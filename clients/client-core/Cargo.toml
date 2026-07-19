@@ -1,0 +1,82 @@
+[package]
+name = "client-core"
+version = "0.0.0"
+edition = "2021"
+description = "Headless Sona client SDK: account lifecycle, KT-verified contact discovery, sealed-sender messaging, and the relay transport. UI-agnostic so Tauri desktop and Android share one tested core."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+crypto-core = { workspace = true }
+kt-log = { workspace = true }
+protocol-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# socks: user-configurable SOCKS5 proxy (Tor/Orbot). socks5h:// URLs resolve DNS
+# through the proxy — with Tor anything else leaks the relay hostname to local DNS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+# rustls-tls: the delivery socket is wss:// behind any TLS-terminating proxy in
+# production. Without a TLS feature tungstenite compiles but fails every wss connect
+# at runtime ("TLS support not compiled in") — caught in prod-sim testing. webpki
+# roots (bundled, no system cert store) to match reqwest's rustls-tls posture.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# WS connects through the same SOCKS5 proxy (tungstenite has no proxy support of its
+# own): SOCKS handshake on a raw TcpStream, then hand the stream to tungstenite's TLS
+# connector. Hostname targets resolve at the proxy — same no-DNS-leak posture as above.
+tokio-socks = "0.5"
+futures-util = "0.3"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+# Voice calls: E2E frame sealing + libopus via maintained raw bindings (safe wrapper in
+# src/call.rs::codec; builds vendored libopus — needs cmake + a C compiler, NDK on Android).
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+zeroize = "1"
+opusic-sys = "0.7"
+# Video calls + screen share: safe Rust bindings over Cisco's OpenH264, vendored and
+# built from source (cc). Realtime camera/screen-content modes, no B-frames, so every
+# frame decodes as it arrives. Chosen over libvpx bindings, which need a system libvpx
+# and don't cross-compile cleanly to the Android NDK.
+openh264 = "0.9"
+# QUIC media path: datagrams for voice (no TCP head-of-line blocking), short reliable
+# streams for video frames. Certificate trust = exact-hash pin fetched from the relay's
+# HTTP API (see media::quic docs); ring only, matching the rest of the tree.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Device-link hardware attestation (attest.rs): parse + signature-verify the Android
+# Keystore attestation certificate chain a new device attaches to its link request.
+# "verify" pulls the same ring already in the tree via rustls.
+x509-parser = { version = "0.16", features = ["verify"] }
+
+[dev-dependencies.rcgen]
+# attest.rs unit tests mint a synthetic attestation chain (root + leaf with the
+# Android attestation extension) instead of shipping a real device's certificates.
+version = "0.13"
+
+[features]
+# Device-bound vaults via the platform keyring; enabled by the Tauri shell.
+# (No-op on Android, where the Keystore backend below is compiled in instead.)
+os-keyring = ["dep:keyring"]
+
+# Optional: OS-keyring storage for the vault device key (Linux Secret Service /
+# Windows Credential Manager). Behind a feature so headless builds stay light; not
+# declared for Android (its Secret Service backend would drag dbus into the APK).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "windows-native"], optional = true }
+
+# On Android the device key is wrapped by a non-exportable Android Keystore key —
+# reached over JNI (there is no NDK C API for the Keystore). Tauri provides the
+# JavaVM/context through ndk-context.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[dev-dependencies]
+# Run the real relay in-process for end-to-end tests. Test-only — never shipped to a client.
+server = { path = "../../crates/server" }
+axum = { version = "0.8", features = ["ws"] }
+hex = "0.4"
+# Sign group-membership epochs in the History unit tests (same signer the account key is).
+ed25519-dalek = { workspace = true }

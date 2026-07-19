@@ -1,0 +1,53 @@
+# Fuzz targets for every parser that touches attacker-controlled bytes.
+# Standalone package (excluded from the backend workspace) — built by cargo-fuzz
+# with nightly + libFuzzer, not by the normal `cargo test`.
+#
+#     cargo +nightly fuzz run <target>          # from the repo root
+#     cargo +nightly fuzz list
+#
+[package]
+name = "sona-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+protocol-types = { path = "../crates/protocol-types" }
+kt-log = { path = "../crates/kt-log" }
+crypto-core = { path = "../crates/crypto-core" }
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kt_proofs"
+path = "fuzz_targets/kt_proofs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kt_entry"
+path = "fuzz_targets/kt_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_open"
+path = "fuzz_targets/vault_open.rs"
+test = false
+doc = false
+bench = false

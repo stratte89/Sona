@@ -1,0 +1,19 @@
+[package]
+name = "kt-log"
+version = "0.0.0"
+edition = "2021"
+description = "Key Transparency: an append-only, signed, verifiable log binding usernames to identity keys. Built on the RFC 6962 Merkle log (ct-merkle). Defeats first-contact key substitution by an untrusted server."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ct-merkle = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+# kt-log needs sha2 0.11 (digest 0.11 / hybrid-array) to match ct-merkle's `Digest`
+# bound. The rest of the workspace stays on sha2 0.10; both coexist in the tree.
+sha2 = "0.11"

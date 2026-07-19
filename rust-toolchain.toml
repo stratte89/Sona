@@ -1,0 +1,6 @@
+# Pinned EXACTLY (not "stable") so independent builders compile with the identical
+# compiler — a precondition for reproducible builds (docs/REPRODUCIBLE_BUILDS.md).
+# Bump deliberately, in its own commit.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

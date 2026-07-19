@@ -1,0 +1,30 @@
+# TLS termination for the Sona relay. Caddy fetches/renews Let's Encrypt certificates
+# automatically for $DOMAIN and proxies HTTP + WebSocket to the relay container.
+{
+	servers {
+		# Slowloris backstop: a client must finish its headers/body promptly or lose
+		# the slot. Idle is long because delivery WebSockets are long-lived (the relay
+		# pings every 30s, so a healthy socket is never idle near this limit).
+		timeouts {
+			read_header 10s
+			read_body 2m
+			idle 10m
+		}
+	}
+}
+{$DOMAIN} {
+	# No access logs: the relay is designed to hold no client IPs anywhere — a proxy
+	# access log would quietly reintroduce "who talked to the relay and when" (including
+	# call-room joins) as a plaintext file. See docs/DEPLOYMENT.md "What the logs show".
+	log {
+		output discard
+	}
+	reverse_proxy relay:5002 {
+		# Overwrite any client-supplied X-Real-IP with the real peer address so the
+		# relay's rate limiter can't be bypassed (fresh spoofed IP per request) or
+		# collapsed (every client sharing one bucket). {remote_host} is Caddy's view
+		# of the immediate peer; the relay treats a MISSING header as deny-worthy in
+		# prod, so this line is load-bearing, not cosmetic.
+		header_up X-Real-IP {remote_host}
+	}
+}

@@ -1,0 +1,22 @@
+[package]
+name = "crypto-core"
+version = "0.0.0"
+edition = "2021"
+description = "The single home for all Sona secrets: vault at-rest encryption, identity keys, and (later) the Double Ratchet + Key Transparency client."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+protocol-types = { path = "../protocol-types" }
+kt-log = { path = "../kt-log" }
+serde = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+base64 = { workspace = true }
+vodozemac = { workspace = true }

@@ -1,0 +1,26 @@
+# Sona client workspace (workspace "B").
+#
+# Kept separate from the backend workspace (../Cargo.toml) on purpose: the Android and
+# desktop builds must never drag in the server's native deps (tokio server stack, etc.).
+# The shared crates (crypto-core, kt-log, protocol-types) are pulled in by relative path.
+[workspace]
+resolver = "2"
+members = [
+    "client-core",
+]
+# The Tauri desktop/Android app is a *detached* package (its own `[workspace]` in
+# desktop/src-tauri/Cargo.toml) built with `cargo tauri`, not `cargo build` here — it
+# needs the platform webview/Android toolchains. Keeping it out of this workspace lets
+# `cargo test` on client-core run in any plain-Rust environment.
+exclude = ["desktop"]
+
+[workspace.dependencies]
+crypto-core = { path = "../crates/crypto-core" }
+kt-log = { path = "../crates/kt-log" }
+protocol-types = { path = "../crates/protocol-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# Standard, vetted Ed25519 — fabricates admin signers in the group-membership tests.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }

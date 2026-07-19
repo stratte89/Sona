@@ -1,0 +1,62 @@
+# cargo-deny policy — supply-chain gate for the backend workspace.
+# COPY of ../deny.toml for the clients workspace — keep them in sync.
+
+[advisories]
+# RustSec advisories: any known-vulnerable dependency fails CI (cargo audit runs too;
+# this is the second, policy-level net).
+version = 2
+yanked = "deny"
+ignore = [
+  # proc-macro-error2 (build-time proc-macro helper) is unmaintained; it reaches us only
+  # through vodozemac → matrix-pickle-derive, i.e. the audited ratchet we deliberately
+  # don't fork. Compile-time only, no runtime attack surface. Re-check on vodozemac bumps.
+  { id = "RUSTSEC-2026-0173", reason = "transitive build-dep of vodozemac; compile-time only" },
+]
+
+[licenses]
+version = 2
+# Sona itself is AGPL-3.0-or-later. Dependencies must be permissive or weak-copyleft.
+allow = [
+  # Sona's own crates.
+  "AGPL-3.0-or-later",
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  # webpki-roots (Mozilla CA bundle data) — permissive data license.
+  "CDLA-Permissive-2.0",
+  "OpenSSL",
+]
+
+# ring bundles code under the OpenSSL/ISC/MIT umbrella; the standard clarification.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate crate versions bloat the audit surface; warn, don't fail (transitive deps
+# make this unavoidable at times).
+multiple-versions = "warn"
+# The dependency policy from ARCHITECTURE.md §11: crypto comes only from the vetted set
+# (vodozemac, ct-merkle, ed25519-dalek, RustCrypto). Deny known-bad or overlapping
+# crypto crates sneaking in transitively.
+deny = [
+  { crate = "openssl", reason = "rustls/RustCrypto only — no C crypto stack" },
+  { crate = "native-tls", reason = "rustls only" },
+  { crate = "md5", reason = "broken hash" },
+  # NOTE: sha1 is NOT banned — axum/tungstenite use it for the RFC 6455 WebSocket
+  # accept-key handshake, a protocol checksum with no security reliance.
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
