@@ -1,0 +1,53 @@
+[package]
+name = "server"
+version = "0.0.0"
+edition = "2021"
+description = "Sona blind relay: Axum WS + REST over a hash-addressed, zero-knowledge message store. Never sees plaintext or sender identity."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+protocol-types = { path = "../protocol-types" }
+kt-log = { path = "../kt-log" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+# Same audited crypto lib as the client — used here only to VERIFY Ed25519 auth
+# signatures. The server holds no private keys.
+vodozemac = { workspace = true }
+
+axum = { version = "0.8", features = ["ws"] }
+# Outbound content-free push wakes (rustls only, no redirects -- see http.rs).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
+futures-util = "0.3"
+# Durable storage. SQLite bundled (no system dep); blobs encrypted at rest with a key
+# held off the data disk so a stolen DB/backup reveals nothing the relay didn't have to keep.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# QUIC media path for calls: unreliable datagrams for voice (no TCP head-of-line
+# blocking), short reliable streams for video frames. TLS is a boot-time self-signed
+# certificate whose hash is advertised over the HTTP API and pinned by clients.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+# FCM wake adapter (push.rs): the service-account OAuth JWT is RS256, which none of the
+# messenger's own (Ed25519/X25519) crypto covers. ring is already in the tree (rustls,
+# quinn) and its RSA signing is constant-time — unlike the pure-Rust `rsa` crate
+# (RUSTSEC-2023-0071, Marvin timing side channel). Used ONLY to sign the JWT.
+ring = "0.17"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+# Reuse the real client crypto engine to drive end-to-end integration tests.
+crypto-core = { path = "../crypto-core" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+base64 = "0.22"

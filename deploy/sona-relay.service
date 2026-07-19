@@ -1,0 +1,50 @@
+# Systemd unit for a bare-metal Sona relay (the non-Docker path).
+#
+#   install -m 755 target/release/server /usr/local/bin/sona-relay
+#   install -m 600 deploy/sona.env /etc/sona/relay.env      # filled-in secrets
+#   install -m 644 deploy/sona-relay.service /etc/systemd/system/
+#   systemctl enable --now sona-relay
+#
+# TLS is a reverse proxy's job (Caddy/nginx in front of 127.0.0.1:5002).
+
+[Unit]
+Description=Sona relay (blind E2EE message relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sona-relay
+# Secrets (KT_SIGNING_KEY, STORAGE_KEY, RATE_SALT) — root-owned, mode 600. Keeping
+# STORAGE_KEY here and the database under /var/lib/sona is the required "key off the
+# data disk" split when /etc and /var/lib share a disk only in the trivial sense;
+# for real separation put this file on another volume or use LoadCredential=.
+EnvironmentFile=/etc/sona/relay.env
+Environment=BIND=127.0.0.1:5002
+Environment=DB_PATH=/var/lib/sona/relay.sqlite
+Environment=PROD=1
+# Environment=ALLOWED_ORIGINS=https://relay.example.org
+
+# Least privilege: dedicated ephemeral user, own state dir, read-only everything else.
+DynamicUser=yes
+StateDirectory=sona
+WorkingDirectory=/var/lib/sona
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

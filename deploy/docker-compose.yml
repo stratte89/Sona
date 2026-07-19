@@ -1,0 +1,78 @@
+# Self-hosted Sona: relay behind Caddy (automatic Let's Encrypt TLS) + an optional
+# co-located auditor. Read docs/DEPLOYMENT.md first — in particular: generate the keys,
+# put them in ./sona.env (chmod 600, NOT committed), and understand that a co-located
+# auditor is a smoke check, not independent witnessing (run one elsewhere too).
+#
+#     cp sona.env.example sona.env   # then fill in the generated keys
+#     DOMAIN=relay.example.org docker compose up -d
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file: sona.env # KT_SIGNING_KEY, STORAGE_KEY, RATE_SALT — secrets live here
+    environment:
+      BIND: 0.0.0.0:5002
+      DB_PATH: /var/lib/sona/relay.sqlite
+      PROD: "1"
+      ALLOWED_ORIGINS: https://${DOMAIN:?set DOMAIN to your relay hostname}
+    # Resource ceilings so a resource-exhaustion flood OOM-kills nothing but the relay's
+    # own container, and it restarts clean instead of taking the host down (M-3).
+    mem_limit: 1g
+    pids_limit: 512
+    cpus: 2.0
+    volumes:
+      # Message queue + KT log. The STORAGE_KEY that encrypts blobs in this volume
+      # stays in sona.env — i.e. off this volume, which is the whole point.
+      - relay-data:/var/lib/sona
+    expose:
+      - "5002"
+    ports:
+      # QUIC media path for calls — published straight from the relay (NOT via Caddy:
+      # this is a bespoke QUIC endpoint whose self-signed cert clients pin over the
+      # API). If blocked/closed, calls silently fall back to WebSocket through Caddy.
+      - "4443:4443/udp"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [relay]
+    mem_limit: 256m
+    pids_limit: 256
+    cpus: 1.0
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to your relay hostname}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # Optional same-host witness. Catches accidents (bad restore, disk corruption)
+  # immediately; does NOT replace independent auditors run by other parties.
+  auditor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on: [relay]
+    mem_limit: 256m
+    pids_limit: 256
+    cpus: 1.0
+    entrypoint: ["/usr/local/bin/sona-auditor"]
+    environment:
+      SONA_RELAY_URL: http://relay:5002
+      AUDITOR_STATE: /var/lib/sona/sona-auditor.json
+      AUDITOR_INTERVAL_SECS: "300"
+    volumes:
+      - auditor-data:/var/lib/sona
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:
+  auditor-data:

@@ -1,0 +1,100 @@
+# CI for both Cargo workspaces (backend at the root, clients under clients/).
+# Gates: tests, clippy as errors, rustfmt, cargo-audit (RustSec advisories),
+# cargo-deny (licenses + duplicate-crate + source policy, see deny.toml).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test & clippy (${{ matrix.workspace.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace:
+          - { name: backend, dir: "." , flags: "" }
+          # os-keyring is what the Tauri shell ships with; its Linux backend
+          # (Secret Service) links libdbus.
+          - { name: clients, dir: "clients", flags: "--features os-keyring" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libdbus (keyring backend)
+        if: matrix.workspace.name == 'clients'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.workspace.dir }}
+      - name: cargo fmt
+        working-directory: ${{ matrix.workspace.dir }}
+        run: cargo fmt --all --check
+      - name: cargo test
+        working-directory: ${{ matrix.workspace.dir }}
+        run: cargo test ${{ matrix.workspace.flags }}
+      - name: cargo clippy
+        working-directory: ${{ matrix.workspace.dir }}
+        run: cargo clippy --all-targets ${{ matrix.workspace.flags }} -- -D warnings
+
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+      - run: cargo audit --file clients/Cargo.lock
+
+  deny:
+    name: cargo deny (licenses & sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+      - run: cargo deny check
+        working-directory: clients
+
+  # The Android build is edge-to-edge: screen-anchored UI that forgets
+  # env(safe-area-inset-*) ends up under the status bar / gesture bar. Keep that mechanical.
+  ui:
+    name: safe-area lint (edge-to-edge UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 clients/desktop/scripts/check-safe-area.py
+
+  # Keep the monoliths from coming back: fail if a non-exempt source file grows
+  # past the line cap (see scripts/no-monolith.sh for the exempt list + rationale).
+  no-monolith:
+    name: no-monolith ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/no-monolith.sh
+
+  # Short smoke-fuzz of every wire-facing parser. Not a soak (run those locally /
+  # scheduled); this catches "the parser now panics on garbage" regressions.
+  fuzz:
+    name: smoke fuzz (parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: fuzz each target for 30s
+        run: |
+          for t in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+          done

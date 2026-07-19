@@ -1,0 +1,48 @@
+# Bare-metal Caddyfile for a bare-metal VPS deployment (relay.example.org).
+#
+# Differs from ../Caddyfile (the Docker one) in a single way: the relay is a systemd
+# service on THIS host, so we proxy to 127.0.0.1:5002 instead of the "relay" container.
+#
+# TLS: Caddy fetches a Let's Encrypt cert for relay.example.org automatically. The name must
+# be DNS-only (grey cloud) in Cloudflare so the ACME challenge reaches THIS box directly —
+# an orange-cloud (proxied) record breaks TLS-ALPN-01 and re-inserts Cloudflare on the
+# wire. Only port 443 needs to be open; Caddy answers the ACME challenge over TLS-ALPN-01.
+{
+	servers {
+		# Slowloris backstop: finish headers/body promptly or lose the slot. Idle is
+		# long because delivery WebSockets are long-lived (relay pings every 30s).
+		timeouts {
+			read_header 10s
+			read_body 2m
+			idle 10m
+		}
+	}
+}
+# Replace with your relay domain.
+relay.example.org {
+	# No access logs. The relay is designed to hold no client IPs anywhere; a proxy
+	# access log would quietly reintroduce "who talked to the relay and when" (including
+	# call-room joins) as a plaintext file. See docs/DEPLOYMENT.md "What the logs show".
+	log {
+		output discard
+	}
+	# Update channel (deploy/publish-updates.sh): static, pre-signed files only.
+	# /apt is a real apt repository (GPG-signed InRelease); /updates holds the
+	# in-app manifest + installers (minisign-signed). Nothing here is trusted by
+	# clients on transport alone, so plain static serving is enough.
+	handle /apt/* {
+		root * /srv/sona-www
+		file_server
+	}
+	handle /updates/* {
+		root * /srv/sona-www
+		file_server
+	}
+	reverse_proxy 127.0.0.1:5002 {
+		# Overwrite any client-supplied X-Real-IP with the real peer so the relay's rate
+		# limiter can't be bypassed (fresh spoofed IP per request) or collapsed (everyone
+		# in one bucket). The relay treats a MISSING header as deny-worthy in prod, so
+		# this line is load-bearing, not cosmetic.
+		header_up X-Real-IP {remote_host}
+	}
+}

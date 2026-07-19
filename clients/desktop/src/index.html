@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- user-scalable=no: pinch/double-tap zoom of the *page* is a misfeature in a chat app
+         (a stray pinch in the thread or chat list leaves the UI at 2.3× with the bars off
+         screen). The one place a zoom gesture means something — previewed media — carries
+         its own transform-based zoom (see `openLightbox` in main.js). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>Sona</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <div class="ctxmenu" id="ctxmenu" hidden></div>
+    <!-- Long-press message sheet: dim backdrop; emoji row + action menu anchor to the
+         focused bubble (positioned from JS). -->
+    <div class="msheet" id="msheet" hidden></div>
+    <div class="modal" id="modal" hidden><div class="modal-card" id="modal-card"></div></div>
+
+    <!-- ── Media selector: bottom sheet off the composer's "+" ───────── -->
+    <div class="msel" id="msel" hidden>
+      <div class="msel-backdrop" id="msel-backdrop"></div>
+      <div class="msel-sheet">
+        <button class="msel-opt" type="button" id="ms-gallery">
+          <span class="msel-ico" data-icon="image"></span><span>Gallery</span>
+        </button>
+        <button class="msel-opt" type="button" id="ms-file">
+          <span class="msel-ico" data-icon="file"></span><span>File</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ── In-app camera: shoot → preview → send (getUserMedia, same pipeline as
+         the QR scanner — no native camera intent, nothing touches disk) ──────── -->
+    <div class="camui" id="camui" hidden>
+      <video id="cam-video" playsinline autoplay muted></video>
+      <img id="cam-still" alt="" hidden />
+      <div class="cam-topbar">
+        <button class="icon-btn cam-btn" type="button" id="cam-close" aria-label="Close camera" data-icon="x"></button>
+      </div>
+      <div class="cam-controls" id="cam-live">
+        <span class="cam-slot"></span>
+        <button class="cam-shutter" type="button" id="cam-shot" aria-label="Take photo"></button>
+        <button class="icon-btn cam-btn" type="button" id="cam-flip" aria-label="Switch camera" data-icon="flip"></button>
+      </div>
+      <div class="cam-controls" id="cam-review" hidden>
+        <button class="icon-btn cam-btn" type="button" id="cam-retake" aria-label="Retake" data-icon="x"></button>
+        <button class="send-btn" type="button" id="cam-send" aria-label="Send photo" data-icon="send"></button>
+      </div>
+    </div>
+
+    <!-- ── QR scanner overlay (link-a-device: camera → jsQR) ─────────── -->
+    <div class="scanui" id="scanui" hidden>
+      <video id="scan-video" playsinline autoplay muted></video>
+      <div class="scan-frame" aria-hidden="true"></div>
+      <p class="scan-hint">Point the camera at the QR code on your new device</p>
+      <button class="btn btn-ghost btn-sm scan-cancel" id="scan-cancel">Cancel</button>
+    </div>
+
+    <!-- ── Call overlay (voice + video + screen share) ────────────── -->
+    <div class="callui" id="callui" hidden>
+      <!-- Call settings: gear top-right, small modal below it (audio prefs). -->
+      <button class="call-gear" id="call-gear" aria-label="Call settings" data-icon="gear" hidden></button>
+      <div class="call-settings" id="call-settings" hidden>
+        <div class="cset-card">
+          <h4>Call settings</h4>
+          <button class="cset-row" id="cset-ns" type="button">
+            <span>Noise suppression</span>
+            <span class="cset-switch" aria-hidden="true"></span>
+          </button>
+          <p class="cset-hint">Filters background noise from your microphone. Applies instantly.</p>
+          <button class="cset-row" id="cset-shareaudio" type="button">
+            <span>Share system audio</span>
+            <span class="cset-switch" aria-hidden="true"></span>
+          </button>
+          <p class="cset-hint" id="cset-shareaudio-hint">Include this device's sound when sharing your screen.</p>
+        </div>
+      </div>
+      <!-- Self-view: what *you* are sending (camera / screen), PiP over the stage. -->
+      <div class="call-self" id="call-self" hidden>
+        <div class="self-tile" id="self-cam" hidden>
+          <canvas id="cv-self-cam"></canvas>
+          <span class="self-note"><span class="spinner-sm"></span>starting camera…</span>
+        </div>
+        <div class="self-tile" id="self-scr" hidden>
+          <canvas id="cv-self-scr"></canvas>
+          <span class="self-note"><span class="spinner-sm"></span>starting share…</span>
+        </div>
+        <span class="self-tag">You</span>
+      </div>
+      <div class="call-card">
+        <!-- Peer video: screen share dominates when present, camera rides along. -->
+        <div class="call-video" id="call-video" hidden>
+          <canvas class="cv-tile cv-screen" id="cv-screen" hidden></canvas>
+          <canvas class="cv-tile cv-camera" id="cv-camera" hidden></canvas>
+        </div>
+        <div class="avatar call-avatar" id="call-avatar">?</div>
+        <div class="call-name" id="call-name">—</div>
+        <div class="call-state" id="call-state">calling…</div>
+        <div class="call-actions">
+          <button class="call-btn" id="call-mute" aria-label="Mute" data-icon="mic" hidden></button>
+          <button class="call-btn" id="call-speaker" aria-label="Loudspeaker" data-icon="vol" hidden></button>
+          <button class="call-btn" id="call-cam" aria-label="Camera" data-icon="cam" hidden></button>
+          <button class="call-btn" id="call-share" aria-label="Share screen" data-icon="screen" hidden></button>
+          <button class="call-btn ok" id="call-accept" aria-label="Accept call" data-icon="phone" hidden></button>
+          <button class="call-btn danger" id="call-hangup" aria-label="Hang up" data-icon="phonedown"></button>
+        </div>
+        <p class="call-hint">End-to-end encrypted · routed through your relay · no IP shared</p>
+      </div>
+    </div>
+
+    <div class="lightbox" id="lightbox" hidden>
+      <div class="lb-bar">
+        <button class="icon-btn lb-btn" id="lb-save" aria-label="Save as…" data-icon="down"></button>
+        <button class="icon-btn lb-btn" id="lb-close" aria-label="Close" data-icon="x"></button>
+      </div>
+      <img id="lb-img" alt="" />
+    </div>
+
+    <!-- Video viewer: same shell as the lightbox, a <video> instead of an <img>. -->
+    <div class="lightbox" id="vidbox" hidden>
+      <div class="lb-bar">
+        <button class="icon-btn lb-btn" id="vb2-save" aria-label="Save as…" data-icon="down"></button>
+        <button class="icon-btn lb-btn" id="vb2-close" aria-label="Close" data-icon="x"></button>
+      </div>
+      <video id="vb2-video" controls playsinline></video>
+    </div>
+
+    <div id="app" class="app">
+      <!-- Desktop two-pane: right side when no chat is open (wide layouts only). -->
+      <div class="main-empty" id="main-empty" hidden>
+        <div class="mark" data-icon="chat"></div>
+        <p>Select a chat</p>
+        <span>Your conversations stay end-to-end encrypted.</span>
+      </div>
+
+      <!-- ── Loading ─────────────────────────────────────────────── -->
+      <section class="screen is-active" data-screen="loading">
+        <div class="splash">
+          <div class="mark mark-lg" data-icon="lock"></div>
+          <div class="wordmark">Sona</div>
+          <div class="spinner"></div>
+        </div>
+      </section>
+
+      <!-- ── Connect (relay + KT pin) ────────────────────────────── -->
+      <section class="screen" data-screen="connect">
+        <div class="pane pane-center">
+          <div class="mark" data-icon="lock"></div>
+          <h1>Connect to a relay</h1>
+          <p class="lede">The relay only moves sealed traffic. Pin its Key Transparency
+            key so a swapped identity is provable, not silent.</p>
+
+          <label class="field">
+            <span>Relay address</span>
+            <div class="schemerow">
+              <select id="cx-scheme" aria-label="Scheme">
+                <option value="https://" selected>https://</option>
+                <option value="http://">http://</option>
+              </select>
+              <input id="cx-server" type="text" placeholder="relay.example" value="127.0.0.1:5002" autocomplete="off" spellcheck="false" autocapitalize="none" />
+            </div>
+          </label>
+
+          <details class="disclosure" id="cx-adv">
+            <summary>Advanced</summary>
+            <label class="field">
+              <span>Access token</span>
+              <input id="cx-token" type="password" placeholder="paste it, or scan the invite QR" autocomplete="off" spellcheck="false" autocapitalize="none" />
+            </label>
+            <p class="hint">Only needed when the relay isn't public. Whoever runs a private
+              relay gives you this token — usually inside an invite QR, which fills
+              everything here automatically.</p>
+            <label class="field">
+              <span>Pinned KT public key</span>
+              <textarea id="cx-pin" rows="2" placeholder="base64 public key (optional — fetched on Continue)" autocomplete="off" spellcheck="false"></textarea>
+            </label>
+            <button id="cx-fetch" class="btn btn-ghost btn-sm">Fetch from relay…</button>
+            <p class="hint" id="cx-fetch-hint" hidden>Fetched from the relay. <strong>Confirm this
+              value out-of-band</strong> — trusting it blindly defeats the point.</p>
+          </details>
+
+          <button id="cx-continue" class="btn">Continue</button>
+          <button id="cx-scan" class="btn btn-ghost btn-sm">Scan an invite QR</button>
+        </div>
+      </section>
+
+      <!-- ── Create account ──────────────────────────────────────── -->
+      <section class="screen" data-screen="create">
+        <div class="pane pane-center">
+          <div class="mark" data-icon="lock"></div>
+          <h1>Create your identity</h1>
+          <p class="lede">No phone. No email. A username and a strong password — the
+            password is the only thing between a stolen device and your keys.</p>
+
+          <label class="field">
+            <span>Username</span>
+            <input id="cr-user" type="text" placeholder="e.g. lincoln" autocomplete="off" spellcheck="false" autocapitalize="none" />
+          </label>
+
+          <!-- Shown only when the relay advertises invite-gated registration. -->
+          <label class="field" id="cr-invite-wrap" hidden>
+            <span>Invite code</span>
+            <input id="cr-invite" type="text" placeholder="this relay requires one — ask whoever invited you" autocomplete="off" spellcheck="false" autocapitalize="none" />
+          </label>
+
+          <label class="field">
+            <span>Password</span>
+            <input id="cr-pass" type="password" placeholder="12+ chars, mixed" autocomplete="new-password" />
+          </label>
+          <div class="strength">
+            <div class="strength-bar"><i id="cr-bar"></i></div>
+            <div class="strength-reqs" id="cr-reqs"></div>
+          </div>
+
+          <label class="field">
+            <span>Repeat password</span>
+            <input id="cr-pass2" type="password" placeholder="same password again" autocomplete="new-password" />
+          </label>
+          <div class="strength-reqs" id="cr-match"></div>
+
+          <button id="cr-create" class="btn" disabled>Create &amp; register</button>
+          <button class="btn btn-ghost btn-sm" id="cr-link">Link an existing account instead</button>
+          <button class="btn btn-ghost btn-sm" data-goto="connect">Change relay</button>
+        </div>
+      </section>
+
+      <!-- ── Link this device to an existing account ─────────────────── -->
+      <section class="screen" data-screen="link">
+        <header class="bar">
+          <button class="icon-btn" id="lk-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">Link this device</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane pane-center">
+          <div class="mark" data-icon="shield"></div>
+          <h1>Join an existing account</h1>
+          <p class="lede">Enter your account's username and password. This device gets its
+            own keys; your primary device approves it, then your history syncs over.</p>
+
+          <label class="field">
+            <span>Username</span>
+            <input id="lk-user" type="text" placeholder="your account username" autocomplete="off" spellcheck="false" autocapitalize="none" />
+          </label>
+          <label class="field">
+            <span>Account password</span>
+            <input id="lk-pass" type="password" placeholder="account password" autocomplete="current-password" />
+          </label>
+          <button id="lk-gen" class="btn">Generate link code</button>
+
+          <div id="lk-codebox" hidden>
+            <h2 class="section-h">Your one-time link code</h2>
+            <p class="hint">On your <strong>primary</strong> device open
+              <em>Settings → Devices → Link a device</em> and scan this QR code (or use
+              the text code). It carries a one-time secret — only ever share it with your
+              own device.</p>
+            <div class="qrbox" id="lk-qr" hidden></div>
+            <p class="hint mono fingerprint" id="lk-fpr" hidden></p>
+            <textarea id="lk-code" class="mono linkcode" rows="4" readonly spellcheck="false" hidden></textarea>
+            <button id="lk-copy" class="btn btn-ghost btn-sm" hidden>Copy code</button>
+            <button id="lk-toggle" class="btn btn-ghost btn-sm">Show text code</button>
+            <button id="lk-finish" class="btn">I approved it on my primary — finish</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Revoked: this device was unlinked from its account remotely ── -->
+      <section class="screen" data-screen="revoked">
+        <div class="pane pane-center">
+          <div class="mark" data-icon="shield"></div>
+          <h1>Device unlinked</h1>
+          <p class="lede">This device was removed from the account on another device.
+            It can no longer send or receive messages. Relink it to the account, or
+            start over with a new account.</p>
+          <button id="rv-relink" class="btn">Relink this device</button>
+          <button id="rv-newacc" class="btn btn-ghost btn-sm">Create a new account</button>
+        </div>
+      </section>
+
+      <!-- ── Relay access changed (shared token rotated / member evicted) ── -->
+      <section class="screen" data-screen="accessdenied">
+        <div class="pane pane-center">
+          <div class="mark" data-icon="lock"></div>
+          <h1>Relay access changed</h1>
+          <p class="lede">The relay stopped accepting this device's access token. The
+            operator has most likely changed it — that's how a private relay re-keys
+            or removes a member.</p>
+          <p class="hint">Contact whoever runs the relay for the new access token (or a
+            fresh invite QR), then reconnect and sign in again with your username and
+            password. Nothing on this device is lost — your keys, messages, and account
+            are intact; only the door key changed.</p>
+          <button id="ad-reconnect" class="btn">Reconnect with a new token</button>
+        </div>
+      </section>
+
+      <!-- ── Unlock ──────────────────────────────────────────────── -->
+      <section class="screen" data-screen="unlock">
+        <div class="pane pane-center">
+          <div class="mark" data-icon="lock"></div>
+          <h1>Welcome back</h1>
+          <p class="lede">This device holds a sealed vault. Unlock it — the keys never
+            leave this process.</p>
+
+          <div id="un-pin-area" hidden>
+            <label class="field">
+              <span>PIN</span>
+              <input id="un-pin" type="password" placeholder="PIN" autocomplete="off" inputmode="numeric" maxlength="8" />
+            </label>
+            <button id="un-pin-btn" class="btn">Unlock with PIN</button>
+          </div>
+
+          <button id="un-bio-btn" class="btn" hidden>Unlock with fingerprint</button>
+
+          <div id="un-pass-area">
+            <label class="field">
+              <span>Password</span>
+              <input id="un-pass" type="password" placeholder="password" autocomplete="current-password" />
+            </label>
+            <button id="un-unlock" class="btn">Unlock</button>
+          </div>
+
+          <button id="un-switch" class="btn btn-ghost btn-sm" hidden>Use password instead</button>
+          <button id="un-link" class="btn btn-ghost btn-sm">Link this as a new device</button>
+          <button class="btn btn-ghost btn-sm" data-goto="connect">Change relay</button>
+        </div>
+      </section>
+
+      <!-- ── Chats list ──────────────────────────────────────────── -->
+      <section class="screen" data-screen="chats">
+        <header class="bar">
+          <div class="bar-title"><span class="dot" id="conn-dot"></span> Sona <span class="conn-note" id="conn-note" hidden>connecting…</span></div>
+          <span class="bar-flex"></span>
+          <button class="icon-btn" id="ch-settings" aria-label="Settings" data-icon="gear"></button>
+        </header>
+        <div class="searchrow">
+          <span class="search-ico" data-icon="search"></span>
+          <input id="ch-search" type="search" placeholder="Search chats" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="list" id="ch-list"></div>
+        <div class="empty" id="ch-empty" hidden>
+          <div class="mark" data-icon="chat"></div>
+          <p>No conversations yet.</p>
+          <span>Start one — you'll need your contact's username.</span>
+        </div>
+        <button class="fab" id="ch-new" aria-label="New chat or group" data-icon="plus"></button>
+      </section>
+
+      <!-- ── Message requests ────────────────────────────────────── -->
+      <section class="screen" data-screen="requests">
+        <header class="bar">
+          <button class="icon-btn" id="rq-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">Message requests</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <p class="hint rq-hint">People who aren't in your chats yet. They don't know
+            you've seen their request until you accept — accepting opens the chat,
+            deleting quietly makes it go away.</p>
+          <div class="list" id="rq-list"></div>
+          <div class="empty" id="rq-empty" hidden>
+            <div class="mark" data-icon="users"></div>
+            <p>No pending requests.</p>
+            <span>When someone new messages you, they'll show up here first.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Thread ──────────────────────────────────────────────── -->
+      <section class="screen" data-screen="thread">
+        <header class="bar">
+          <button class="icon-btn" id="th-back" aria-label="Back" data-icon="back"></button>
+          <button class="bar-peer" id="th-peer">
+            <span class="avatar bar-peer-av" id="th-avatar"></span>
+            <span class="bar-peer-text">
+              <span class="bar-peer-name" id="th-name">—</span>
+              <span class="bar-peer-sub" id="th-sub">tap for chat settings</span>
+            </span>
+          </button>
+          <span class="timer-chip" id="th-timerchip" hidden><i data-icon="clock"></i><b id="th-timerchip-label"></b></span>
+          <button class="icon-btn" id="th-call" aria-label="Voice call" data-icon="phone"></button>
+          <button class="icon-btn" id="th-search" aria-label="Search in chat" data-icon="search"></button>
+        </header>
+
+        <div class="chatsearch" id="th-searchbar" hidden>
+          <input id="th-searchinput" type="search" placeholder="Search in this chat" autocomplete="off" />
+          <span class="cs-count" id="th-searchcount"></span>
+          <button class="icon-btn" id="th-searchprev" aria-label="Previous match" data-icon="up"></button>
+          <button class="icon-btn" id="th-searchnext" aria-label="Next match" data-icon="downchev"></button>
+          <button class="icon-btn" id="th-searchclose" aria-label="Close search" data-icon="x"></button>
+        </div>
+
+        <div class="blocked-note" id="th-blocked" hidden>
+          <span>You blocked this contact.</span>
+          <button class="btn btn-sm btn-ghost" id="th-unblock">Unblock</button>
+        </div>
+
+        <!-- Brand-new chat: offer an explicit request instead of forcing a first text -->
+        <div class="knock-note" id="th-knock" hidden>
+          <span>New chat — say hi, or just knock.</span>
+          <button class="btn btn-sm" id="th-knockbtn">👋 Request to chat</button>
+        </div>
+
+        <!-- Pinned messages: shows the current pin; tap = jump + cycle, list = all pins -->
+        <button class="pinbar" id="th-pinbar" hidden>
+          <span class="pinbar-ico" data-icon="pin"></span>
+          <span class="pinbar-body">
+            <span class="pinbar-label" id="th-pinlabel">Pinned</span>
+            <span class="pinbar-text" id="th-pintext"></span>
+          </span>
+          <span class="pinbar-list" id="th-pinlist" role="button" aria-label="All pinned messages" data-icon="downchev"></span>
+        </button>
+
+        <div class="blocked-note" id="th-left" hidden>
+          <span>You're no longer in this group — the history stays, but no one can be messaged.</span>
+        </div>
+
+        <div class="keychange" id="th-keychange" hidden>
+          <strong>⚠ This contact's key changed.</strong>
+          <p>Their published key is different from the one you trusted. This is expected on
+            a reinstall — or it's an impersonation. Compare the new safety number before
+            you accept.</p>
+          <div class="safety-num" id="th-kc-num"></div>
+          <div class="keychange-actions">
+            <button class="btn btn-sm btn-danger" id="th-kc-accept">Accept new key</button>
+          </div>
+        </div>
+
+        <div class="sticky-date" id="th-stickydate"></div>
+        <div class="thread" id="th-thread"></div>
+        <div class="drop-overlay" id="th-drop" hidden><div class="drop-inner"><i data-icon="clip"></i><span>Drop to attach</span></div></div>
+        <button class="jump-fab" id="th-jump" hidden aria-label="Jump to latest"><i data-icon="downchev"></i><span class="jump-count" id="th-jumpcount" hidden></span></button>
+
+        <div class="attach-queue" id="th-queue" hidden></div>
+
+        <!-- @mention autocomplete (groups): floats above the composer -->
+        <div class="mentionbox" id="mentionbox" hidden></div>
+
+        <div class="replybar" id="th-replybar" hidden>
+          <div class="rb-body">
+            <span class="rb-label">Replying to</span>
+            <span class="rb-text" id="th-replytext"></span>
+          </div>
+          <button class="icon-btn" id="th-replycancel" aria-label="Cancel reply" data-icon="x"></button>
+        </div>
+
+        <div class="voicebar" id="th-voicebar" hidden>
+          <span class="spinner-sm" id="vb-init" hidden></span>
+          <span class="rec-dot" id="vb-dot"></span>
+          <span class="vb-time" id="vb-time">0:00</span>
+          <span class="vb-note" id="vb-note">Recording…</span>
+          <span class="bar-flex"></span>
+          <button class="icon-btn" type="button" id="vb-cancel" aria-label="Discard recording" data-icon="trash"></button>
+          <button class="icon-btn" type="button" id="vb-play" aria-label="Preview" data-icon="play" hidden></button>
+          <button class="icon-btn vb-stop" type="button" id="vb-stop" aria-label="Stop recording" data-icon="stopsq"></button>
+          <button class="send-btn" type="button" id="vb-send" aria-label="Send voice message" data-icon="send" hidden></button>
+        </div>
+
+        <!-- Signal-style composer: pill bubble (emoji toggle · input · camera+mic that
+             collapse to an inline "+" while composing) + a round main button that
+             morphs between "+" (media selector) and send. -->
+        <form class="composer" id="th-form">
+          <div class="cmp-bubble">
+            <button class="cmp-ico" type="button" id="th-emoji" aria-label="Emoji and GIFs" data-icon="smile"></button>
+            <textarea id="th-input" rows="1" placeholder="Message" autocomplete="off"></textarea>
+            <span class="cmp-side" id="cmp-side">
+              <button class="cmp-ico" type="button" id="th-camera" aria-label="Take a photo" data-icon="camera"></button>
+              <button class="cmp-ico mic-btn" type="button" id="th-mic" aria-label="Record voice message" data-icon="mic"></button>
+            </span>
+            <button class="cmp-ico cmp-plusinline" type="button" id="th-plusinline" aria-label="Add attachment" data-icon="plus" tabindex="-1"></button>
+          </div>
+          <button class="send-btn cmp-main" type="button" id="th-main" aria-label="Send or attach">
+            <span class="cm-plus" data-icon="plus"></span>
+            <span class="cm-send" data-icon="send"></span>
+          </button>
+          <input type="file" id="th-file" hidden multiple />
+        </form>
+
+        <!-- Emoji / GIF panel: docks under the composer where the keyboard was -->
+        <div class="cmp-panel" id="cmp-panel" hidden>
+          <div class="cmp-tabs">
+            <button class="cmp-tab sel" type="button" id="cpt-emoji" aria-label="Emoji" data-icon="smile"></button>
+            <button class="cmp-tab cmp-tab-gif" type="button" id="cpt-gif" aria-label="GIFs">GIF</button>
+          </div>
+          <div class="cmp-pane" id="cpp-emoji"></div>
+          <div class="cmp-pane cmp-gifpane" id="cpp-gif" hidden>
+            <div class="cmp-gifsearch">
+              <span class="ep-search-ico" data-icon="search"></span>
+              <input id="cpg-q" type="search" placeholder="Search GIPHY" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="cmp-gifgrid" id="cpg-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Chat settings ───────────────────────────────────────── -->
+      <section class="screen" data-screen="chatsettings">
+        <header class="bar">
+          <button class="icon-btn" id="cs-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">Chat settings</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <div class="cs-peer">
+            <div class="avatar" id="cs-avatar">?</div>
+            <div>
+              <div class="cs-name" id="cs-name">—</div>
+              <div class="cs-user" id="cs-username"></div>
+              <span class="badge" id="th-badge"></span>
+            </div>
+          </div>
+
+          <h2 class="section-h">Safety number</h2>
+          <div class="card cs-card">
+            <p class="safety-desc">Compare these numbers with your contact over a channel you
+              already trust — or scan each other's QR code when you're together. If they
+              match, the connection has no one in the middle.</p>
+            <div class="verify-qr" id="cs-qr" aria-label="Safety number QR code"></div>
+            <div class="safety-num" id="th-safetynum"></div>
+            <div class="verify-actions">
+              <button class="btn btn-sm" id="cs-scanverify">Scan their code</button>
+              <button class="btn btn-sm" id="th-verify">Mark verified</button>
+            </div>
+          </div>
+
+          <h2 class="section-h">Disappearing messages</h2>
+          <div class="card cs-card">
+            <p class="safety-desc">New messages delete themselves on <em>both</em> devices
+              after this long. Synced with your contact automatically.</p>
+            <div class="timer-opts" id="th-timeropts">
+              <button data-secs="" class="topt">Off</button>
+              <button data-secs="300" class="topt">5m</button>
+              <button data-secs="3600" class="topt">1h</button>
+              <button data-secs="86400" class="topt">1d</button>
+              <button data-secs="604800" class="topt">7d</button>
+            </div>
+          </div>
+
+          <h2 class="section-h">Options</h2>
+          <div class="card">
+            <button class="rowbtn" id="cs-search"><span class="rowico" data-icon="search"></span>Search in chat</button>
+            <button class="rowbtn" id="cs-media"><span class="rowico" data-icon="file"></span>Media, files &amp; voice</button>
+            <button class="rowbtn" id="cs-mute"><span class="rowico" data-icon="bell"></span>Mute<em id="cs-mute-state"></em></button>
+            <button class="rowbtn" id="cs-nick"><span class="rowico" data-icon="edit"></span>Nickname<em id="cs-nick-state"></em></button>
+            <button class="rowbtn" id="cs-addgroup"><span class="rowico" data-icon="users"></span>Add to group</button>
+          </div>
+
+          <h2 class="section-h">Danger zone</h2>
+          <div class="card">
+            <button class="rowbtn danger" id="cs-block"><span class="rowico" data-icon="block"></span><span id="cs-block-label">Block</span></button>
+            <button class="rowbtn danger" id="cs-delete"><span class="rowico" data-icon="trash"></span>Delete chat</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Group settings (page, mirrors the 1:1 chat settings) ── -->
+      <section class="screen" data-screen="groupsettings">
+        <header class="bar">
+          <button class="icon-btn" id="gs-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">Group settings</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <div class="avatar-edit">
+            <button class="avatar editable" id="gs-avatar" aria-label="Change group photo"></button>
+            <button class="btn btn-ghost btn-sm" id="gs-avatar-rm" hidden>Remove photo</button>
+          </div>
+          <h3 class="gi-name"><span id="gs-name">—</span>
+            <button class="icon-btn" id="gs-rename" aria-label="Rename group" data-icon="edit"></button></h3>
+          <p class="gs-count" id="gs-count"></p>
+          <p class="hint gs-left-note" id="gs-left-note" hidden>You're no longer in this group.</p>
+
+          <h2 class="section-h" id="gs-timer-h">Disappearing messages</h2>
+          <div class="card cs-card" id="gs-timer-card">
+            <p class="safety-desc">New messages delete themselves on <em>every</em> member's
+              device after this long.</p>
+            <div class="timer-opts" id="gs-timeropts">
+              <button data-secs="" class="topt">Off</button>
+              <button data-secs="300" class="topt">5m</button>
+              <button data-secs="3600" class="topt">1h</button>
+              <button data-secs="86400" class="topt">1d</button>
+              <button data-secs="604800" class="topt">7d</button>
+            </div>
+          </div>
+
+          <h2 class="section-h">Members</h2>
+          <div class="card" id="gs-members"></div>
+          <div class="card" id="gs-add-card">
+            <button class="rowbtn" id="gs-add"><span class="rowico" data-icon="users"></span>Add members</button>
+          </div>
+
+          <h2 class="section-h">Options</h2>
+          <div class="card">
+            <button class="rowbtn" id="gs-search"><span class="rowico" data-icon="search"></span>Search in chat</button>
+            <button class="rowbtn" id="gs-media"><span class="rowico" data-icon="file"></span>Media, files &amp; voice</button>
+          </div>
+
+          <h2 class="section-h">Danger zone</h2>
+          <div class="card">
+            <button class="rowbtn danger" id="gs-leave"><span class="rowico" data-icon="x"></span>Leave group</button>
+            <button class="rowbtn danger" id="gs-delete"><span class="rowico" data-icon="trash"></span>Delete for me</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── New group ───────────────────────────────────────────── -->
+      <section class="screen" data-screen="newgroup">
+        <header class="bar">
+          <button class="icon-btn" id="ng-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">New group</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <label class="field">
+            <span>Group name</span>
+            <input id="ng-name" type="text" placeholder="e.g. escape committee" autocomplete="off" />
+          </label>
+          <h2 class="section-h">Members</h2>
+          <div class="card" id="ng-members"></div>
+          <p class="hint" id="ng-hint" hidden>You need contacts first — start a chat before making a group.</p>
+          <button id="ng-create" class="btn">Create group</button>
+        </div>
+      </section>
+
+      <!-- ── New chat ────────────────────────────────────────────── -->
+      <section class="screen" data-screen="newchat">
+        <header class="bar">
+          <button class="icon-btn" id="nc-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">New chat</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <p class="lede">Enter a username. Sona verifies their key against the
+            transparency log before it starts a session.</p>
+          <label class="field">
+            <span>Username</span>
+            <input id="nc-user" type="text" placeholder="username" autocomplete="off" spellcheck="false" autocapitalize="none" />
+          </label>
+          <button id="nc-start" class="btn">Verify &amp; open</button>
+        </div>
+      </section>
+
+      <!-- ── Settings ────────────────────────────────────────────── -->
+      <section class="screen" data-screen="settings">
+        <header class="bar">
+          <button class="icon-btn" id="se-back" aria-label="Back" data-icon="back"></button>
+          <div class="bar-title">Settings</div>
+          <span class="bar-spacer"></span>
+        </header>
+        <div class="pane">
+          <div class="card profile-card">
+            <div class="avatar-edit">
+              <button class="avatar editable" id="se-avatar" aria-label="Change your photo"><span class="av-cam" data-icon="cam"></span></button>
+              <button class="btn btn-ghost btn-sm" id="se-avatar-rm" hidden>Remove photo</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="row"><span>Username</span><b id="se-user">—</b></div>
+            <div class="row"><span>Relay</span>
+              <span class="relay-actions">
+                <b id="se-relay" class="mono">—</b>
+                <button class="icon-btn" id="se-relay-copy" aria-label="Copy relay address" data-icon="copy"></button>
+                <button class="icon-btn" id="se-relay-qr" aria-label="Show invite QR" data-icon="qr" hidden></button>
+                <button class="icon-btn" id="se-relay-info" aria-label="About sharing this relay" data-icon="info"></button>
+              </span>
+            </div>
+          </div>
+
+          <h2 class="section-h">Security</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-audit">
+              <span>Audit my key in the log</span>
+              <em id="se-audit-res"></em>
+            </button>
+          </div>
+          <p class="hint">Confirms the transparency log still binds your username to your
+            real keys — catches a rogue entry filed under your name.</p>
+
+          <h2 class="section-h">Devices</h2>
+          <p class="devwarn" id="se-devices-warn" hidden></p>
+          <div class="card" id="se-devices"><div class="hint devrow-hint">Loading…</div></div>
+          <div class="card">
+            <button class="rowbtn" id="se-link"><span class="rowico" data-icon="plus"></span>Link a device</button>
+            <button class="rowbtn" id="se-resync" hidden><span class="rowico" data-icon="clock"></span>Re-sync history to this device</button>
+          </div>
+          <p class="hint">Add another device to this account. Each device keeps its own keys;
+            a cross-signed device roster is published to the transparency log, so no one can
+            add a device without your key. Revoking a device cuts it off immediately.</p>
+
+          <h2 class="section-h">App lock</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-pin"><span class="rowico" data-icon="lock"></span>Unlock PIN<em id="se-pin-state"></em></button>
+            <button class="rowbtn" id="se-bio" hidden><span class="rowico" data-icon="shield"></span>Fingerprint unlock<em id="se-bio-state"></em></button>
+            <button class="rowbtn" id="se-auto"><span class="rowico" data-icon="check"></span>Auto-unlock at start<em id="se-auto-state"></em></button>
+            <button class="rowbtn" id="se-locktimer"><span class="rowico" data-icon="clock"></span>Lock when idle<em id="se-locktimer-state"></em></button>
+            <button class="rowbtn" id="se-reminder"><span class="rowico" data-icon="bell"></span>PIN reminders<em id="se-reminder-state"></em></button>
+          </div>
+          <p class="hint">Quick unlock wraps your vault key with a key held in this device's
+            OS key store — it never weakens the password itself. 5 wrong PINs disable PIN
+            unlock until you sign in with the password. Fingerprint unlock and auto-unlock
+            are mutually exclusive; the PIN can stay on alongside either.</p>
+
+          <h2 class="section-h">Privacy</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-reqs"><span class="rowico" data-icon="users"></span>Message requests<em id="se-reqs-state"></em></button>
+            <button class="rowbtn" id="se-reqtext"><span class="rowico" data-icon="chat"></span>Message with request<em id="se-reqtext-state"></em></button>
+            <button class="rowbtn" id="se-typing"><span class="rowico" data-icon="edit"></span>Send typing indicators<em id="se-typing-state"></em></button>
+            <button class="rowbtn" id="se-receipts"><span class="rowico" data-icon="check"></span>Send read receipts<em id="se-receipts-state"></em></button>
+            <button class="rowbtn" id="se-notif"><span class="rowico" data-icon="bell"></span>Notification content<em id="se-notif-state"></em></button>
+            <button class="rowbtn" id="se-proxy"><span class="rowico" data-icon="shield"></span>Tor / SOCKS proxy<em id="se-proxy-state"></em></button>
+          </div>
+          <p class="hint">With message requests on, someone new has to knock first — you decide
+            who reaches you, and "message with request" controls whether their first message
+            travels along or stays back until you accept. Typing and read receipts are courtesy
+            signals — turn either off and this device sends nothing (it never sends-then-hides).
+            Notification content controls how much a lock screen reveals when a message arrives.</p>
+
+          <h2 class="section-h">Notifications &amp; delivery</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-delivery-mode"><span class="rowico" data-icon="bell"></span>Delivery mode<em id="se-delivery-mode-state"></em></button>
+            <button class="rowbtn" id="se-up"><span class="rowico" data-icon="bell"></span>Push wake-ups<em id="se-up-state"></em></button>
+            <button class="rowbtn" id="se-delivery-health"><span class="rowico" data-icon="shield"></span>Delivery health<em id="se-delivery-health-state"></em></button>
+            <button class="rowbtn" id="se-test-notif"><span class="rowico" data-icon="check"></span>Send a test notification</button>
+            <button class="rowbtn" id="se-test-ring"><span class="rowico" data-icon="bell"></span>Test the call ring</button>
+          </div>
+          <p class="hint" id="se-delivery-hint">Connection mode keeps an encrypted socket open (no
+            third party, more battery). Push mode lets the relay send a content-free wake-up —
+            through the system push, or on de-Googled phones through a UnifiedPush app of your
+            choice — when a message waits. Nothing readable ever leaves this device.</p>
+
+          <h2 class="section-h">Updates</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-update"><span class="rowico" data-icon="clock"></span>Check for updates<em id="se-update-state"></em></button>
+          </div>
+          <p class="hint" id="se-update-hint">Updates come from your relay operator's channel and
+            are signature-verified on this device before anything installs.</p>
+
+          <h2 class="section-h">Account</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-chuser"><span class="rowico" data-icon="edit"></span>Change username</button>
+            <button class="rowbtn" id="se-chpass"><span class="rowico" data-icon="lock"></span>Change password</button>
+            <button class="rowbtn danger" id="se-delacct"><span class="rowico" data-icon="trash"></span>Delete account</button>
+          </div>
+          <p class="hint">Account changes take your password, an OS identity check (on
+            Android), and your PIN — all three, in that order. Deleting the account is the
+            same ceremony and can only be done from the primary device: the relay forgets
+            you, your username frees up after 7 days, other devices are unlinked, and this
+            device is wiped.</p>
+
+          <button class="btn btn-danger" id="se-lock">Lock</button>
+          <p class="about">Sona — the messenger where the guards are locked outside.
+            E2EE · sealed sender · key transparency · self-hosted.</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- Vendored QR encoder (qrcode-generator, MIT) — the decoder (vendor/jsQR.js) is
+         lazy-loaded the first time the camera scanner opens. No remote assets (strict CSP). -->
+    <script src="vendor/qrcode.js"></script>
+    <!-- App scripts: classic (non-module) scripts sharing one global scope, loaded in a
+         fixed order. 00-core defines the shared helpers; 99-boot runs boot() last. -->
+    <script src="js/00-core.js"></script>
+    <script src="js/10-onboard.js"></script>
+    <script src="js/20-chats.js"></script>
+    <script src="js/30-thread.js"></script>
+    <script src="js/31-scroll.js"></script>
+    <script src="js/33-msg-actions.js"></script>
+    <script src="js/34-composer.js"></script>
+    <script src="js/35-attach.js"></script>
+    <script src="js/36-mentions.js"></script>
+    <script src="js/37-gallery.js"></script>
+    <script src="js/38-emoji.js"></script>
+    <script src="js/40-voice.js"></script>
+    <script src="js/50-media.js"></script>
+    <script src="js/60-settings.js"></script>
+    <script src="js/70-applock.js"></script>
+    <script src="js/80-calls.js"></script>
+    <script src="js/99-boot.js"></script>
+  </body>
+</html>

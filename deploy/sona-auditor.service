@@ -1,0 +1,46 @@
+# Systemd unit for the standalone Key Transparency auditor. Run this on a DIFFERENT
+# machine than the relay (a VPS, a home server, a friend's box) — independence is what
+# makes split-view detection meaningful.
+#
+#   install -m 755 target/release/sona-auditor /usr/local/bin/
+#   install -m 644 deploy/sona-auditor.service /etc/systemd/system/
+#   systemctl edit sona-auditor    # set SONA_RELAY_URL (and SONA_KT_PUBKEY if known)
+#   systemctl enable --now sona-auditor
+#
+# Alarms land in the journal and as evidence files under /var/lib/sona-auditor.
+
+[Unit]
+Description=Sona Key Transparency auditor (log witness)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sona-auditor
+# Environment=SONA_RELAY_URL=https://relay.example.org
+# Environment=SONA_KT_PUBKEY=<base64 pinned key; omit for trust-on-first-use>
+Environment=AUDITOR_STATE=/var/lib/sona-auditor/sona-auditor.json
+Environment=AUDITOR_INTERVAL_SECS=300
+
+DynamicUser=yes
+StateDirectory=sona-auditor
+WorkingDirectory=/var/lib/sona-auditor
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

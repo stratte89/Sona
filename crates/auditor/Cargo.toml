@@ -1,0 +1,27 @@
+[package]
+name = "auditor"
+version = "0.0.0"
+edition = "2021"
+description = "Standalone Sona Key Transparency auditor: witnesses a relay's signed tree heads over time and produces non-repudiable evidence if the log is rewritten, rolled back, or forked."
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "sona-auditor"
+path = "src/main.rs"
+
+[dependencies]
+kt-log = { path = "../kt-log" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Same HTTP stack as client-core: rustls only, no system TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+# End-to-end tests drive the real relay in-process.
+server = { path = "../server" }
+axum = { version = "0.8", features = ["ws"] }

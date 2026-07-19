@@ -1,0 +1,80 @@
+[package]
+name = "sona-desktop"
+version = "0.0.0"
+edition = "2021"
+description = "Sona desktop/Android app (Tauri 2). Thin shell over the headless client-core SDK."
+license = "AGPL-3.0-or-later"
+
+# `sona-desktop` is a DETACHED package (own [workspace] below): it is built with
+# `cargo tauri` using the platform webview/Android toolchains, not as part of the client
+# workspace. This keeps `cargo test` on client-core runnable in a plain-Rust environment.
+[workspace]
+
+[lib]
+# Tauri 2 mobile requires a library target; the binary just calls into it.
+name = "sona_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+client-core = { path = "../../client-core", features = ["os-keyring"] }
+crypto-core = { path = "../../../crates/crypto-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+base64 = "0.22"
+tauri-plugin-dialog = "2"
+# New-message / incoming-call notifications while the app is unfocused or backgrounded.
+tauri-plugin-notification = "2"
+zeroize = "1"
+# Voice calls: platform audio devices for the client-core call engine.
+cpal = "0.18"
+# In-app updates (update.rs): manifest + artifact signatures are minisign (ed25519),
+# verified against the pubkey baked in at build time. sha256/hex for the extra pin.
+minisign-verify = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+
+# Video calls: camera capture (V4L2 / AVFoundation / MSMF) → I420 for the engine.
+# Android gets frames from the Kotlin bridges over JNI instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+nokhwa = { version = "0.10", features = ["input-native"] }
+# Desktop tray: closing the window hides to tray so delivery + notifications keep
+# running; the tray menu is the way back in (and the real quit).
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Noise suppression for call capture (pure-Rust RNNoise). Android instead uses the
+# platform NoiseSuppressor attached to its VOICE_COMMUNICATION capture (audio.rs).
+nnnoiseless = { version = "0.5", default-features = false }
+
+# Screen share, Windows/macOS: Windows Graphics Capture / CoreGraphics.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+xcap = "0.9"
+
+# Biometric gate: JNI bridge to the BiometricGate.kt injected by harden-android.sh.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+# stdio→logcat bridge (release builds otherwise lose all Rust diagnostics on-device).
+libc = "0.2"
+
+# Voice messages: wry never enables WebKitGTK's media stream or answers its permission
+# requests, so getUserMedia (microphone) is dead on Linux without going straight at the
+# webview. Version pinned to the one wry links against.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+# Screen share, Linux/X11: pure-Rust XCB (GetImage + RandR monitor picking). No
+# system deps; Wayland needs the PipeWire portal and is not wired yet.
+x11rb = { version = "0.13", features = ["randr"] }
+# Screen-share system audio: the ALSA host cannot enumerate Pulse/PipeWire "monitor"
+# sources, so Linux additionally enables cpal's PulseAudio host (a pure-Rust protocol
+# client; PipeWire serves the same protocol via pipewire-pulse).
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
+# Voice messages / QR scanner on Windows: answer WebView2's PermissionRequested for
+# mic + camera on our only page (parity with the Linux WebKitGTK handler in lib.rs).
+# Version tracks the one wry links against.
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.38"
