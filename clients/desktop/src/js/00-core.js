@@ -47,6 +47,13 @@ class LruCache {
     }
   }
   forEach(fn) { this.map.forEach(fn); }
+  delete(k) {
+    if (!this.map.has(k)) return;
+    const v = this.map.get(k);
+    this.map.delete(k);
+    this.spent -= this.costOf(v);
+    if (this.onEvict) try { this.onEvict(v, k); } catch (_) {}
+  }
   clear() {
     if (this.onEvict) this.map.forEach((v, k) => { try { this.onEvict(v, k); } catch (_) {} });
     this.map.clear(); this.spent = 0;

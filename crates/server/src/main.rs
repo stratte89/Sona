@@ -34,6 +34,10 @@
 //! * `MAX_WS_PER_IP`    — max concurrent delivery sockets per client address (default 16).
 //! * `MAX_STORAGE_BYTES` — global ceiling on stored attachment + sync bytes (default
 //!   10 GiB). Uploads over it get `507`; TTL expiry frees space.
+//! * `BLOB_TTL_DAYS`   — hard attachment retention cap in days (default 30). Blobs are
+//!   deleted when it elapses regardless of chat state — E2EE deletion signals and
+//!   sealed-sender uploads mean the relay cannot tie a blob to a message, so the
+//!   schedule is the only deletion it can honestly perform.
 //! * `REGISTRATION_CODES` — comma-separated single-use invite codes (min 8 chars each).
 //!   Non-empty = brand-new account claims need an unused code (`x-sona-invite` header);
 //!   rotations/renames/linked devices are never gated. Consumed codes persist in the DB.
@@ -217,6 +221,13 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(Config::default().max_storage_bytes);
 
+    let blob_ttl_secs = std::env::var("BLOB_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|d| *d > 0)
+        .map(|d| d * 24 * 3600)
+        .unwrap_or(Config::default().blob_ttl_secs);
+
     // Single-use registration invite codes. Digests only in memory; consumed codes are
     // remembered durably (DB) so a restart can't resurrect one.
     let registration_code_hashes: Vec<String> = std::env::var("REGISTRATION_CODES")
@@ -253,6 +264,7 @@ async fn main() {
         ip_allowlist,
         max_ws_per_client,
         max_storage_bytes,
+        blob_ttl_secs,
         registration_code_hashes,
     };
 

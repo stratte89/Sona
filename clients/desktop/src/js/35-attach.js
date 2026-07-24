@@ -552,6 +552,19 @@ $('#cs-block').onclick = async () => {
   } catch (e) { toast(say(e), 'err'); }
 };
 $('#cs-delete').onclick = () => deleteChatModal(cur.username, cur.peer);
+// Repair a one-way-silent conversation: a desynced ratchet cannot self-heal, and the
+// peer can't tell us it's broken (a non-prekey message carries no sender), so the reset
+// has to be driven from this side. Nothing is deleted — the next message just renegotiates.
+$('#cs-resetsession').onclick = async () => {
+  if (!(await confirmModal('Reset secure session?',
+    `Renegotiates encryption with ${cur.username} from scratch. Use this if your messages stop arriving for them while you both still show as connected. No messages are deleted, and they don't need to do anything.`,
+    'Reset'))) return;
+  try {
+    await invoke('reset_secure_session', { username: cur.username, peer: cur.peer });
+    toast('Secure session reset — send them a message to re-establish it', 'ok');
+    if (cur.peer) renderThread(cur.peer);
+  } catch (e) { toast(say(e), 'err'); }
+};
 $('#th-unblock').onclick = async () => {
   try {
     await invoke('set_blocked', { username: cur.username, blocked: false });

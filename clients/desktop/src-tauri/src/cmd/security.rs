@@ -1,5 +1,79 @@
 use crate::*;
 
+/// Repair a conversation that has gone one-way silent: drop our ratchet sessions with
+/// every device of this contact so the next message performs a fresh handshake.
+///
+/// A desynced session cannot self-heal. We keep encrypting to it happily while the peer's
+/// decrypt yields `NoSession` and drops the message — both ends still show "connected", so
+/// it is indistinguishable from nobody writing. A non-prekey message carries no cleartext
+/// sender, so the peer cannot even tell us which session to reset: the repair has to be
+/// driven from this side. Their copy is untouched — they bootstrap a new inbound session
+/// from our next pre-key message. Records a system chip so the repair is visible in the
+/// transcript. Returns how many device sessions were dropped (0 is equally fine: nothing
+/// was established in the first place).
+/// Automatic half of the session repair, run before every 1:1 send.
+///
+/// If our recent sends to `peer` were never acknowledged we are almost certainly
+/// encrypting into a session they can no longer open — invisible to us, and it never
+/// recovers on its own (`ensure_device_session` reuses whatever already exists). Dropping
+/// ours makes the message we are about to send a fresh handshake, which they bootstrap
+/// automatically, so a broken conversation heals on the next thing the user types.
+///
+/// The decision is made entirely from LOCAL state and is rate-limited
+/// ([`History::session_looks_dead`]), so nothing remote — a peer, or the relay — can
+/// provoke a reset. That is deliberate: the obvious alternative (the receiver asking peers
+/// to reset when it sees undecryptable traffic) is exploitable, because anyone can post
+/// junk ciphertext into a mailbox and the resulting burst of requests would enumerate that
+/// user's contacts. A false positive here costs exactly one extra handshake and loses
+/// nothing — the peer keeps their existing sessions alongside the new one.
+///
+/// Best-effort: a failure must never block the send.
+pub(crate) async fn auto_reset_if_dead(
+    s: &mut Session,
+    client: &Arc<Client>,
+    username: &str,
+    peer: &str,
+) {
+    if !s.history.session_looks_dead(peer, now_secs()) {
+        return;
+    }
+    let Some(account) = s.account.as_mut() else {
+        return;
+    };
+    match client
+        .reset_sessions_with(account, &mut s.history, username, peer)
+        .await
+    {
+        Ok(_) => {
+            s.history.mark_session_reset(peer, now_secs());
+            s.history
+                .record_system(peer, "Secure session reset automatically", now_secs());
+            let _ = s.persist();
+        }
+        Err(e) => eprintln!("client: auto session reset failed: {e}"),
+    }
+}
+
+#[tauri::command]
+pub async fn reset_secure_session(
+    state: tauri::State<'_, AppState>,
+    username: String,
+    peer: String,
+) -> Result<usize, String> {
+    let mut s = state.inner.lock().await;
+    let client = s.client.clone().ok_or("not configured")?;
+    let sess = &mut *s;
+    let account = sess.account.as_mut().ok_or("locked")?;
+    let dropped = client
+        .reset_sessions_with(account, &mut sess.history, username.trim(), peer.trim())
+        .await
+        .map_err(|e| e.to_string())?;
+    sess.history
+        .record_system(peer.trim(), "Secure session reset", now_secs());
+    sess.persist()?;
+    Ok(dropped)
+}
+
 #[tauri::command]
 pub async fn security_status(state: tauri::State<'_, AppState>) -> Result<SecurityView, String> {
     let os_auth = match bio::availability_async().await {

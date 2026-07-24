@@ -716,19 +716,35 @@ async function refreshScreenAudioAvail() {
 // `sync` = new inbound state (repaint), `conn` = relay link up/down. If event
 // registration fails (e.g. a missing capability), fall back to polling so the UI
 // still refreshes — delivery must never depend on a silent promise rejection.
+// A "seen" receipt is a promise the user actually LOOKED at the message. A thread
+// left open behind a minimized / backgrounded window (taskbar, another virtual
+// desktop, screen off) is NOT looked at — sending a read receipt then is a lie the
+// sender sees as two blue ticks. Only ack as seen when the window is genuinely on
+// screen and focused; otherwise the receipt waits for the next real focus.
+function threadOnScreen() {
+  return document.visibilityState === 'visible' && document.hasFocus();
+}
 async function onSync() {
   if (current === 'chats') loadChats();
   else if (current === 'requests') loadRequests();
   else if (current === 'thread' && cur.peer && !cur.keyChanged) {
+    const seeable = threadOnScreen();
     if (cur.kind === 'group') {
       await renderGroupThread(cur.peer);
-      try { await invoke('mark_group_seen', { groupId: cur.peer }); } catch (_) {}
+      if (seeable) { try { await invoke('mark_group_seen', { groupId: cur.peer }); } catch (_) {} }
     } else {
       await renderThread(cur.peer);
-      markSeen(); // thread is open — ack any just-arrived messages as seen
+      if (seeable) markSeen(); // thread is open AND on screen — ack as seen
     }
   }
 }
+// Coming back to a thread that received messages while the window was hidden/blurred
+// (where onSync deliberately withheld the receipt) — ack them now that they're seen.
+window.addEventListener('focus', () => {
+  if (current !== 'thread' || !cur.peer || cur.keyChanged || !threadOnScreen()) return;
+  if (cur.kind === 'group') { invoke('mark_group_seen', { groupId: cur.peer }).catch(() => {}); }
+  else markSeen();
+});
 (async () => {
   try {
     await listen('conn', (ev) => {
@@ -737,6 +753,15 @@ async function onSync() {
       $('#conn-note').hidden = up;
     });
     await listen('sync', onSync);
+    // Something addressed to us arrived that we couldn't decrypt. We can't name the
+    // sender (a non-prekey message carries none), so point at the cure rather than a
+    // chat: without this the conversation just looks silent on both ends. Rate-limited
+    // to one warning per app run so a backlog can't spam.
+    await listen('undecryptable', () => {
+      if (window.__undecWarned) return;
+      window.__undecWarned = true;
+      toast('A message arrived that could not be decrypted. If a chat has gone silent, open it → Reset secure session.', 'err');
+    });
     await listen('call', onCallEvent);
     await listen('group_call', onGroupCallEvent);
     await listen('typing', (ev) => {

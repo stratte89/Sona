@@ -277,6 +277,9 @@ pub(crate) async fn install_unlocked_account(
         Ok(hist_blob) => History::open(&account.data_key(), &hist_blob),
         Err(_) => History::new(),
     };
+    // Heal any thread that drifted into self-sync arrival order on an older build; new
+    // messages stay ordered on insert. One-time, cheap on already-ordered threads.
+    history.normalize_message_order();
     // On the primary (which includes every single-device account) our own identity key IS
     // the account primary key. Seed it so History::apply can recognize "us" in a group
     // epoch (kick/re-add detection) without waiting for a multi-device selfsync to run —

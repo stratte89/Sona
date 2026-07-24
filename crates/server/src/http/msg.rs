@@ -27,7 +27,13 @@ pub(crate) async fn send_message(
         }
         let to = env.to.clone();
         match inner.store.enqueue(env.clone(), t) {
-            Ok(()) => {}
+            Ok(true) => {}
+            // Idempotent: the relay already holds this exact message (an at-least-once
+            // retry after a lost ACK) or it arrived already-expired. Success, but there
+            // is nothing new to persist, deliver live, or wake for — the first arrival
+            // did all that. Returning 200 here is what stops the sender showing "Not
+            // sent" for a message the recipient already received.
+            Ok(false) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         }
         // Persist the queued message (envelope encrypted at rest) for offline durability.

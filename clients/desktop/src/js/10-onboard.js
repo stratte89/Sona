@@ -396,10 +396,7 @@ async function doLock(auto) {
   closeModal(); hideCtx(); closeLightbox();
   // Locking drops the keys — drop the decrypted media this session cached too
   // (clear() runs each cache's onEvict: blob URLs revoked, audio released).
-  cancelVoice(); stopNowPlaying();
-  voiceCache.clear();
-  imgCache.clear();
-  vidCache.clear();
+  clearMediaCaches();
   await refreshSec();
   renderUnlock();
   show('unlock');

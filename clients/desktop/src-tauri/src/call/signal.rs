@@ -113,7 +113,7 @@ pub(crate) async fn handle_call_signal(
             // earbuds must answer whether the ring is native or in-app.
             let ring_name = ring_title(&s, &username);
             eng().call_buttons_start(&call_id);
-            if !eng().is_focused() {
+            if !eng().on_screen() {
                 eng().show_ring(&call_id, &ring_name, false);
             }
             // Unanswered ring expires by itself (the caller times out too).
@@ -347,7 +347,7 @@ pub(crate) async fn handle_call_signal(
             // Headset-button session starts unconditionally, same as 1:1.
             let ring_name = ring_title(&s, &group_name);
             eng().call_buttons_start(&call_instance);
-            if !eng().is_focused() {
+            if !eng().on_screen() {
                 eng().show_ring(&call_instance, &ring_name, true);
             }
             let inner = inner.clone();

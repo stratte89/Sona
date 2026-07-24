@@ -169,6 +169,15 @@ pub(crate) struct Session {
     /// A device-linking ceremony in progress on THIS (new) device: the freshly created
     /// account + the link request it generated, held until the user completes linking.
     pub(crate) pending_link: Option<(Account, client_core::multidevice::LinkRequest)>,
+    /// Attribution quarantine: inbound events from a device key we can't attribute yet
+    /// while their claimed username IS a pinned contact (they linked a new device, or
+    /// their key rotated). Held per claimed username until a KT roster re-resolve
+    /// settles it (`runtime::resolve_attr_and_replay`); in-memory only — the frames
+    /// were acked, so a crash before resolution loses them (same as the silent drop
+    /// this replaces, but recoverable in every live path).
+    pub(crate) pending_attr: std::collections::HashMap<String, Vec<client_core::InboundEvent>>,
+    /// Usernames with a roster re-resolve already in flight (dedup for the spawn).
+    pub(crate) attr_inflight: std::collections::HashSet<String>,
 }
 
 /// Handle to a running call session (outgoing ring or connected either way).

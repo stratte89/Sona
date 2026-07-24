@@ -546,6 +546,12 @@
             <button class="rowbtn" id="cs-addgroup"><span class="rowico" data-icon="users"></span>Add to group</button>
           </div>
 
+          <h2 class="section-h">Troubleshooting</h2>
+          <div class="card">
+            <button class="rowbtn" id="cs-resetsession"><span class="rowico" data-icon="shield"></span>Reset secure session</button>
+          </div>
+          <p class="hint">Use this if they stop receiving your messages while both of you still show as connected — it renegotiates the encryption from scratch. Nothing is deleted.</p>
+
           <h2 class="section-h">Danger zone</h2>
           <div class="card">
             <button class="rowbtn danger" id="cs-block"><span class="rowico" data-icon="block"></span><span id="cs-block-label">Block</span></button>
@@ -729,6 +735,14 @@
             through the system push, or on de-Googled phones through a UnifiedPush app of your
             choice — when a message waits. Nothing readable ever leaves this device.</p>
 
+          <h2 class="section-h">Storage</h2>
+          <div class="card">
+            <button class="rowbtn" id="se-clearmedia"><span class="rowico" data-icon="trash"></span>Clear media cache<em id="se-clearmedia-state"></em></button>
+          </div>
+          <p class="hint">Photos, videos and voice messages are decrypted into memory only —
+            nothing is ever written to disk — and the cache is capped and dropped on lock or
+            exit. Clearing frees that memory now; media re-downloads when viewed again.</p>
+
           <h2 class="section-h">Updates</h2>
           <div class="card">
             <button class="rowbtn" id="se-update"><span class="rowico" data-icon="clock"></span>Check for updates<em id="se-update-state"></em></button>
@@ -763,6 +777,7 @@
     <script src="js/00-core.js"></script>
     <script src="js/10-onboard.js"></script>
     <script src="js/20-chats.js"></script>
+    <script src="js/29-media-cache.js"></script>
     <script src="js/30-thread.js"></script>
     <script src="js/31-scroll.js"></script>
     <script src="js/33-msg-actions.js"></script>
@@ -774,6 +789,7 @@
     <script src="js/40-voice.js"></script>
     <script src="js/50-media.js"></script>
     <script src="js/60-settings.js"></script>
+    <script src="js/61-updates.js"></script>
     <script src="js/70-applock.js"></script>
     <script src="js/80-calls.js"></script>
     <script src="js/99-boot.js"></script>

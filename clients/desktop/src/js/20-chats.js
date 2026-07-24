@@ -408,7 +408,7 @@ function rowMenu(c) {
       label: 'Delete notes…', icon: 'trash', danger: true,
       fn: async () => {
         if (!(await confirmModal('Delete your notes?', 'Every note on this device is wiped. Other devices keep their copies.', 'Delete'))) return;
-        try { await invoke('delete_chat', { username: NOTE_PEER, peer: NOTE_PEER, forBoth: false }); loadChats(); }
+        try { await invoke('delete_chat', { username: NOTE_PEER, peer: NOTE_PEER, forBoth: false }); clearMediaCaches(); loadChats(); }
         catch (e) { toast(say(e), 'err'); }
       },
     }];
@@ -533,6 +533,7 @@ function deleteChatModal(username, peer, after) {
     closeModal();
     try {
       await invoke('delete_chat', { username, peer, forBoth });
+      clearMediaCaches(); // the deleted thread's decrypted media must not linger in RAM
       toast('Chat deleted', 'ok');
       show('chats'); loadChats();
       if (after) after();

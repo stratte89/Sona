@@ -45,6 +45,9 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # Desktop tray: closing the window hides to tray so delivery + notifications keep
 # running; the tray menu is the way back in (and the real quit).
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# One running instance per machine: a second launch focuses the live window instead
+# of starting a rival process (two delivery loops on one vault corrupt history/ratchet).
+tauri-plugin-single-instance = "2"
 # Noise suppression for call capture (pure-Rust RNNoise). Android instead uses the
 # platform NoiseSuppressor attached to its VOICE_COMMUNICATION capture (audio.rs).
 nnnoiseless = { version = "0.5", default-features = false }
@@ -52,6 +55,7 @@ nnnoiseless = { version = "0.5", default-features = false }
 # Screen share, Windows/macOS: Windows Graphics Capture / CoreGraphics.
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 xcap = "0.9"
+
 
 # Biometric gate: JNI bridge to the BiometricGate.kt injected by harden-android.sh.
 [target.'cfg(target_os = "android")'.dependencies]
@@ -72,9 +76,17 @@ x11rb = { version = "0.13", features = ["randr"] }
 # sources, so Linux additionally enables cpal's PulseAudio host (a pure-Rust protocol
 # client; PipeWire serves the same protocol via pipewire-pulse).
 cpal = { version = "0.18", features = ["pulseaudio"] }
+# Notifications: post through notify-rust directly (same version the notification plugin
+# already pulls in) so we can set the freedesktop `desktop-entry` hint. Without it GNOME
+# can't tie the notification to Sona.desktop and files it as a SILENT background
+# notification — a sound but no on-screen banner.
+notify-rust = "4.18"
 
 # Voice messages / QR scanner on Windows: answer WebView2's PermissionRequested for
 # mic + camera on our only page (parity with the Linux WebKitGTK handler in lib.rs).
 # Version tracks the one wry links against.
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "0.38"
+# Toast notifications need this process to DECLARE its AppUserModelID (see lib.rs).
+# Version already in the dependency graph, so this pulls nothing new.
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
