@@ -139,6 +139,13 @@ pub struct Config {
     /// spreading uploads across many addresses must not fill the disk. Uploads over the
     /// ceiling get `507 Insufficient Storage`; expiry (TTL reaper) frees space.
     pub max_storage_bytes: u64,
+    /// Hard retention ceiling for attachment blobs, seconds (`BLOB_TTL_DAYS`, default
+    /// 30 days). Every upload is stamped `now + this` and the periodic reaper deletes
+    /// past-due rows unconditionally. This is the ONLY server-side deletion mechanism
+    /// for attachments: message/chat deletion signals are end-to-end encrypted and
+    /// uploads are sealed-sender, so the relay cannot map a blob to a message — by
+    /// design it deletes on schedule, never on chat activity.
+    pub blob_ttl_secs: u64,
     /// Hex SHA-256 digests of single-use registration invite codes
     /// (`REGISTRATION_CODES`). Non-empty = brand-new account claims require an unused
     /// code in `x-sona-invite`; rotations/renames/rosters are never gated. Empty = off.
@@ -163,6 +170,7 @@ impl Default for Config {
             ip_allowlist: Vec::new(),
             max_ws_per_client: 16,
             max_storage_bytes: 10 * 1024 * 1024 * 1024,
+            blob_ttl_secs: 30 * 24 * 3600,
             registration_code_hashes: Vec::new(),
         }
     }

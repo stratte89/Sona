@@ -388,6 +388,7 @@ function deleteMsgModal(m) {
     try {
       if (isGroup) await invoke('delete_group_message', { groupId: cur.peer, msgId: m.msg_id });
       else await invoke('delete_message', { peer: cur.peer, msgId: m.msg_id });
+      purgeMediaCache(m.msg_id);
       repaint();
     } catch (e) { toast(say(e), 'err'); }
   };
@@ -397,6 +398,7 @@ function deleteMsgModal(m) {
     try {
       if (isGroup) await invoke('delete_group_message_everyone', { groupId: cur.peer, msgId: m.msg_id });
       else await invoke('delete_message_everyone', { username: cur.username, peer: cur.peer, msgId: m.msg_id });
+      purgeMediaCache(m.msg_id);
       repaint();
     } catch (e) { toast(say(e), 'err'); }
   };

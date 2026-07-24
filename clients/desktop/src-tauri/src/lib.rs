@@ -36,6 +36,7 @@ use tokio::sync::Mutex;
 
 #[cfg(target_os = "android")]
 mod android_media;
+mod attr_heal;
 mod audio;
 mod bio;
 mod call;
@@ -53,6 +54,7 @@ mod runtime;
 mod state;
 mod update;
 mod views;
+pub(crate) use attr_heal::*;
 pub(crate) use call::cmd::*;
 pub(crate) use call::engine::*;
 pub(crate) use call::group::*;
@@ -439,7 +441,21 @@ fn redirect_stdio_to_logcat() {
 pub fn run() {
     #[cfg(target_os = "android")]
     redirect_stdio_to_logcat();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Single-instance guard (desktop only — Android has one activity by construction).
+    // MUST be the first plugin registered. A second launch never spins up a rival
+    // process: two delivery loops sharing one vault would race the ratchet and history.
+    // Instead the running instance raises and focuses its window, so the user sees the
+    // app they already had open.
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(w) = app.webview_windows().values().next() {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
@@ -456,6 +472,17 @@ pub fn run() {
                 // Desktop: closing the window hides to the tray — the process (and with
                 // it the delivery socket + notifications) stays alive. Quit lives in
                 // the tray menu. Android never emits this event.
+                // Some window managers report a minimize as a resize rather than a focus
+                // change, which would leave the cached flag claiming we are on screen and
+                // silence notifications. We are on the MAIN thread here, so asking the
+                // window is free — never do this from the delivery loop (see
+                // `Engine::on_screen`).
+                #[cfg(not(target_os = "android"))]
+                tauri::WindowEvent::Resized(_) => {
+                    if window.is_minimized().unwrap_or(false) {
+                        engine::global().set_focused(false);
+                    }
+                }
                 #[cfg(not(target_os = "android"))]
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let _ = window.hide();
@@ -468,6 +495,25 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Windows toasts: a desktop app must DECLARE its AppUserModelID, and it must
+            // equal the one on its Start-Menu shortcut (the NSIS installer stamps
+            // `${BUNDLEID}` = this same identifier). The notification is created for that
+            // AUMID, but nothing in tao/tauri tells Windows the process owns it — so the
+            // toast was silently dropped and Sona never even appeared under
+            // Settings → Notifications. Read the id from config so it can never drift.
+            #[cfg(target_os = "windows")]
+            {
+                use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+                let aumid: Vec<u16> = app
+                    .config()
+                    .identifier
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe {
+                    SetCurrentProcessExplicitAppUserModelID(aumid.as_ptr());
+                }
+            }
             // Desktop tray: the way back in after close-to-tray, and the real quit.
             #[cfg(not(target_os = "android"))]
             {
@@ -540,6 +586,7 @@ pub fn run() {
             cmd::chat::thread,
             cmd::chat::open_chat,
             cmd::chat::accept_key_change,
+            cmd::security::reset_secure_session,
             cmd::chat::mark_verified,
             cmd::chat::mark_seen,
             cmd::chat::send,

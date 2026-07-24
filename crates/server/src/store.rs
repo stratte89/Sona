@@ -42,8 +42,6 @@ pub enum RelayError {
     ZkViolation,
     #[error("rejected: recipient mailbox is full")]
     MailboxFull,
-    #[error("rejected: duplicate message id")]
-    Duplicate,
     #[error("rejected: relay is at capacity")]
     StoreFull,
 }
@@ -61,7 +59,13 @@ impl MessageStore {
 
     /// Accept an envelope for later delivery. `now` is unix-seconds (injected so the
     /// logic is testable without a clock). Enforces every relay invariant, fail-closed.
-    pub fn enqueue(&mut self, mut env: Envelope, now: u64) -> Result<(), RelayError> {
+    /// `Ok(true)` = newly stored; `Ok(false)` = nothing new to store (an already-expired
+    /// message, or an **idempotent duplicate** the relay already holds). Delivery is
+    /// at-least-once: a client whose ACK was lost retries the same `msg_id`, and a message
+    /// the recipient already received must return success, not an error — otherwise the
+    /// sender shows "Not sent" for a message that went through. The caller skips the live
+    /// push, the wake, and the DB write when this is `false`.
+    pub fn enqueue(&mut self, mut env: Envelope, now: u64) -> Result<bool, RelayError> {
         if !env.is_zk_clean() {
             return Err(RelayError::ZkViolation);
         }
@@ -71,7 +75,7 @@ impl MessageStore {
         // An already-expired message is silently dropped — nothing to store, and it
         // is not the sender's error that the recipient was slow to come online.
         if matches!(env.expires_at, Some(exp) if exp <= now) {
-            return Ok(());
+            return Ok(false);
         }
 
         // Bound the number of distinct mailboxes: a brand-new recipient hash is refused
@@ -81,14 +85,17 @@ impl MessageStore {
             return Err(RelayError::StoreFull);
         }
         let mailbox = self.mailboxes.entry(key).or_default();
+        // Already holding this exact message: idempotent success (a retry after a lost
+        // ACK), NOT a rejection. Re-storing would double-deliver; erroring would strand
+        // a delivered message as "Not sent" on the sender.
         if mailbox.iter().any(|m| m.msg_id == env.msg_id) {
-            return Err(RelayError::Duplicate);
+            return Ok(false);
         }
         if mailbox.len() >= MAX_MAILBOX_DEPTH {
             return Err(RelayError::MailboxFull);
         }
         mailbox.push(env);
-        Ok(())
+        Ok(true)
     }
 
     /// Drop every expired message and any mailbox left empty. Called by the relay's
@@ -167,12 +174,19 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_msg_id_is_rejected() {
+    fn duplicate_msg_id_is_idempotent() {
         let mut store = MessageStore::new();
-        store.enqueue(env_for("bob", "m1", None), 1000).unwrap();
+        // First store is "newly stored"; a re-post of the same id is idempotent success
+        // (Ok(false) = already held), NOT an error — an at-least-once retry of a message
+        // the recipient already received must not surface to the sender as "Not sent".
+        assert_eq!(store.enqueue(env_for("bob", "m1", None), 1000), Ok(true));
+        assert_eq!(store.enqueue(env_for("bob", "m1", None), 1000), Ok(false));
+        // And it did not double-store.
         assert_eq!(
-            store.enqueue(env_for("bob", "m1", None), 1000),
-            Err(RelayError::Duplicate)
+            store
+                .fetch(&IdentityHash::from_identifier("bob"), 1000)
+                .len(),
+            1
         );
     }
 

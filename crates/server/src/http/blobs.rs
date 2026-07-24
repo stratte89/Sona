@@ -4,8 +4,6 @@ use super::*;
 
 /// Max attachment blob size (the client ciphertext). 10 MiB.
 pub const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
-/// How long an undownloaded blob is retained.
-const BLOB_TTL_SECS: u64 = 30 * 24 * 3600;
 
 #[derive(Serialize)]
 struct BlobUploadResponse {
@@ -48,7 +46,9 @@ pub(crate) async fn upload_blob(
     };
     let t = now();
     let id = random_blob_id();
-    let expires = Some(t + BLOB_TTL_SECS);
+    // Hard retention cap (BLOB_TTL_DAYS): the only server-side deletion for
+    // attachments — see the Config field docs for why chat state can't drive it.
+    let expires = Some(t + state.config.blob_ttl_secs);
 
     let mut inner = state.inner.lock().unwrap();
     if !inner.rate.check(&key, t) {

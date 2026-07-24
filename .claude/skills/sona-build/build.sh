@@ -72,6 +72,13 @@ bump_version() {
   local cur next
   cur="$(grep -oE '"version": *"[0-9]+\.[0-9]+\.[0-9]+"' "$TAURI_CONF" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   [ -n "$cur" ] || die "cannot read version from tauri.conf.json"
+  # Escape hatch: rebuild the version already committed (e.g. a prior run bumped, then a
+  # build step failed) instead of bumping past it. Only the build steps re-run.
+  if [ -n "${SONA_NO_BUMP:-}" ]; then
+    VERSION="$cur"
+    log "version: keeping $cur (SONA_NO_BUMP set — no bump, no commit)"
+    return
+  fi
   next="${cur%.*}.$(( ${cur##*.} + 1 ))"
   sed -i "s|\"version\": \"$cur\"|\"version\": \"$next\"|" "$TAURI_CONF"
   ( cd "$REPO" && git add "$TAURI_CONF" && git commit -q -m "chore(release): v$next" ) \
@@ -217,7 +224,11 @@ EOF
   else
     log "no SONA_UPDATE_BASE/SONA_APT_KEYRING — plain deb (no apt enrollment)"
   fi
-  ( cd "$DESKTOP" && cargo tauri build --bundles deb )
+  # opusic-sys builds Opus via cmake here too. Bare `cmake` on this box resolves to the
+  # broken ~/.local/bin pip shim (missing module) — point $CMAKE at the same working
+  # bundled binary the apk build uses, or the deb dies before it starts.
+  local CMAKE_BIN; CMAKE_BIN="$(pick_cmake)" || die "no usable cmake found"
+  ( cd "$DESKTOP" && CMAKE="$CMAKE_BIN" cargo tauri build --bundles deb )
   local deb
   deb="$(ls -t "$DESKTOP"/src-tauri/target/release/bundle/deb/*.deb | head -1)"
   [ -f "$deb" ] || die "no .deb produced"
@@ -248,12 +259,40 @@ build_apk() {
     log "no clients/desktop/.env.fcm — building without FCM (push modes disabled)"
   fi
 
+  # The Android project (gen/android) is generated per machine, not committed — a fresh
+  # or recreated tree has none, and hardening edits files that init produces. Generate it
+  # first when absent. (Signing still needs gen/android/keystore.properties per machine.)
+  if [ ! -d "$DESKTOP/src-tauri/gen/android/app" ]; then
+    log "generating Android project (cargo tauri android init)"
+    ( cd "$DESKTOP" && cargo tauri android init )
+  fi
+
+  # `android init` ships STOCK Tauri launcher icons; stamp the Sona icon into the fresh
+  # res/mipmap-* so the APK isn't ugly. `tauri icon` also re-encodes the committed
+  # desktop/iOS icons — revert those, leaving only the (gitignored) gen/android mipmaps.
+  log "stamping Sona launcher icons"
+  ( cd "$DESKTOP" && cargo tauri icon src-tauri/icons/icon.png >/dev/null 2>&1 )
+  git -C "$REPO" checkout -- clients/desktop/src-tauri/icons 2>/dev/null || true
+
   log "applying Android hardening"
   ( cd "$DESKTOP" && bash scripts/harden-android.sh )
   # Pin the cleartext placeholder to literal false (generated manifest; regenerated on init).
   local manifest="$DESKTOP/src-tauri/gen/android/app/src/main/AndroidManifest.xml"
   [ -f "$manifest" ] && sed -i 's/android:usesCleartextTraffic="${usesCleartextTraffic}"/android:usesCleartextTraffic="false"/' "$manifest" || true
   ( cd "$DESKTOP" && bash scripts/harden-android.sh --check ) || die "hardening check failed"
+
+  # Restore the release signing config from its DURABLE home (kept with the other release
+  # keys outside the repo — the gen/ copy is regenerated on every init and was lost when
+  # the working dir was deleted, which is why 0.1.7's key became unrecoverable). Harden
+  # step 12 wired gradle to read gen/android/keystore.properties; supply it here. Override
+  # the source with SONA_KEYSTORE_PROPS.
+  local ks_props="${SONA_KEYSTORE_PROPS:-$HOME/.config/sona-release/android-keystore.properties}"
+  if [ -f "$ks_props" ]; then
+    cp "$ks_props" "$DESKTOP/src-tauri/gen/android/keystore.properties"
+    log "restored release signing config from $ks_props"
+  else
+    log "WARNING: no keystore.properties at $ks_props — the APK will build UNSIGNED"
+  fi
 
   # Fresh opus dirs avoid a stale CMakeCache pinning a bad install prefix.
   rm -rf "$DESKTOP"/src-tauri/target/*-linux-android*/release/build/opusic-sys-* 2>/dev/null || true
@@ -263,7 +302,7 @@ build_apk() {
   local apk
   apk="$(ls -t "$DESKTOP"/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk | head -1)"
   [ -f "$apk" ] || die "no .apk produced"
-  cp "$apk" "$DEST/Sona-arm64.apk"
+  cp "$apk" "$DEST/Sona-${VERSION}-arm64.apk"
   echo "$apk"
 }
 
@@ -283,6 +322,6 @@ esac
 echo
 log "done. artifacts:"
 [ -n "$DEB_OUT" ] && echo "  .deb: $DEB_OUT  (copied to $DEST/)"
-[ -n "$APK_OUT" ] && echo "  .apk: $APK_OUT  (copied to $DEST/Sona-arm64.apk)"
+[ -n "$APK_OUT" ] && echo "  .apk: $APK_OUT  (copied to $DEST/Sona-${VERSION}-arm64.apk)"
 [ -n "$EXE_OUT" ] && echo "  .exe: $EXE_OUT  (copied to $DEST/)"
 exit 0

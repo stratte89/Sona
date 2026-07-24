@@ -218,6 +218,27 @@ impl Engine {
         self.focused.load(Relaxed)
     }
 
+    /// Is the app window genuinely in front of the user right now? Drives notification and
+    /// incoming-call-ring suppression — we go silent only when the user can actually SEE
+    /// the app. Android: the cached activity-focus flag is authoritative (tao focus events
+    /// stop arriving once the activity dies). Desktop: consult the LIVE window — focused
+    /// AND visible AND not minimized — because the cached `focused` flag can go stale (some
+    /// window managers, notably Windows, don't fire `Focused(false)` on minimize), which
+    /// would otherwise silence every notification and every ring while the app sits
+    /// minimized. Falls back to the cached flag when there is no window yet.
+    pub fn on_screen(&self) -> bool {
+        // MUST stay non-blocking and lock-free. This runs on the DELIVERY loop
+        // (notification suppression, and the incoming-call ring while the session lock is
+        // held). An earlier revision queried the live window instead — `is_focused()` and
+        // friends dispatch a message to the UI event loop and block on its reply. When
+        // that loop is not pumping promptly, which is exactly what a minimized window on
+        // Windows produces, the delivery loop wedges: nothing gets drained, no delivery
+        // receipts go out, no notification is ever posted, and the sender sits on one
+        // tick. The cached flag is maintained from real window events on the main thread
+        // (focus changes, close-to-tray, minimize) and is always cheap to read.
+        self.focused.load(Relaxed)
+    }
+
     /// Delivery-loop connection transitions (main mailbox only): Connected ↔
     /// Reconnecting. Lock/unlock/mode transitions set `Locked`/`Off` explicitly via
     /// [`set_conn_state`](Self::set_conn_state); a late loop event must not overwrite
@@ -277,8 +298,8 @@ impl Engine {
     /// is focused AND that exact chat is on screen. Desktop: whenever focused (the
     /// chat list already shows the unread).
     pub fn suppress_notif(&self, chat_key: &str) -> bool {
-        let focused = self.focused.load(Relaxed);
         if cfg!(target_os = "android") {
+            let focused = self.focused.load(Relaxed);
             let same = self
                 .open_chat
                 .lock()
@@ -287,7 +308,9 @@ impl Engine {
                 .unwrap_or(false);
             focused && same
         } else {
-            focused
+            let _ = chat_key;
+            // The chat list already shows the unread when the app is on screen.
+            self.on_screen()
         }
     }
 

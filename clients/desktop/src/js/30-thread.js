@@ -603,10 +603,6 @@ async function renderThread(peer, anchor) {
 }
 const IMG_EXT = /\.(png|jpe?g|gif|webp|avif|bmp)$/i;
 const VIDEO_EXT = /\.(mp4|webm|mov|m4v|3gpp?|ogv)$/i;
-// Decrypted previews, this session only — LRU-bounded so a heavy image/video chat
-// can't grow memory until the next lock (an evicted entry just re-fetches).
-const imgCache = new LruCache({ max: 200, budget: 48 * 1024 * 1024, cost: (v) => v.length }); // msg_id -> data URL
-const vidCache = new LruCache({ max: 6, onEvict: (url) => URL.revokeObjectURL(url) });        // msg_id -> blob URL
 function mimeFor(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
   return { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',

@@ -214,6 +214,12 @@ object NotificationBridge {
   @JvmStatic
   fun showCall(callId: String, title: String, isGroup: Boolean) {
     val ctx = app()
+    // The full-screen intent fires AUTOMATICALLY over the lock screen — that is its whole
+    // job. It must therefore only SHOW the ring UI (Answer/Decline), never carry the answer
+    // action, or a locked phone silently auto-answers with no screen to decline from (the
+    // caller then hears nothing until the callee unlocks). Distinct request code so this
+    // neutral "show" PendingIntent never collapses into the answer one below.
+    val showUi = openAppIntent(ctx, mapOf("call" to callId), callNotifId(callId) + 3)
     val answer = openAppIntent(
       ctx, mapOf("call" to callId, "call_action" to "answer"), callNotifId(callId)
     )
@@ -232,7 +238,8 @@ object NotificationBridge {
       .setCategory(Notification.CATEGORY_CALL)
       .setOngoing(true)
       .setVisibility(Notification.VISIBILITY_PRIVATE)
-      .setFullScreenIntent(answer, true)
+      .setFullScreenIntent(showUi, true) // show the ring UI — NOT auto-answer (see above)
+      .setContentIntent(showUi)
       .setTimeoutAfter(45_000) // RING_TIMEOUT_SECS — the Rust timer also cancels
     if (Build.VERSION.SDK_INT >= 31) {
       val caller = android.app.Person.Builder().setName(title).setImportant(true).build()

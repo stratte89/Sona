@@ -10,11 +10,14 @@
 //! Per platform the *apply* step differs:
 //! * Linux — the deb enrolls an apt repo (see build.sh); applying is one pkexec'd
 //!   `apt-get install --only-upgrade`. apt re-verifies the archive's GPG signature.
-//! * Windows — download the NSIS installer, verify minisign, spawn it and exit (the
-//!   installer waits for this process and preserves `%APPDATA%`).
-//! * Android — download the APK, verify minisign, hand it to the platform installer
-//!   (which additionally enforces same-signer + higher versionCode before touching
-//!   the installed app; app data survives by construction).
+//! * Windows — download the NSIS installer, verify minisign, spawn it PASSIVE
+//!   (`/P /R`: progress-bar-only upgrade in place, auto-relaunch) and exit. Never the
+//!   interactive installer — its maintenance flow exposes an uninstall page whose
+//!   "remove app data" option wipes the vault.
+//! * Android — download the APK, verify minisign, stream it into a PackageInstaller
+//!   session (UpdateBridge.kt; content-URI installs break on some ROMs). The OS
+//!   enforces same-signer + higher versionCode before touching the installed app;
+//!   app data survives by construction.
 //!
 //! Downgrade safety: a manifest advertising a version ≤ ours is reported as
 //! "up to date" and can never trigger an install — a replayed old manifest is inert.
@@ -28,10 +31,14 @@ use crate::state::AppState;
 /// Compile-time channel config; `None` (dev builds, forks without a channel) disables.
 const UPDATE_BASE: Option<&str> = option_env!("SONA_UPDATE_BASE");
 const UPDATE_PUBKEY: Option<&str> = option_env!("SONA_UPDATE_PUBKEY");
+/// Optional trustless mirror consulted when the primary host is unreachable — e.g. a
+/// GitHub `…/releases/latest/download` base holding the same signed files.
+const UPDATE_FALLBACK: Option<&str> = option_env!("SONA_UPDATE_FALLBACK");
 
 /// Body caps: a hostile mirror must not balloon memory. Manifests are ~1 KB; installers
 /// are a few MB (desktop) to tens of MB (APK with bundled webview assets).
 const MANIFEST_MAX: usize = 64 * 1024;
+#[cfg(any(target_os = "android", target_os = "windows"))]
 const ARTIFACT_MAX: usize = 256 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -39,11 +46,20 @@ struct Manifest {
     version: String,
     #[serde(default)]
     notes: Option<String>,
+    // Read only on Windows/Android (Linux applies through apt); deserialized everywhere.
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "windows")),
+        allow(dead_code)
+    )]
     #[serde(default)]
     platforms: std::collections::HashMap<String, PlatformEntry>,
 }
 
 #[derive(Deserialize, Clone)]
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "windows")),
+    allow(dead_code)
+)]
 struct PlatformEntry {
     url: String,
     #[serde(default)]
@@ -105,25 +121,56 @@ fn parse_v(s: &str) -> Option<(u64, u64, u64)> {
     Some((a, b, c))
 }
 
+/// Manifest locations in preference order: the operator's own host first, then the
+/// optional mirror (a GitHub `releases/latest/download` URL). Every byte from either
+/// is minisign-verified against the baked pubkey, so the mirror is fully trustless —
+/// it can only serve outages or the truth.
+fn manifest_bases() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(b) = UPDATE_BASE {
+        v.push(format!("{}/updates", b.trim_end_matches('/')));
+    }
+    if let Some(b) = UPDATE_FALLBACK {
+        v.push(b.trim_end_matches('/').to_string());
+    }
+    v
+}
+
 /// Fetch `manifest.json` + `manifest.json.minisig`, verify, parse. All trust lives here.
 async fn fetch_manifest(proxy: Option<&str>) -> Result<Manifest, String> {
-    let base = UPDATE_BASE.ok_or("this build has no update channel configured")?;
     let pubkey = UPDATE_PUBKEY.ok_or("this build has no update signing key configured")?;
-    let base = base.trim_end_matches('/');
-    let manifest = client_core::http_get_bytes(
-        &format!("{base}/updates/manifest.json"),
-        proxy,
-        MANIFEST_MAX,
-    )
-    .await?;
-    let sig = client_core::http_get_bytes(
-        &format!("{base}/updates/manifest.json.minisig"),
-        proxy,
-        MANIFEST_MAX,
-    )
-    .await?;
-    verify_minisign(pubkey, &manifest, std::str::from_utf8(&sig).unwrap_or(""))?;
-    serde_json::from_slice(&manifest).map_err(|e| format!("manifest parse: {e}"))
+    let bases = manifest_bases();
+    if bases.is_empty() {
+        return Err("this build has no update channel configured".into());
+    }
+    let mut last_err = String::new();
+    for base in &bases {
+        let fetched: Result<(Vec<u8>, Vec<u8>), String> = async {
+            let m =
+                client_core::http_get_bytes(&format!("{base}/manifest.json"), proxy, MANIFEST_MAX)
+                    .await?;
+            let s = client_core::http_get_bytes(
+                &format!("{base}/manifest.json.minisig"),
+                proxy,
+                MANIFEST_MAX,
+            )
+            .await?;
+            Ok((m, s))
+        }
+        .await;
+        match fetched {
+            Ok((manifest, sig)) => {
+                // A bad signature is NOT a reason to try the mirror: it means this
+                // source is compromised or corrupt, and the mirror carries the same
+                // files — fail loudly instead of shopping for a copy that "works".
+                verify_minisign(pubkey, &manifest, std::str::from_utf8(&sig).unwrap_or(""))?;
+                return serde_json::from_slice(&manifest)
+                    .map_err(|e| format!("manifest parse: {e}"));
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 fn verify_minisign(pubkey_b64: &str, data: &[u8], sig_text: &str) -> Result<(), String> {
@@ -135,8 +182,18 @@ fn verify_minisign(pubkey_b64: &str, data: &[u8], sig_text: &str) -> Result<(), 
         .map_err(|_| "SIGNATURE VERIFICATION FAILED — refusing update".to_string())
 }
 
+/// Stage event for the settings UI's progress modal: `{stage, pct}`; `pct` is present
+/// only while downloading with a known length.
+fn emit_stage(stage: &str, pct: Option<u64>) {
+    crate::eng().emit(
+        "update_state",
+        serde_json::json!({ "stage": stage, "pct": pct }),
+    );
+}
+
 /// Download an artifact and verify it against its manifest entry (minisign mandatory,
-/// sha256 as an extra pin when present). Returns the verified bytes.
+/// sha256 as an extra pin when present). Returns the verified bytes. Emits
+/// `downloading` progress along the way.
 #[cfg(any(target_os = "android", target_os = "windows"))]
 async fn fetch_artifact(entry: &PlatformEntry, proxy: Option<&str>) -> Result<Vec<u8>, String> {
     let pubkey = UPDATE_PUBKEY.ok_or("no update signing key")?;
@@ -144,7 +201,31 @@ async fn fetch_artifact(entry: &PlatformEntry, proxy: Option<&str>) -> Result<Ve
         .minisig
         .as_deref()
         .ok_or("manifest entry has no signature — refusing")?;
-    let bytes = client_core::http_get_bytes(&entry.url, proxy, ARTIFACT_MAX).await?;
+    let on = |got: u64, total: Option<u64>| {
+        emit_stage(
+            "downloading",
+            total.filter(|t| *t > 0).map(|t| got * 100 / t),
+        );
+    };
+    // The manifest's URL points at the primary host; if that fetch fails and a mirror
+    // is baked in, retry there by asset name. Verification below treats both equally.
+    let bytes = match client_core::http_get_bytes_progress(&entry.url, proxy, ARTIFACT_MAX, on)
+        .await
+    {
+        Ok(b) => b,
+        Err(primary_err) => match (UPDATE_FALLBACK, entry.url.rsplit('/').next()) {
+            (Some(mirror), Some(name)) if !name.is_empty() => client_core::http_get_bytes_progress(
+                &format!("{}/{name}", mirror.trim_end_matches('/')),
+                proxy,
+                ARTIFACT_MAX,
+                on,
+            )
+            .await
+            .map_err(|mirror_err| format!("{primary_err}; mirror: {mirror_err}"))?,
+            _ => return Err(primary_err),
+        },
+    };
+    emit_stage("verifying", None);
     verify_minisign(pubkey, &bytes, sig)?;
     if let Some(want) = entry.sha256.as_deref() {
         use sha2::Digest as _;
@@ -216,6 +297,7 @@ pub async fn update_install(
     #[cfg(not(any(target_os = "android", target_os = "windows")))]
     {
         let _ = m; // apt owns artifact fetch + verification on this platform
+        emit_stage("installing", None);
         let out = tokio::task::spawn_blocking(|| {
             std::process::Command::new("pkexec")
                 .args([
@@ -251,10 +333,15 @@ pub async fn update_install(
         tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| format!("write installer: {e}"))?;
+        emit_stage("installing", None);
+        // /P /R: PASSIVE upgrade (progress bar only, closes the running app, replaces
+        // in place, auto-relaunches the new version) — NEVER the interactive installer:
+        // its maintenance flow let a user reach the uninstall page, whose "remove app
+        // data" option wipes the vault and forces a relink. Data must survive updates.
         std::process::Command::new(&path)
+            .args(["/P", "/R"])
             .spawn()
             .map_err(|e| format!("launch installer: {e}"))?;
-        // The NSIS installer waits for this process before swapping files.
         app.exit(0);
         return Ok("installer started".into());
     }
@@ -278,6 +365,9 @@ pub async fn update_install(
             .app_cache_dir()
             .map_err(|e| format!("cache dir: {e}"))?
             .join("updates");
+        // Fresh staging dir: stale APKs from earlier attempts are dead weight and the
+        // installer must only ever see the file we just verified.
+        let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("mkdir: {e}"))?;
@@ -285,6 +375,7 @@ pub async fn update_install(
         tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| format!("write apk: {e}"))?;
+        emit_stage("installing", None);
         android_install_apk(path.to_str().ok_or("bad path")?)?;
         return Ok("installer started".into());
     }

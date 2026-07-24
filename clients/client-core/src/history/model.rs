@@ -376,6 +376,11 @@ pub struct ContactPin {
     /// behavior. Local-only, never transmitted.
     #[serde(default)]
     pub request: Option<PendingRequest>,
+    /// When we last auto-reset the ratchet session with this contact, rate-limiting the
+    /// dead-session self-heal (see [`crate::History::session_looks_dead`]) so a peer who
+    /// is merely offline can never make it churn. Local-only, never transmitted.
+    #[serde(default)]
+    pub last_session_reset: Option<u64>,
 }
 
 /// This device's own identity inside a multi-device account. Absent = a legacy

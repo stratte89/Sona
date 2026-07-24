@@ -399,13 +399,84 @@ mod android {
 mod desktop {
     use super::{ConnState, Generic, NotifLine};
 
+    // Linux: post through notify-rust directly so we control the app name and themed icon
+    // (the tauri plugin sets neither, so notifications arrived anonymous). App name +
+    // `Icon=sona-desktop` match Sona.desktop so the shell attributes us; no
+    // `desktop-entry` hint (it's redundant once the pid resolves to the app).
+    //
+    // CRITICAL: keep the D-Bus connection (its bus sender name) alive while the banner is
+    // on screen. freedesktop shells run `notificationDaemon._onNameVanished`, which
+    // DESTROYS a notification the instant its sender disconnects — but only when the
+    // notification resolved to an installed application:
+    //
+    //     if (!this.trayIcon && this.app) this.destroy();
+    //
+    // Sona's pid always resolves to Sona.desktop, so `this.app` is set. notify-rust opens
+    // a fresh connection per show() and returns a handle that owns it; a throwaway
+    // `thread::spawn` per notification dropped the handle the moment show() returned, the
+    // sender vanished within milliseconds, and the shell tore the banner down ~10ms after
+    // it appeared — the reported "sound but no popup" (the sound is our own in-app ping,
+    // independent of the OS banner). notify-send is exempted by the `this.app` guard
+    // above, which is why every ad-hoc probe showed a banner and only the real app failed.
+    //
+    // Fix: a single long-lived thread owns the handles and keeps each alive well past the
+    // banner's on-screen lifetime (the daemon default is a few seconds), so the sender
+    // never vanishes while it matters. Pruning drops them once the banner is long gone.
+    #[cfg(target_os = "linux")]
+    mod linux_notify {
+        use notify_rust::{Notification, NotificationHandle};
+        use std::sync::mpsc::{channel, Sender};
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+
+        static TX: OnceLock<Sender<(String, String)>> = OnceLock::new();
+
+        // Comfortably past any daemon's on-screen timeout; by now the banner is gone and
+        // dropping the handle (letting its sender vanish) is a no-op.
+        const HOLD: Duration = Duration::from_secs(30);
+
+        fn tx() -> &'static Sender<(String, String)> {
+            TX.get_or_init(|| {
+                let (tx, rx) = channel::<(String, String)>();
+                std::thread::spawn(move || {
+                    let mut live: Vec<(Instant, NotificationHandle)> = Vec::new();
+                    while let Ok((title, body)) = rx.recv() {
+                        live.retain(|(t, _)| t.elapsed() < HOLD);
+                        match Notification::new()
+                            .summary(&title)
+                            .body(&body)
+                            .appname("Sona")
+                            .icon("sona-desktop")
+                            .show()
+                        {
+                            Ok(h) => live.push((Instant::now(), h)),
+                            Err(e) => eprintln!("[notify] {e}"),
+                        }
+                    }
+                });
+                tx
+            })
+        }
+
+        pub fn post(title: &str, body: &str) {
+            let _ = tx().send((title.to_string(), body.to_string()));
+        }
+    }
+
     fn plugin_show(title: &str, body: &str) {
-        let Some(app) = crate::engine::global().ui_handle() else {
-            return;
-        };
-        use tauri_plugin_notification::NotificationExt as _;
-        if let Err(e) = app.notification().builder().title(title).body(body).show() {
-            eprintln!("[notify] {e}");
+        #[cfg(target_os = "linux")]
+        {
+            linux_notify::post(title, body);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(app) = crate::engine::global().ui_handle() else {
+                return;
+            };
+            use tauri_plugin_notification::NotificationExt as _;
+            if let Err(e) = app.notification().builder().title(title).body(body).show() {
+                eprintln!("[notify] {e}");
+            }
         }
     }
 

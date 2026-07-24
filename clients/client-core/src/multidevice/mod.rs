@@ -44,7 +44,10 @@ pub use protocol_types::{CAP_GIF_SEARCH, CAP_HISTORY_SYNC, CAP_MULTI_DEVICE};
 
 /// Upper bound (seconds) of the random delay applied to own-device self-sync copies, so a
 /// send doesn't produce a tight, correlatable burst of envelopes to the sender's mailboxes.
-pub const SELF_SYNC_MAX_JITTER_SECS: u64 = 25;
+/// Tuning: a few seconds of spread (plus ordinary network timing noise) already breaks
+/// tight-burst correlation; 25 s made cross-device history feel broken (a sent message
+/// took up to half a minute to appear on the sender's other devices).
+pub const SELF_SYNC_MAX_JITTER_SECS: u64 = 8;
 
 /// A random own-device self-sync delay in `0..=SELF_SYNC_MAX_JITTER_SECS` seconds.
 pub fn self_sync_jitter_secs() -> u64 {

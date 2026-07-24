@@ -395,6 +395,10 @@ pub(crate) fn spawn_delivery_loop(
                 let mut promotion_offered = false;
                 // Terminal revocation: this mailbox no longer exists on the relay.
                 let mut revoked = false;
+                // A username whose roster needs a KT re-resolve (attribution quarantine).
+                let mut attr_resolve: Option<String> = None;
+                // A real message frame arrived that we could not decrypt (desynced ratchet).
+                let mut undecryptable = false;
                 let auth_failed = {
                     let mut s = inner.lock().await;
                     let Some(account) = s.account.as_mut() else {
@@ -406,6 +410,43 @@ pub(crate) fn spawn_delivery_loop(
                             // Blocked peer: drop silently (no record, no receipt) but ack
                             // so the relay doesn't keep redelivering it.
                             if s.history.peer_blocked(event.sender_identity_key()) {
+                                let _ = s.persist(); // ratchet advanced during decrypt
+                                ack_id = Some(ack_msg_id);
+                                false
+                            } else if let Some(uname) = match &event {
+                                // Attribution self-heal: content from an unattributed
+                                // device key claiming a name we know would be silently
+                                // dropped by the request gate's spoof rule — but it may
+                                // simply be a device the contact linked (or their key
+                                // rotated) that we never resolved. Quarantine the event
+                                // and re-resolve the claimed account's roster
+                                // (KT-verified); replay happens on success. The frame is
+                                // acked — we own delivery of the quarantined copy now.
+                                InboundEvent::Message {
+                                    sender_identity_key,
+                                    sender_username,
+                                    ..
+                                }
+                                | InboundEvent::Attachment {
+                                    sender_identity_key,
+                                    sender_username,
+                                    ..
+                                }
+                                | InboundEvent::Knock {
+                                    sender_identity_key,
+                                    sender_username,
+                                } => s
+                                    .history
+                                    .device_resolution_candidate(sender_identity_key, sender_username),
+                                _ => None,
+                            } {
+                                let q = s.pending_attr.entry(uname.clone()).or_default();
+                                if q.len() < PENDING_ATTR_CAP {
+                                    q.push(event.clone());
+                                }
+                                if s.attr_inflight.insert(uname.clone()) {
+                                    attr_resolve = Some(uname);
+                                }
                                 let _ = s.persist(); // ratchet advanced during decrypt
                                 ack_id = Some(ack_msg_id);
                                 false
@@ -511,7 +552,30 @@ pub(crate) fn spawn_delivery_loop(
                                         )
                                     })
                                 } else {
-                                    notif_for_event(&s.history, &event, &s.prefs.notif_level, &me)
+                                    // Notify only what the timeline actually shows —
+                                    // apply() may have dropped the event (spoof rule); a
+                                    // content notification for an invisible message is a
+                                    // lie (same gating the delivery receipt gets below).
+                                    let visible = match &event {
+                                        InboundEvent::Message { msg_id, .. }
+                                        | InboundEvent::Attachment { msg_id, .. } => {
+                                            s.history.message(&sender_convo, msg_id).is_some()
+                                        }
+                                        _ => true,
+                                    };
+                                    if visible {
+                                        notif_for_event(
+                                            &s.history,
+                                            &event,
+                                            &s.prefs.notif_level,
+                                            &me,
+                                        )
+                                    } else {
+                                        eprintln!(
+                                            "client: inbound message dropped by apply(); notification suppressed"
+                                        );
+                                        None
+                                    }
                                 };
                                 // Surface ephemeral reaction/typing to the UI so the open
                                 // thread can update live (typing is never persisted).
@@ -622,12 +686,22 @@ pub(crate) fn spawn_delivery_loop(
                                     let recorded = s.history.message(&convo, &msg_id).is_some();
                                     let pending = s.history.request_pending_for_key(&convo);
                                     if recorded && !pending {
-                                        let contact = contact_for(&username, &key);
-                                        let account = s.account.as_mut().unwrap();
-                                        receipt = client
-                                            .prepare_receipt(account, &contact, vec![msg_id], false)
-                                            .ok()
-                                            .flatten();
+                                        // Address the DEVICE that sent this, not the account
+                                        // mailbox — see `prepare_receipt_to_sender`.
+                                        let sess = &mut *s;
+                                        if let Some(account) = sess.account.as_mut() {
+                                            receipt = client
+                                                .prepare_receipt_to_sender(
+                                                    account,
+                                                    &sess.history,
+                                                    &username,
+                                                    &key,
+                                                    vec![msg_id],
+                                                    false,
+                                                )
+                                                .ok()
+                                                .flatten();
+                                        }
                                     }
                                 }
                                 // Multi-device primary: forward a legacy sender's message
@@ -656,6 +730,22 @@ pub(crate) fn spawn_delivery_loop(
                         // Permanently undecryptable: ack it out of the mailbox so it
                         // cannot poison delivery; persist any ratchet state change.
                         client_core::Decoded::Ignore { ack_msg_id } => {
+                            // Never drop it SILENTLY. A desynced ratchet makes every
+                            // message from that peer vanish while both ends still report
+                            // "connected" — indistinguishable from nobody messaging us,
+                            // and the state cannot self-heal (see
+                            // `Client::reset_sessions_with`). An id means this really was
+                            // a message frame, not a malformed/irrelevant one; a non-prekey
+                            // message carries no cleartext sender, so we can flag THAT it
+                            // happened but never who from.
+                            if ack_msg_id.is_some() {
+                                undecryptable = true;
+                                eprintln!(
+                                    "client: inbound message could not be decrypted — dropping it. \
+                                     A contact's secure session is likely desynced; reset it from \
+                                     that chat's settings."
+                                );
+                            }
                             let _ = s.persist();
                             ack_id = ack_msg_id;
                             false
@@ -782,6 +872,11 @@ pub(crate) fn spawn_delivery_loop(
                 if got_event {
                     eng().emit("sync", ());
                 }
+                // Something addressed to us arrived that we could not open. Surface it so a
+                // silently-dead conversation is diagnosable instead of looking like silence.
+                if undecryptable {
+                    eng().emit("undecryptable", ());
+                }
                 if let Some((peer, group, typing, who)) = typing_evt {
                     eng().emit(
                         "typing",
@@ -790,6 +885,13 @@ pub(crate) fn spawn_delivery_loop(
                 }
                 if let Some(plan) = notif {
                     notify_now(&plan);
+                }
+                if let Some(uname) = attr_resolve {
+                    let inner2 = inner.clone();
+                    let client2 = client.clone();
+                    tokio::spawn(async move {
+                        resolve_attr_and_replay(&inner2, &client2, &uname).await;
+                    });
                 }
             }
         }

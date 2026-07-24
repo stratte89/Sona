@@ -365,6 +365,22 @@ impl RatchetEngine {
             .is_some_and(|l| !l.is_empty())
     }
 
+    /// Drop every session held for a peer device, so the next outgoing message performs a
+    /// fresh X3DH handshake instead of continuing a dead one.
+    ///
+    /// This is the ONLY recovery from a desynced ratchet. A stale session is invisible to
+    /// its owner: we keep encrypting happily while the peer's `decrypt` yields
+    /// `NoSession` and drops the message. Worse, a `Normal` (non-prekey) message carries
+    /// no cleartext sender, so the peer cannot even tell us who to reset — recovery has to
+    /// be unilateral on the SENDER's side. Dropping ours is safe and sufficient: the peer
+    /// bootstraps an additional inbound session from the resulting pre-key message
+    /// (`decrypt_olm`'s `None` branch), and their own sessions to us are untouched.
+    ///
+    /// Returns true if anything was actually removed.
+    pub fn remove_sessions(&mut self, peer_identity_key: &str) -> bool {
+        self.sessions.remove(peer_identity_key).is_some()
+    }
+
     /// Serialize the full ratchet state (account + all sessions) for vault storage.
     pub fn export_state(&self) -> Result<Vec<u8>, RatchetError> {
         let state = RatchetState {
@@ -440,6 +456,57 @@ mod tests {
         let c2 = alice.encrypt(&bob_id, "second").unwrap();
         assert_eq!(c2.message_type, 1);
         assert_eq!(bob.decrypt(&alice_id, &c2).unwrap(), "second");
+    }
+
+    #[test]
+    fn resetting_a_desynced_session_restores_delivery() {
+        // The real failure this guards: Alice's session to Bob is alive on HER side, but
+        // Bob can no longer open it (his half went with a reinstall / relink / re-key).
+        // She keeps encrypting normal ratchet messages he silently drops — and a normal
+        // message carries no cleartext sender, so he cannot even tell her WHICH session to
+        // reset. Recovery is therefore unilateral, on the sender's side.
+        let mut alice = RatchetEngine::new();
+        let mut bob = RatchetEngine::new();
+        let bob_id = bob.identity_key();
+        let alice_id = alice.identity_key();
+
+        alice.establish_outbound(&bob.create_bundle()).unwrap();
+        let c1 = alice.encrypt(&bob_id, "hello").unwrap();
+        assert_eq!(bob.decrypt(&alice_id, &c1).unwrap(), "hello");
+        // Bob's reply confirms the session, so Alice's later sends are normal messages
+        // (a session stays in pre-key mode until the peer answers on it).
+        let r1 = bob.encrypt(&alice_id, "hi").unwrap();
+        assert_eq!(alice.decrypt(&bob_id, &r1).unwrap(), "hi");
+
+        // Bob loses his half of the session.
+        assert!(bob.remove_sessions(&alice_id));
+
+        // Alice is none the wiser: still holds a session, still sends NORMAL messages,
+        // which Bob cannot open — the silent one-way blackhole.
+        let dead = alice.encrypt(&bob_id, "into the void").unwrap();
+        assert_eq!(dead.message_type, 1);
+        assert!(bob.decrypt_unattributed(&dead).is_err());
+
+        // The cure: Alice drops her side and re-establishes from a fresh bundle. Her next
+        // message is a PRE-KEY message, which bootstraps a new inbound session for Bob.
+        assert!(alice.remove_sessions(&bob_id));
+        alice.establish_outbound(&bob.create_bundle()).unwrap();
+        let revived = alice.encrypt(&bob_id, "back online").unwrap();
+        assert_eq!(
+            revived.message_type, 0,
+            "a reset must produce a fresh handshake, not continue the dead session"
+        );
+        assert_eq!(
+            bob.decrypt_unattributed(&revived).unwrap(),
+            (alice_id.clone(), "back online".to_string())
+        );
+
+        // …and ordinary traffic keeps flowing BOTH ways over the repaired session.
+        let r2 = bob.encrypt(&alice_id, "got it").unwrap();
+        assert_eq!(alice.decrypt(&bob_id, &r2).unwrap(), "got it");
+        let after = alice.encrypt(&bob_id, "and again").unwrap();
+        assert_eq!(after.message_type, 1);
+        assert_eq!(bob.decrypt(&alice_id, &after).unwrap(), "and again");
     }
 
     #[test]

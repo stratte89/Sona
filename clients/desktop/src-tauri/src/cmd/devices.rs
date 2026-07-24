@@ -203,10 +203,24 @@ pub async fn complete_link_cmd(
     s.multi_device = true;
     s.persist()?;
     spawn_subscriber(&state.inner, &mut s);
-    Ok(LinkCompleteView {
+    let view = LinkCompleteView {
         account_id: id,
         history_synced: result.history_synced,
-    })
+    };
+    drop(s);
+    // Resolve the delivery-mode default now (mirrors register + unlock) — a freshly
+    // (re)linked device, an Android phone especially, should adopt "push only" when the
+    // relay can wake it instead of sitting on "connection" until the next app restart.
+    // Push registration also kicks the async FCM-token fetch, whose arrival re-runs the
+    // auto-default.
+    spawn_push_registration(&state.inner);
+    {
+        let inner = state.inner.clone();
+        eng().spawn(async move {
+            maybe_auto_delivery_mode(&inner).await;
+        });
+    }
+    Ok(view)
 }
 
 /// (Linked device) Ask the primary to re-export history (transfer expired). Returns the

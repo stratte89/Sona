@@ -115,6 +115,98 @@ impl Client {
             devices,
         })
     }
+    /// Prepare a delivery/read receipt addressed to the DEVICE that actually sent us the
+    /// message, instead of to the account mailbox.
+    ///
+    /// [`contact_for`](crate::contact_for) addresses `IdentityHash::from_identifier(username)`
+    /// — the account mailbox, which only the PRIMARY device drains. A receipt sealed to a
+    /// **linked** device's key but posted there is undecryptable junk for the primary (which
+    /// acks and drops it), and never reaches the device that sent the message: that sender
+    /// sits on a single tick forever, while the primary logs a spurious "couldn't decrypt".
+    ///
+    /// Resolve the sender's device from the pinned roster — network-free, so this stays
+    /// cheap enough for the delivery loop — and address its own mailbox. Falls back to the
+    /// account mailbox when we have no roster; the primary needs no special case, since
+    /// `device_mailbox_hash` maps `PRIMARY_DEVICE_ID` back to the account mailbox.
+    pub fn prepare_receipt_to_sender(
+        &self,
+        account: &mut Account,
+        history: &History,
+        username: &str,
+        sender_key: &str,
+        ids: Vec<String>,
+        seen: bool,
+    ) -> Result<Option<Envelope>> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let account_hash = IdentityHash::from_identifier(username).as_str().to_string();
+        let mailbox = history
+            .pinned_roster(username)
+            .and_then(|pin| {
+                pin.devices
+                    .iter()
+                    .find(|d| d.identity_key == sender_key)
+                    .map(|d| d.device_id.clone())
+            })
+            .and_then(|device_id| device_mailbox_hash(&account_hash, &device_id))
+            .map(|h| h.as_str().to_string())
+            .unwrap_or(account_hash);
+        seal_payload_to(
+            account,
+            &mailbox,
+            sender_key,
+            &ChatPayload::Receipt { ids, seen },
+            &random_msg_id(),
+        )
+        .map(Some)
+    }
+
+    /// Drop our ratchet sessions with EVERY device of `username`, so the next message to
+    /// them performs a fresh handshake instead of continuing a dead one.
+    ///
+    /// The cure for a desynced session. [`ensure_device_session`](Self::ensure_device_session)
+    /// short-circuits on `has_session`, so once a session exists we reuse it forever — and a
+    /// session the peer can no longer open is invisible to us (we keep encrypting; they get
+    /// `NoSession` and silently drop). A non-prekey message carries no cleartext sender, so
+    /// the peer cannot even tell us which session to reset: recovery must be unilateral
+    /// here. See [`crypto_core::RatchetEngine::remove_sessions`].
+    ///
+    /// Resolves the roster so linked devices are covered too, but stays useful offline by
+    /// falling back to the pinned roster and the caller's known key. Returns how many
+    /// device sessions were dropped.
+    pub async fn reset_sessions_with(
+        &self,
+        account: &mut Account,
+        history: &mut History,
+        username: &str,
+        fallback_key: &str,
+    ) -> Result<usize> {
+        let mut keys: Vec<String> = Vec::new();
+        // Live roster when the network allows; the pin otherwise. Both, deduped, so a
+        // roster that drifted mid-rotation can't leave a stale session behind.
+        if let Ok(rec) = self.resolve_account_devices(history, username).await {
+            keys.extend(rec.devices.iter().map(|d| d.identity_key.clone()));
+            keys.push(rec.primary_key);
+        }
+        if let Some(pin) = history.pinned_roster(username) {
+            keys.extend(pin.devices.iter().map(|d| d.identity_key.clone()));
+            keys.push(pin.primary_key.clone());
+        }
+        if !fallback_key.is_empty() {
+            keys.push(fallback_key.to_string());
+        }
+        keys.sort();
+        keys.dedup();
+        let mut dropped = 0;
+        for k in keys {
+            if account.ratchet().remove_sessions(&k) {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Establish (if absent) a session to a specific device from the bundle at its mailbox,
     /// verifying the bundle's identity key equals the (roster-verified) `expected_key`.
     pub(crate) async fn ensure_device_session(

@@ -13,6 +13,7 @@ async function openSettings() {
   } catch (e) { /* ignore */ }
   $('#se-audit-res').textContent = '';
   $('#se-audit-res').className = '';
+  $('#se-clearmedia-state').textContent = mediaCacheLabel();
   // Current version on the updates row until a check replaces it.
   window.__TAURI__.app.getVersion()
     .then((v) => { if (!$('#se-update-state').textContent) $('#se-update-state').textContent = `v${v}`; })
@@ -233,23 +234,31 @@ async function renderDelivery() {
 $('#se-delivery-mode').onclick = () => {
   const d = lastDelivery || { mode: 'c', relay_fcm: false, relay_webhook: false, health: null };
   const h = d.health;
+  // Desktop (Linux/Windows/macOS) has NO push transport of any kind — no FCM, no
+  // UnifiedPush — and the tray keeps it permanently connected anyway. The delivery-health
+  // payload is Android-only, so its absence marks desktop: there, "Connection" is the only
+  // meaningful mode and the push options are dropped entirely (offering them was a bug —
+  // they keyed off the RELAY's push support, not this device's).
+  const isDesktop = !h && !d.up_endpoint;
   // Two audiences, two surfaces. Stock devices (Play Services present) keep the
   // familiar Google-push options exactly as they were. De-Googled devices
   // (GrapheneOS etc.) get the same modes powered by UnifiedPush instead — that is
   // the only place the UI changes.
   const googley = !h || h.play_services;
   const upOk = (h && (h.up_endpoint || h.up_available || h.up_distributor)) || d.up_endpoint;
-  const pushOk = googley
+  const pushOk = !isDesktop && (googley
     ? d.relay_fcm || ((d.relay_webhook || d.relay_fcm) && upOk)
-    : (d.relay_webhook || d.relay_fcm) && upOk;
+    : (d.relay_webhook || d.relay_fcm) && upOk);
   const why = googley && !d.relay_fcm ? 'relay has no push support'
     : !(d.relay_webhook || d.relay_fcm) ? 'relay has no push support'
     : 'install a UnifiedPush app such as ntfy first';
   const wakeVia = googley ? 'a content-free wake-up' : 'a content-free wake-up through your UnifiedPush app';
   const opts = [
-    ['c', 'Connection', 'Always connected. Most private — no third party. Uses more battery.', true],
-    ['cp', 'Connection + push fallback', `Connected when possible; if Android kills the connection, ${wakeVia} restores delivery. Recommended.`, pushOk],
-    ['p', 'Push only', `Battery saver. Messages arrive within seconds via ${wakeVia}. No persistent notification.`, pushOk],
+    ['c', 'Connection', isDesktop ? 'Always connected while Sona runs in the tray. Most private — no third party.' : 'Always connected. Most private — no third party. Uses more battery.', true],
+    ...(isDesktop ? [] : [
+      ['cp', 'Connection + push fallback', `Connected when possible; if Android kills the connection, ${wakeVia} restores delivery. Recommended.`, pushOk],
+      ['p', 'Push only', `Battery saver. Messages arrive within seconds via ${wakeVia}. No persistent notification.`, pushOk],
+    ]),
   ];
   const card = openModal(
     `<h3>Delivery mode</h3><p>How this device receives messages when the app is closed.</p>
@@ -445,45 +454,20 @@ $('#se-delivery-health').onclick = async () => {
 $('#se-test-notif').onclick = () => { invoke('test_notification').catch((e) => toast(say(e), 'err')); toast('Test notification sent', 'ok'); };
 $('#se-test-ring').onclick = () => { invoke('test_ring').catch((e) => toast(say(e), 'err')); toast('Test ring — auto-stops in 5 s', 'ok'); };
 
-// ── Updates: manual check against the operator's signed channel (update.rs).
-// Everything is verified device-side (minisign) before any install action; the
-// backend re-fetches the manifest at install time so this UI holds no authority.
-let updateBusy = false;
-$('#se-update').onclick = async () => {
-  if (updateBusy) return;
-  updateBusy = true;
-  const st = $('#se-update-state');
-  try {
-    st.textContent = 'checking…';
-    const info = await invoke('update_check');
-    if (!info.configured) { st.textContent = 'no update channel in this build'; return; }
-    if (!info.available) { st.textContent = `up to date (v${info.current})`; return; }
-    st.textContent = `v${info.latest} available`;
-    const how = info.method === 'apt'
-      ? 'Sona updates through your system package manager — you may be asked for your password. Your messages and settings are untouched.'
-      : info.method === 'installer'
-        ? 'The installer will start and Sona will close; it reopens updated. Your messages and settings are untouched.'
-        : "The verified update opens in Android's installer. Your messages and settings are untouched.";
-    const notes = info.notes ? ` ${info.notes}` : '';
-    if (!(await confirmModal(`Update to ${info.latest}?`, `You have ${info.current}. ${how}${notes}`, 'Update'))) return;
-    st.textContent = 'downloading…';
-    const msg = await invoke('update_install');
-    st.textContent = 'done';
-    toast(msg, 'ok');
-  } catch (e) {
-    if (String(e).includes('needs-install-permission')) {
-      st.textContent = 'permission needed';
-      if (await confirmModal('Allow app updates?',
-        'Android needs a one-time permission for Sona to install its own updates. Turn on "install unknown apps" on the next screen, then check again.',
-        'Open settings')) {
-        invoke('update_open_install_settings').catch(() => {});
-      }
-    } else {
-      st.textContent = 'failed';
-      toast(say(e), 'err');
-    }
-  } finally { updateBusy = false; }
+// ── Storage: session media cache (RAM only; see clearMediaCaches in 30-thread) ───
+function mediaCacheLabel() {
+  const items = imgCache.map.size + vidCache.map.size + voiceCache.map.size;
+  if (!items) return 'empty';
+  // Only imgCache tracks byte cost (data URLs); video/voice are a few bounded blobs.
+  const mb = imgCache.spent / (1024 * 1024);
+  return mb >= 0.1 ? `≈${mb.toFixed(1)} MB · ${items} items` : `${items} items`;
+}
+$('#se-clearmedia').onclick = () => {
+  clearMediaCaches();
+  $('#se-clearmedia-state').textContent = 'empty';
+  toast('Media cache cleared', 'ok');
 };
+
 
 // ── Notification-tap routing: cold start (pending intent) + warm (navigate event) ─
 async function handleNavigate(p) {

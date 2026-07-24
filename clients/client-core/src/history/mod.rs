@@ -35,6 +35,21 @@ pub enum GroupEpochOutcome {
     Refused(GroupEpochError),
 }
 
+/// Stable-insert `m` into a thread kept ordered by `sent_at`. Messages normally arrive
+/// in order (a plain append), but a **jittered multi-device self-sync copy** can land
+/// out of order — device A recorded A-then-B, while device B's outbox delivered B's copy
+/// before A's. Placing each message by its timestamp keeps every device's thread
+/// identical instead of one of them drifting into arrival order. Ties (same wall-clock
+/// second) keep arrival order, so a device's own same-second burst never reshuffles.
+/// Walks back only over strictly-later messages, so an in-order append stays O(1).
+fn insert_message_ordered(msgs: &mut Vec<StoredMessage>, m: StoredMessage) {
+    let mut i = msgs.len();
+    while i > 0 && msgs[i - 1].sent_at > m.sent_at {
+        i -= 1;
+    }
+    msgs.insert(i, m);
+}
+
 /// Convert an epoch's member entries to the display [`GroupMember`] roster.
 fn members_from_epoch(epoch: &GroupEpoch) -> Vec<GroupMember> {
     epoch
@@ -131,6 +146,13 @@ pub struct History {
     held_group_content: HashMap<String, Vec<HeldGroupEvent>>,
 }
 
+/// Dead-session self-heal thresholds (see [`History::session_looks_dead`]). Tuned so a
+/// merely-offline peer never trips them: three unacknowledged sends, the oldest at least
+/// ten minutes old, and at most one automatic reset per contact per hour.
+const DEAD_SESSION_MIN_UNACKED: usize = 3;
+const DEAD_SESSION_MIN_AGE_SECS: u64 = 600;
+const DEAD_SESSION_RETRY_SECS: u64 = 3600;
+
 /// Outbox depth cap: beyond this the OLDEST entries drop first. Bounds vault growth if
 /// the relay is unreachable for a long time; 512 sealed copies is days of traffic.
 const MAX_OUTBOX: usize = 512;
@@ -193,23 +215,26 @@ impl History {
             return; // dedup re-delivery
         }
         let delete_at = carried_delete_at(convo.disappearing_secs, expire_secs, sent_at);
-        convo.messages.push(StoredMessage {
-            msg_id: msg_id.to_string(),
-            direction,
-            body: body.to_string(),
-            sent_at,
-            delete_at,
-            attachment: None,
-            sender: None,
-            status: DeliveryStatus::default(),
-            seen_receipted: false,
-            edited: false,
-            reply,
-            reactions: Vec::new(),
-            system: false,
-            pinned: false,
-            forwarded: false,
-        });
+        insert_message_ordered(
+            &mut convo.messages,
+            StoredMessage {
+                msg_id: msg_id.to_string(),
+                direction,
+                body: body.to_string(),
+                sent_at,
+                delete_at,
+                attachment: None,
+                sender: None,
+                status: DeliveryStatus::default(),
+                seen_receipted: false,
+                edited: false,
+                reply,
+                reactions: Vec::new(),
+                system: false,
+                pinned: false,
+                forwarded: false,
+            },
+        );
     }
 
     /// Record a local, centered system-event chip in a conversation (disappearing-timer
@@ -564,23 +589,26 @@ impl History {
             return;
         }
         let delete_at = carried_delete_at(convo.disappearing_secs, expire_secs, sent_at);
-        convo.messages.push(StoredMessage {
-            msg_id: msg_id.to_string(),
-            direction,
-            body: attachment.filename.clone(),
-            sent_at,
-            delete_at,
-            attachment: Some(attachment),
-            sender: None,
-            status: DeliveryStatus::default(),
-            seen_receipted: false,
-            edited: false,
-            reply: None,
-            reactions: Vec::new(),
-            system: false,
-            pinned: false,
-            forwarded: false,
-        });
+        insert_message_ordered(
+            &mut convo.messages,
+            StoredMessage {
+                msg_id: msg_id.to_string(),
+                direction,
+                body: attachment.filename.clone(),
+                sent_at,
+                delete_at,
+                attachment: Some(attachment),
+                sender: None,
+                status: DeliveryStatus::default(),
+                seen_receipted: false,
+                edited: false,
+                reply: None,
+                reactions: Vec::new(),
+                system: false,
+                pinned: false,
+                forwarded: false,
+            },
+        );
     }
 
     /// The pinned admin/epoch state for a group (`None` = an unknown group).
@@ -697,23 +725,26 @@ impl History {
             return;
         }
         let delete_at = carried_delete_at(g.disappearing_secs, expire_secs, sent_at);
-        g.messages.push(StoredMessage {
-            msg_id: msg_id.to_string(),
-            direction: Direction::Incoming,
-            body: body.to_string(),
-            sent_at,
-            delete_at,
-            attachment: None,
-            sender: Some(sender.to_string()),
-            status: DeliveryStatus::default(),
-            seen_receipted: false,
-            edited: false,
-            reply,
-            reactions: Vec::new(),
-            system: false,
-            pinned: false,
-            forwarded: false,
-        });
+        insert_message_ordered(
+            &mut g.messages,
+            StoredMessage {
+                msg_id: msg_id.to_string(),
+                direction: Direction::Incoming,
+                body: body.to_string(),
+                sent_at,
+                delete_at,
+                attachment: None,
+                sender: Some(sender.to_string()),
+                status: DeliveryStatus::default(),
+                seen_receipted: false,
+                edited: false,
+                reply,
+                reactions: Vec::new(),
+                system: false,
+                pinned: false,
+                forwarded: false,
+            },
+        );
     }
 
     /// One group message by id (for reply previews / edit-window checks).
@@ -866,23 +897,26 @@ impl History {
             return;
         }
         let delete_at = carried_delete_at(g.disappearing_secs, expire_secs, sent_at);
-        g.messages.push(StoredMessage {
-            msg_id: msg_id.to_string(),
-            direction: Direction::Incoming,
-            body: attachment.filename.clone(),
-            sent_at,
-            delete_at,
-            attachment: Some(attachment),
-            sender: Some(sender.to_string()),
-            status: DeliveryStatus::default(),
-            seen_receipted: false,
-            edited: false,
-            reply: None,
-            reactions: Vec::new(),
-            system: false,
-            pinned: false,
-            forwarded: false,
-        });
+        insert_message_ordered(
+            &mut g.messages,
+            StoredMessage {
+                msg_id: msg_id.to_string(),
+                direction: Direction::Incoming,
+                body: attachment.filename.clone(),
+                sent_at,
+                delete_at,
+                attachment: Some(attachment),
+                sender: Some(sender.to_string()),
+                status: DeliveryStatus::default(),
+                seen_receipted: false,
+                edited: false,
+                reply: None,
+                reactions: Vec::new(),
+                system: false,
+                pinned: false,
+                forwarded: false,
+            },
+        );
     }
 
     /// Record a local, centered system-event chip in a group thread (member added/removed).
@@ -1780,6 +1814,92 @@ impl History {
         self.conversations.get(peer).and_then(|c| c.messages.last())
     }
 
+    /// Does this conversation look like it is talking into a DEAD ratchet session?
+    ///
+    /// A desynced session is invisible to its sender: we keep encrypting happily, the peer's
+    /// decrypt yields `NoSession` and drops the message, and nothing ever comes back. The
+    /// only trustworthy signal is local and private — the recipient acknowledges every
+    /// message that lands in their timeline, so a run of recent sends that never reached
+    /// `Delivered` is strong evidence the session is dead.
+    ///
+    /// Deliberately sender-local: the alternative (the receiver asking peers to reset when
+    /// it sees undecryptable traffic) is exploitable, because anyone — including the relay —
+    /// can post junk ciphertext into a mailbox, and the resulting burst of reset requests
+    /// would enumerate that user's contacts. Nothing here is remotely triggerable, and a
+    /// false positive costs only a re-handshake.
+    ///
+    /// Conservative on purpose:
+    /// * requires at least one INCOMING message ever — a peer who never replied may simply
+    ///   not have accepted us, and a pending message request withholds receipts *by design*;
+    /// * requires a run of unacknowledged sends whose oldest is past a grace period, so a
+    ///   brief offline peer or a fast burst cannot trip it;
+    /// * stops at the first acknowledged send or any inbound message — either proves the
+    ///   session is alive;
+    /// * rate-limited per contact by `last_session_reset`, so it can never churn.
+    pub fn session_looks_dead(&self, peer: &str, now: u64) -> bool {
+        let Some(convo) = self.conversations.get(peer) else {
+            return false;
+        };
+        // Never auto-reset a conversation we have never actually received anything on.
+        if !convo
+            .messages
+            .iter()
+            .any(|m| m.direction == Direction::Incoming && !m.system)
+        {
+            return false;
+        }
+        if self
+            .contacts
+            .values()
+            .find(|p| p.identity_key == peer)
+            .and_then(|p| p.last_session_reset)
+            .is_some_and(|t| now.saturating_sub(t) < DEAD_SESSION_RETRY_SECS)
+        {
+            return false;
+        }
+        // Walk back over the trailing run of unacknowledged outgoing messages.
+        let mut unacked = 0usize;
+        let mut oldest = now;
+        for m in convo.messages.iter().rev() {
+            if m.system {
+                continue;
+            }
+            match m.direction {
+                // Anything acknowledged means the session is fine.
+                Direction::Outgoing if m.status != DeliveryStatus::Sent => break,
+                Direction::Outgoing => {
+                    unacked += 1;
+                    oldest = oldest.min(m.sent_at);
+                }
+                // They reached us after these sends — the session is alive.
+                Direction::Incoming => break,
+            }
+        }
+        unacked >= DEAD_SESSION_MIN_UNACKED
+            && now.saturating_sub(oldest) >= DEAD_SESSION_MIN_AGE_SECS
+    }
+
+    /// Anchor the dead-session rate limit after an automatic reset.
+    pub fn mark_session_reset(&mut self, peer: &str, now: u64) {
+        if let Some(pin) = self.contacts.values_mut().find(|p| p.identity_key == peer) {
+            pin.last_session_reset = Some(now);
+        }
+    }
+
+    /// One-time heal for vaults written before ordered inserts existed: stable-sort every
+    /// 1:1 and group thread by `sent_at`, so a history that had drifted into multi-device
+    /// self-sync *arrival* order snaps back to chronological order. Stable, so a same-second
+    /// burst keeps its existing relative order. Cheap on an already-ordered thread. Called
+    /// once at unlock; new messages stay ordered via [`insert_message_ordered`].
+    pub fn normalize_message_order(&mut self) {
+        for c in self.conversations.values_mut() {
+            c.messages.sort_by_key(|m| m.sent_at);
+        }
+        for g in self.groups.values_mut() {
+            g.messages.sort_by_key(|m| m.sent_at);
+        }
+    }
+
     /// Apply a delivery receipt from the peer: upgrade the status of our matching outgoing
     /// messages (never downgrade — `Seen` sticks even if a stale `Delivered` arrives late).
     pub fn mark_receipt(&mut self, peer: &str, ids: &[String], seen: bool) {
@@ -2609,6 +2729,24 @@ impl History {
     /// verified roster. `None` = attribute the device to itself (single-device / unknown).
     pub fn device_owner(&self, device_key: &str) -> Option<&str> {
         self.device_owner.get(device_key).map(String::as_str)
+    }
+
+    /// A silent drop that a KT roster refresh could repair: `sender_key` is completely
+    /// unattributed (no roster maps it, no contact pins it) while `claimed` IS a pinned
+    /// contact — either that contact linked a device we haven't resolved yet, or their
+    /// key rotated. Without a refresh, [`screen_inbound`](Self::screen_inbound)'s spoof
+    /// rule drops this sender's content without a trace (the name-collision branch).
+    /// Returns the username whose roster should be re-resolved.
+    pub fn device_resolution_candidate(&self, sender_key: &str, claimed: &str) -> Option<String> {
+        if claimed.is_empty()
+            || self.device_owner.contains_key(sender_key)
+            || self.contacts.values().any(|p| p.identity_key == sender_key)
+        {
+            return None;
+        }
+        self.contacts
+            .contains_key(claimed)
+            .then(|| claimed.to_string())
     }
 
     /// Resolve a sending device key to the conversation key to file it under: the owning
@@ -3806,6 +3944,30 @@ mod tests {
     }
 
     #[test]
+    fn device_resolution_candidate_flags_only_the_repairable_drop() {
+        let mut h = History::new();
+        h.pin_contact("alice", "alice-key", false);
+        // Unattributed key + pinned name = the repairable silent-drop (linked device
+        // we never resolved, or a rotated key) → re-resolve alice's roster.
+        assert_eq!(
+            h.device_resolution_candidate("mystery-key", "alice"),
+            Some("alice".to_string())
+        );
+        // Not repairable: unknown name (plain stranger request path handles it)…
+        assert_eq!(h.device_resolution_candidate("mystery-key", "bob"), None);
+        assert_eq!(h.device_resolution_candidate("mystery-key", ""), None);
+        // …the pinned key itself…
+        assert_eq!(h.device_resolution_candidate("alice-key", "alice"), None);
+        // …or a key a verified roster already attributes.
+        let devs = vec![RosterDevice {
+            device_id: "aa".repeat(16),
+            identity_key: "mystery-key".into(),
+        }];
+        h.pin_roster("alice", 0, 0, "alice-key", devs).unwrap();
+        assert_eq!(h.device_resolution_candidate("mystery-key", "alice"), None);
+    }
+
+    #[test]
     fn roster_pin_is_monotonic_and_maps_device_owner() {
         let mut h = History::new();
         let devs = vec![
@@ -4682,6 +4844,64 @@ mod tests {
             forwarded: false,
         });
         assert!(!h.is_request_pending("mallory"));
+    }
+
+    #[test]
+    fn dead_session_detection_is_conservative() {
+        let now = 1_000_000u64;
+        let peer = "peer-key";
+        // A conversation they HAVE replied on, plus `n` unacknowledged sends `age` old.
+        let convo = |n: usize, age: u64| -> History {
+            let mut h = History::new();
+            h.pin_contact("bob", peer, false);
+            h.record(peer, Direction::Incoming, "in1", "hi", now - age - 60);
+            for i in 0..n {
+                h.record(
+                    peer,
+                    Direction::Outgoing,
+                    &format!("out{i}"),
+                    "hello?",
+                    now - age,
+                );
+            }
+            h
+        };
+
+        // The real failure: a run of old sends nobody ever acknowledged.
+        assert!(convo(3, 900).session_looks_dead(peer, now));
+
+        // Too few unacknowledged sends to be sure.
+        assert!(!convo(2, 900).session_looks_dead(peer, now));
+        // A fast burst inside the grace period (they may simply be offline).
+        assert!(!convo(5, 60).session_looks_dead(peer, now));
+
+        // Never heard from them at all — could just be an unaccepted message request,
+        // which withholds delivery receipts by design. Must NOT auto-reset.
+        let mut never = History::new();
+        never.pin_contact("bob", peer, false);
+        for i in 0..5 {
+            never.record(peer, Direction::Outgoing, &format!("o{i}"), "hi", now - 900);
+        }
+        assert!(!never.session_looks_dead(peer, now));
+
+        // One acknowledged send in the trailing run proves the session is alive.
+        let mut acked = convo(3, 900);
+        acked.mark_receipt(peer, &["out2".to_string()], false);
+        assert!(!acked.session_looks_dead(peer, now));
+
+        // So does anything inbound after the run.
+        let mut replied = convo(3, 900);
+        replied.record(peer, Direction::Incoming, "in2", "still here", now - 10);
+        assert!(!replied.session_looks_dead(peer, now));
+
+        // Rate limited right after an automatic reset, so it can never churn…
+        let mut just_reset = convo(3, 900);
+        just_reset.mark_session_reset(peer, now - 60);
+        assert!(!just_reset.session_looks_dead(peer, now));
+        // …and allowed again once the window has passed.
+        let mut long_ago = convo(3, 900);
+        long_ago.mark_session_reset(peer, now - 4000);
+        assert!(long_ago.session_looks_dead(peer, now));
     }
 
     #[test]

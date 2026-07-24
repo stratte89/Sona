@@ -25,6 +25,8 @@
 #   SONA_SSH_HOST      ssh alias of the VPS (same one deploy/push.sh uses)
 #   SONA_WWW_DIR       server dir Caddy serves the channel from (default /srv/sona-www)
 #   SONA_GH_MIRROR     "1" to also mirror artifacts to a GitHub release via `gh`
+#   SONA_GH_REPO       owner/name the releases go to (default: the cwd's origin —
+#                      set this when the dev remote and the public repo differ)
 #
 # Keys live in ~/.config/sona-release/ :
 #   minisign.key/.pub  (rsign2)  — signs manifest + exe + apk; pubkey baked into builds
@@ -210,14 +212,15 @@ PRUNE
 # ------------------------------------------------------------------ GitHub mirror
 if [[ "${SONA_GH_MIRROR:-0}" == "1" ]]; then
   log "mirroring to GitHub release v$VERSION"
+  GH=(gh); [ -n "${SONA_GH_REPO:-}" ] && GH=(gh -R "$SONA_GH_REPO")
   ( cd "$REPO" && {
-      gh release view "v$VERSION" >/dev/null 2>&1 || gh release create "v$VERSION" --title "Sona v$VERSION" --notes "Signed release artifacts. Verify with minisign; the in-app updater does this automatically."
+      "${GH[@]}" release view "v$VERSION" >/dev/null 2>&1 || "${GH[@]}" release create "v$VERSION" --title "Sona v$VERSION" --notes "Signed release artifacts. Verify with minisign; the in-app updater does this automatically."
       files=()
       [ -n "$DEB" ] && files+=("$DEB")
       [ -n "$EXE_NAME" ] && files+=("$OUT/updates/$EXE_NAME" "$OUT/updates/$EXE_NAME.minisig")
       [ -n "$APK_NAME" ] && files+=("$OUT/updates/$APK_NAME" "$OUT/updates/$APK_NAME.minisig")
       files+=("$OUT/updates/manifest.json" "$OUT/updates/manifest.json.minisig")
-      gh release upload "v$VERSION" "${files[@]}" --clobber
+      "${GH[@]}" release upload "v$VERSION" "${files[@]}" --clobber
   } )
 fi
 

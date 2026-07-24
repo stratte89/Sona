@@ -99,7 +99,6 @@ UP_SRC="$SCRIPT_DIR/UnifiedPush.kt";            UP_DST="$(dirname "$ACTIVITY")/U
 HWATTEST_SRC="$SCRIPT_DIR/HwAttest.kt";         HWATTEST_DST="$(dirname "$ACTIVITY")/HwAttest.kt"
 UPDATE_SRC="$SCRIPT_DIR/UpdateBridge.kt";       UPDATE_DST="$(dirname "$ACTIVITY")/UpdateBridge.kt"
 STAT_ICON="$MAIN_DIR/res/drawable/ic_stat_sona.xml"
-UPDATE_PATHS_XML="$MAIN_DIR/res/xml/sona_update_paths.xml"
 
 # ---------------------------------------------------------------- check mode
 activity_hardened() { grep -q "$MARKER" "$ACTIVITY"; }
@@ -133,10 +132,9 @@ delivery_kept() { [ -f "$PRO_FILE" ] && grep -q 'DeliveryService' "$PRO_FILE"; }
 update_installed() { [ -f "$UPDATE_DST" ] && cmp -s "$UPDATE_SRC" "$UPDATE_DST"; }
 update_wired() {
   grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' "$MANIFEST" \
-    && grep -q '\.updates"' "$MANIFEST" \
-    && [ -f "$UPDATE_PATHS_XML" ]
+    && grep -q 'UpdateBridge\$ResultReceiver' "$MANIFEST"
 }
-update_kept() { [ -f "$PRO_FILE" ] && grep -q 'UpdateBridge' "$PRO_FILE"; }
+update_kept() { [ -f "$PRO_FILE" ] && grep -q 'UpdateBridge\$\*' "$PRO_FILE"; }
 media_activity_wired() { grep -q "$MEDIA_MARKER" "$ACTIVITY"; }
 notify_installed() {
   [ -f "$SONAAPP_DST" ] && cmp -s "$SONAAPP_SRC" "$SONAAPP_DST"     && [ -f "$BRIDGE_DST" ] && cmp -s "$BRIDGE_SRC" "$BRIDGE_DST"     && [ -f "$BOOT_DST" ] && cmp -s "$BOOT_SRC" "$BOOT_DST"     && [ -f "$FCM_DST" ] && cmp -s "$FCM_SRC" "$FCM_DST"     && [ -f "$UP_DST" ] && cmp -s "$UP_SRC" "$UP_DST"
@@ -194,7 +192,7 @@ if [ "$MODE" = "check" ]; then
   if notify_kept; then note "proguard keep rules (notification pipeline): present"; else note "proguard keep rules (notification pipeline): MISSING"; ok=1; fi
   if signing_wired; then note "release signing: wired"; else note "release signing: NOT wired"; ok=1; fi
   if update_installed; then note "UpdateBridge.kt: installed (current)"; else note "UpdateBridge.kt: MISSING or stale"; ok=1; fi
-  if update_wired; then note "update install wiring (permission + FileProvider): present"; else note "update install wiring: MISSING"; ok=1; fi
+  if update_wired; then note "update install wiring (permission + result receiver): present"; else note "update install wiring: MISSING"; ok=1; fi
   if update_kept; then note "proguard keep rule (UpdateBridge): present"; else note "proguard keep rule (UpdateBridge): MISSING"; ok=1; fi
   exit "$ok"
 fi
@@ -883,9 +881,11 @@ EOF
 fi
 
 # ---------------------- 16. UpdateBridge.kt (in-app APK updates, update.rs)
-# Rust downloads + minisign-verifies the APK into app cache; the bridge hands it to the
-# platform installer via a FileProvider URI. The OS enforces same-signer + monotonic
-# versionCode, so data survives and a foreign APK can never replace the app.
+# Rust downloads + minisign-verifies the APK into app cache; the bridge STREAMS it into
+# a PackageInstaller session (content-URI installs get "problem parsing the package" on
+# some ROMs) and a manifest ResultReceiver surfaces the outcome / confirm dialog. The
+# OS enforces same-signer + monotonic versionCode, so data survives and a foreign APK
+# can never replace the app.
 if update_installed; then
   note "UpdateBridge.kt already current — skipping"
 else
@@ -899,32 +899,25 @@ else
     's|<application|<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <application|' "$MANIFEST"
   note "AndroidManifest.xml: REQUEST_INSTALL_PACKAGES added"
 fi
-if [ -f "$UPDATE_PATHS_XML" ]; then
-  note "sona_update_paths.xml already present — skipping"
-else
-  cat > "$UPDATE_PATHS_XML" <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider scope for in-app updates: ONLY the cache updates/ dir is exposed,
-     read-only, to the platform package installer. Nothing else leaves the sandbox. -->
-<paths>
-    <cache-path name="updates" path="updates/" />
-</paths>
-EOF
-  note "sona_update_paths.xml written"
-fi
-if grep -q '\.updates"' "$MANIFEST"; then
-  note "update FileProvider already present — skipping"
+# (The former FileProvider path — sona_update_paths.xml + <provider> — is gone: APK
+# bytes now stream straight into a PackageInstaller session; content-URI installs
+# produced "problem parsing the package" on some ROMs. A provider left in an already
+# generated manifest is inert and harmless.)
+if grep -q 'UpdateBridge\$ResultReceiver' "$MANIFEST"; then
+  note "update result receiver already present — skipping"
 else
   sed -i \
-    's|</application>|    <provider\n        android:name="androidx.core.content.FileProvider"\n        android:authorities="${applicationId}.updates"\n        android:exported="false"\n        android:grantUriPermissions="true">\n        <meta-data\n            android:name="android.support.FILE_PROVIDER_PATHS"\n            android:resource="@xml/sona_update_paths" />\n    </provider>\n    </application>|' "$MANIFEST"
-  note "AndroidManifest.xml: update FileProvider added"
+    's|</application>|    <receiver\n        android:name=".UpdateBridge$ResultReceiver"\n        android:exported="false" />\n    </application>|' "$MANIFEST"
+  note "AndroidManifest.xml: update result receiver added"
 fi
 if update_kept; then
   note "proguard keep rule (UpdateBridge) already present — skipping"
 else
   cat >> "$PRO_FILE" <<'EOF'
-# In-app updates: UpdateBridge is driven over JNI reflection from Rust (update.rs).
+# In-app updates: UpdateBridge is driven over JNI reflection from Rust (update.rs);
+# ResultReceiver is a manifest component (PackageInstaller session callback).
 -keep class app.sona.messenger.UpdateBridge { *; }
+-keep class app.sona.messenger.UpdateBridge$* { *; }
 EOF
   note "proguard keep rule (UpdateBridge) appended"
 fi

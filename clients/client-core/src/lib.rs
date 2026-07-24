@@ -213,6 +213,17 @@ pub async fn http_get_bytes(
     proxy: Option<&str>,
     max_len: usize,
 ) -> std::result::Result<Vec<u8>, String> {
+    http_get_bytes_progress(url, proxy, max_len, |_, _| {}).await
+}
+
+/// [`http_get_bytes`] with a progress callback: `(bytes_so_far, total_if_known)` after
+/// every received chunk — for UIs showing a download bar (e.g. the in-app updater).
+pub async fn http_get_bytes_progress(
+    url: &str,
+    proxy: Option<&str>,
+    max_len: usize,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> std::result::Result<Vec<u8>, String> {
     let client = build_http(None, proxy);
     let resp = client
         .get(url)
@@ -227,6 +238,7 @@ pub async fn http_get_bytes(
             return Err(format!("fetch {url}: {len} bytes exceeds cap"));
         }
     }
+    let total = resp.content_length();
     let mut out: Vec<u8> = Vec::new();
     let mut stream = resp;
     while let Some(chunk) = stream
@@ -238,6 +250,7 @@ pub async fn http_get_bytes(
             return Err(format!("fetch {url}: body exceeds {max_len}-byte cap"));
         }
         out.extend_from_slice(&chunk);
+        progress(out.len() as u64, total);
     }
     Ok(out)
 }

@@ -269,12 +269,16 @@ pub async fn accept_key_change(
     let view = OpenChatView {
         status: "unchanged",
         peer: c.identity_key,
-        username: c.username,
+        username: c.username.clone(),
         safety_number: c.safety_number,
         verified: false,
         previous_key: None,
     };
     s.persist()?;
+    drop(s);
+    // Messages from the new key may sit in the attribution quarantine (they arrived
+    // before this accept and could not be attributed) — surface them now.
+    crate::attr_heal::resolve_attr_and_replay(&state.inner, &client, &c.username).await;
     Ok(view)
 }
 
@@ -347,6 +351,9 @@ pub(crate) async fn send_inner(
     });
     let peer = contact.identity_key.clone();
     let contact_username = contact.username.clone();
+
+    // Self-heal a dead ratchet session before we seal anything to it.
+    cmd::security::auto_reset_if_dead(&mut s, &client, &contact_username, &peer).await;
 
     // Multi-device: fan the message out to every recipient device AND our own other
     // devices (self-sync, jittered). Single-device (or an old relay): the 1:1 path.
@@ -460,6 +467,13 @@ pub async fn mark_seen(
     username: String,
     peer: String,
 ) -> Result<(), String> {
+    // "Seen" claims the user LOOKED at it. The JS gate alone is not enough: WebView2 calls
+    // `document.hasFocus()` true even when its window is not foreground, so a background
+    // Windows client still marked messages read. Nothing is lost (the UI re-runs this on
+    // focus). NOT in `mark_seen_inner`: the notification "mark read" tap IS the user reading.
+    if !eng().on_screen() {
+        return Ok(());
+    }
     mark_seen_inner(&state.inner, username, peer).await
 }
 
@@ -477,42 +491,44 @@ pub(crate) async fn mark_seen_inner(
         if ids.is_empty() {
             return Ok(());
         }
-        // Privacy: read receipts off ⇒ send NOTHING over the wire (no send-then-hide). Still
-        // clear the *local* unread state so this device's own badge updates.
+        // Clear THIS device's unread state first and persist. The receipt to the sender is
+        // best-effort (reaching every one of their devices may need the network); the local
+        // badge must clear whether or not that send succeeds.
+        s.history.mark_seen_receipted(peer.trim(), &ids);
+        // Privacy: read receipts off ⇒ send NOTHING over the wire (no send-then-hide).
         if !s.prefs.send_receipts {
-            s.history.mark_seen_receipted(peer.trim(), &ids);
             return s.persist();
         }
         let contact = contact_for(username.trim(), peer.trim());
-        // Multi-device: fan the read receipt out to the contact's devices AND self-sync it
-        // to our own devices so every device clears the unread badge. Single-device: one
-        // receipt over the existing session.
-        let envelopes = if s.multi_device {
-            let sess = &mut *s;
-            let account = sess.account.as_mut().ok_or("locked")?;
-            match client
-                .prepare_receipt_fanout(account, &mut sess.history, &contact, ids.clone())
-                .await
-                .map_err(|e| e.to_string())?
-            {
-                Some(fan) => {
-                    let mut all = fan.immediate;
-                    all.extend(fan.deferred);
-                    all
-                }
-                None => Vec::new(),
+        // Fan the "seen" receipt to EVERY one of the SENDER's devices (roster-resolved),
+        // plus a self-sync to our own devices. The old gate keyed this on OUR account being
+        // multi-device — so a single-device reader sent a lone receipt to just the one
+        // sender device it happened to hear from, and the sender's OTHER devices (e.g. a
+        // phone that only self-synced the outgoing copy) sat on one tick forever. What
+        // actually decides fan-out is whether the SENDER is multi-device, which the fan-out
+        // resolves. If that resolve fails (offline / stale roster) fall back to a single
+        // receipt over the live session, so it still reaches the device we have a session
+        // with instead of failing the whole call.
+        let sess = &mut *s;
+        let account = sess.account.as_mut().ok_or("locked")?;
+        let envelopes = match client
+            .prepare_receipt_fanout(account, &mut sess.history, &contact, ids.clone())
+            .await
+        {
+            Ok(Some(fan)) => {
+                let mut all = fan.immediate;
+                all.extend(fan.deferred);
+                all
             }
-        } else {
-            let account = s.account.as_mut().ok_or("locked")?;
-            client
+            Ok(None) => Vec::new(),
+            Err(_) => client
                 .prepare_receipt(account, &contact, ids.clone(), true)
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .collect()
+                .collect(),
         };
         // The ratchet advanced while encrypting — persist before hitting the network.
-        s.history.mark_seen_receipted(peer.trim(), &ids);
-        s.persist()?;
+        sess.persist()?;
         (client, envelopes)
     };
     client
