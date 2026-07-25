@@ -81,7 +81,7 @@
           <select class="cset-select" id="cset-input-device"></select>
           <label class="cset-label" for="cset-output-device">Speaker</label>
           <select class="cset-select" id="cset-output-device"></select>
-          <p class="cset-hint">Audio devices apply on the next call. Active calls keep their current device.</p>
+          <p class="cset-hint">Overrides the default from Settings for this call. Active calls keep their current device.</p>
         </div>
       </div>
       <!-- Self-view: what *you* are sending (camera / screen), PiP over the stage. -->
@@ -694,6 +694,15 @@
               </span>
             </div>
           </div>
+
+          <h2 class="section-h">Audio</h2>
+          <div class="card">
+            <label class="cset-label" for="se-input-device">Microphone</label>
+            <select class="cset-select" id="se-input-device"></select>
+            <label class="cset-label" for="se-output-device">Speaker</label>
+            <select class="cset-select" id="se-output-device"></select>
+          </div>
+          <p class="hint">Default audio devices for calls. You can still change them per-call from the call settings gear.</p>
 
           <h2 class="section-h">Security</h2>
           <div class="card">

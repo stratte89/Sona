@@ -24,7 +24,36 @@ async function openSettings() {
   renderDelivery(); // async fill-in (talks to the relay for capabilities)
   renderProxy();
   await renderDevices();
+  await renderAudioDevices();
 }
+
+// ── Audio device selection (global default; per-call override in call settings) ──
+async function renderAudioDevices() {
+  if (IS_ANDROID) return;
+  try {
+    const devs = await invoke('call_list_audio_devices');
+    const savedIn = localStorage.getItem('sona-audio-in') || '';
+    const savedOut = localStorage.getItem('sona-audio-out') || '';
+    const inSel = $('#se-input-device');
+    const outSel = $('#se-output-device');
+    inSel.innerHTML = '<option value="">System default</option>' +
+      (devs.inputs || []).map(d => `<option value="${escapeHtml(d.name)}"${d.name === savedIn ? ' selected' : ''}>${escapeHtml(d.name)}${d.is_default ? ' (default)' : ''}</option>`).join('');
+    outSel.innerHTML = '<option value="">System default</option>' +
+      (devs.outputs || []).map(d => `<option value="${escapeHtml(d.name)}"${d.name === savedOut ? ' selected' : ''}>${escapeHtml(d.name)}${d.is_default ? ' (default)' : ''}</option>`).join('');
+  } catch (e) { console.warn('audio device list failed:', e); }
+}
+$('#se-input-device')?.addEventListener('change', (e) => {
+  const v = e.target.value;
+  localStorage.setItem('sona-audio-in', v);
+  const out = localStorage.getItem('sona-audio-out') || '';
+  invoke('call_set_audio_devices', { input: v, output: out }).catch(() => {});
+});
+$('#se-output-device')?.addEventListener('change', (e) => {
+  const v = e.target.value;
+  localStorage.setItem('sona-audio-out', v);
+  const inp = localStorage.getItem('sona-audio-in') || '';
+  invoke('call_set_audio_devices', { input: inp, output: v }).catch(() => {});
+});
 
 // ── Own profile picture ──────────────────────────────────────────────────────────
 // Broadcast to every contact we share a session with (over the ratchet, sealed — the
