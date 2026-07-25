@@ -188,6 +188,8 @@ pub(crate) struct CallCtl {
     pub(crate) caller: bool,
     /// Mic mute + camera/screen/screen-audio toggles, read live by the engine.
     pub(crate) toggles: client_core::media::MediaToggles,
+    /// Screen capture source (monitor/window selection), shared with the capture thread.
+    pub(crate) screen_source: Arc<std::sync::Mutex<media_shell::CaptureSource>>,
     pub(crate) connected: Arc<std::sync::atomic::AtomicBool>,
     /// Unix time the media leg first connected (0 = never) — drives the call-history
     /// chip's duration and the answered/unanswered outcome split.

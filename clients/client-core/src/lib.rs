@@ -44,6 +44,7 @@ pub mod devicekey;
 mod events;
 pub mod groupcall;
 pub mod history;
+pub mod hw_codec;
 pub mod media;
 pub mod multidevice;
 mod padding;

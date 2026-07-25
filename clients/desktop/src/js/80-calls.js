@@ -380,6 +380,8 @@ function hideCall() {
   $('#call-speaker').classList.remove('on');
   $('#call-speaker').innerHTML = icon('vol');
   $('#call-settings').hidden = true;
+  $('#call-participants').hidden = true;
+  $('#vol-popup').hidden = true;
   callUi.videoReady = false; callUi.cameraOn = false; callUi.screenOn = false;
   callUi.screenAudioOn = false; callUi.peerCam = false; callUi.peerScr = false;
   $('#call-mute').innerHTML = icon('mic');
@@ -513,6 +515,20 @@ $('#call-gear').onclick = async () => {
     await refreshScreenAudioAvail();
     $('#cset-shareaudio').hidden = !callUi.screenAudioAvail;
     $('#cset-shareaudio-hint').hidden = !callUi.screenAudioAvail;
+    // Populate audio device dropdowns (desktop only — Android uses platform routing).
+    if (!IS_ANDROID) {
+      try {
+        const devs = await invoke('call_list_audio_devices');
+        const savedIn = localStorage.getItem('sona-audio-in') || '';
+        const savedOut = localStorage.getItem('sona-audio-out') || '';
+        const inSel = $('#cset-input-device');
+        const outSel = $('#cset-output-device');
+        inSel.innerHTML = '<option value="">System default</option>' +
+          (devs.inputs || []).map(d => `<option value="${escapeHtml(d.name)}"${d.name === savedIn ? ' selected' : ''}>${escapeHtml(d.name)}${d.is_default ? ' (default)' : ''}</option>`).join('');
+        outSel.innerHTML = '<option value="">System default</option>' +
+          (devs.outputs || []).map(d => `<option value="${escapeHtml(d.name)}"${d.name === savedOut ? ' selected' : ''}>${escapeHtml(d.name)}${d.is_default ? ' (default)' : ''}</option>`).join('');
+      } catch (e) { console.warn('audio device list failed:', e); }
+    }
   }
 };
 // Tap outside the card closes the modal.
@@ -540,6 +556,20 @@ $('#cset-shareaudio').onclick = async () => {
   }
 };
 
+// Audio device selection: persist choice and apply to backend.
+$('#cset-input-device')?.addEventListener('change', (e) => {
+  const v = e.target.value;
+  localStorage.setItem('sona-audio-in', v);
+  const out = localStorage.getItem('sona-audio-out') || '';
+  invoke('call_set_audio_devices', { input: v, output: out }).catch(() => {});
+});
+$('#cset-output-device')?.addEventListener('change', (e) => {
+  const v = e.target.value;
+  localStorage.setItem('sona-audio-out', v);
+  const inp = localStorage.getItem('sona-audio-in') || '';
+  invoke('call_set_audio_devices', { input: inp, output: v }).catch(() => {});
+});
+
 $('#call-mute').onclick = async () => {
   const next = !callUi.muted;
   try {
@@ -561,25 +591,106 @@ $('#call-cam').onclick = async () => {
 };
 $('#call-share').onclick = async () => {
   const next = !callUi.screenOn;
+  if (!next) {
+    // Stopping share — no picker needed.
+    try {
+      await invoke('call_set_screen', { on: false });
+      callUi.screenOn = false;
+      callUi.screenAudioOn = false;
+      setCallButtons();
+      updateSelfStage();
+    } catch (e) { toast(say(e), 'err'); }
+    return;
+  }
+  // Starting share — open source picker modal.
+  let sources;
   try {
-    await invoke('call_set_screen', { on: next });
-    callUi.screenOn = next;
-    callUi.screenAudioOn = false; // backend clears audio with the share
-    if (next) {
+    sources = await invoke('call_list_screens');
+  } catch (e) { toast(say(e), 'err'); return; }
+  const monitors = sources.monitors || [];
+  const windows = sources.windows || [];
+  if (!monitors.length && !windows.length) {
+    // No sources available — share primary as fallback.
+    try {
+      await invoke('call_set_screen', { on: true, source: null });
+      callUi.screenOn = true;
+      callUi.screenAudioOn = false;
       $('#self-scr .self-note').hidden = false;
-      // System audio rides the share per the call-settings preference. Ordering is
-      // audio *after* share on purpose: the gap direction is silence, never a leak
-      // (and on Android the bridge attaches capture once the projection lands).
       if (callUi.screenAudioAvail && shareAudioPref()) {
         try {
           await invoke('call_set_screen_audio', { on: true });
           callUi.screenAudioOn = true;
         } catch (e) { toast(say(e), 'err'); }
       }
-    }
-    setCallButtons();
-    updateSelfStage();
-  } catch (e) { toast(say(e), 'err'); }
+      setCallButtons();
+      updateSelfStage();
+    } catch (e) { toast(say(e), 'err'); }
+    return;
+  }
+  // Build source picker modal using existing modal system.
+  const lastSrc = localStorage.getItem('sona-sharesrc') || '';
+  let selected = lastSrc;
+  const monHtml = monitors.map(m => {
+    const sel = selected === m.id ? ' sel' : '';
+    const prim = m.is_primary ? '<small>Primary</small>' : '';
+    return `<button class="modal-list-btn${sel}" data-src="${escapeHtml(m.id)}">
+      ${icon('screen')}<span>${escapeHtml(m.name || m.id)}</span>
+      <em>${m.width}×${m.height}</em>${prim}</button>`;
+  }).join('');
+  const winHtml = windows.map(w => {
+    const sel = selected === w.id ? ' sel' : '';
+    return `<button class="modal-list-btn${sel}" data-src="${escapeHtml(w.id)}">
+      ${icon('app')}<span>${escapeHtml(w.title || w.id)}</span>
+      <em>${w.width}×${w.height}</em></button>`;
+  }).join('');
+  const card = openModal(`
+    <h3>Share screen</h3>
+    <p>Choose a screen or window to share.</p>
+    ${monitors.length ? `<div class="modal-list"><button class="src-tab sel" data-tab="screens">Screens</button><button class="src-tab" data-tab="windows">Windows</button></div>` : ''}
+    <div class="modal-list src-list" id="src-list-screens">${monHtml}</div>
+    <div class="modal-list src-list" id="src-list-windows" hidden>${winHtml}</div>
+    <button class="btn" id="src-share">Share</button>
+    <button class="btn btn-ghost btn-sm" id="src-cancel">Cancel</button>
+  `, { onCall: true });
+  // Tab switching.
+  card.querySelectorAll('.src-tab').forEach(tab => {
+    tab.onclick = () => {
+      card.querySelectorAll('.src-tab').forEach(t => t.classList.remove('sel'));
+      tab.classList.add('sel');
+      const showWindows = tab.dataset.tab === 'windows';
+      $('#src-list-screens', card).hidden = showWindows;
+      $('#src-list-windows', card).hidden = !showWindows;
+    };
+  });
+  // Source selection.
+  card.querySelectorAll('.modal-list-btn').forEach(btn => {
+    btn.onclick = () => {
+      card.querySelectorAll('.modal-list-btn').forEach(b => b.classList.remove('sel'));
+      btn.classList.add('sel');
+      selected = btn.dataset.src;
+    };
+  });
+  // Share button.
+  card.querySelector('#src-share').onclick = async () => {
+    const src = selected || null;
+    closeModal();
+    try {
+      await invoke('call_set_screen', { on: true, source: src });
+      callUi.screenOn = true;
+      callUi.screenAudioOn = false;
+      if (src) localStorage.setItem('sona-sharesrc', src);
+      $('#self-scr .self-note').hidden = false;
+      if (callUi.screenAudioAvail && shareAudioPref()) {
+        try {
+          await invoke('call_set_screen_audio', { on: true });
+          callUi.screenAudioOn = true;
+        } catch (e) { toast(say(e), 'err'); }
+      }
+      setCallButtons();
+      updateSelfStage();
+    } catch (e) { toast(say(e), 'err'); }
+  };
+  card.querySelector('#src-cancel').onclick = () => closeModal();
 };
 
 // Group-call events drive the same overlay in voice-only mode. Connectivity is
@@ -605,11 +716,13 @@ function onGroupCallEvent(ev) {
     case 'peer_connected':
       callUi.peers.add(p.username);
       if (callUi.mode !== 'connected') showCall('connected');
+      renderParticipants();
       break;
     case 'peer_left':
     case 'peer_declined':
       if (p.username) callUi.peers.delete(p.username);
       if (p.kind === 'peer_declined' && callUi.mode) toast(`${p.username || 'Someone'} declined`);
+      renderParticipants();
       break;
     case 'accepted': if (callUi.mode === 'incoming') showCall('connecting'); break;
     case 'no_answer': toast('No one answered'); hideCall(); break;
@@ -689,6 +802,7 @@ async function resyncCall() {
       callUi.group = true;
       callUi.peers = new Set(st.group_active.peers || []);
       showCall(callUi.peers.size ? 'connected' : 'outgoing', st.group_active.name);
+      renderParticipants();
       if (st.group_active.muted) {
         callUi.muted = true;
         $('#call-mute').innerHTML = icon('micoff');
@@ -784,4 +898,86 @@ window.addEventListener('focus', () => {
     setInterval(onSync, 1500);
   }
 })();
+
+// ── Group call participant tiles + per-peer volume popup ────────────────────────
+function renderParticipants() {
+  const container = $('#call-participants');
+  if (!callUi.group || callUi.peers.size === 0) {
+    container.hidden = true;
+    container.innerHTML = '';
+    return;
+  }
+  container.hidden = false;
+  container.innerHTML = '';
+  for (const username of callUi.peers) {
+    const tile = document.createElement('div');
+    tile.className = 'participant-tile';
+    tile.dataset.peer = username;
+    const h = hue(username);
+    tile.innerHTML = `<div class="avatar" style="--av-h:${h};width:28px;height:28px;font-size:12px">${escapeHtml(initial(username))}</div><span>${escapeHtml(username)}</span>`;
+    tile.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openVolPopup(username, e.clientX, e.clientY, false);
+    });
+    container.appendChild(tile);
+  }
+}
+
+$('#call-avatar').addEventListener('contextmenu', (e) => {
+  if (callUi.group || !callUi.username) return;
+  e.preventDefault();
+  openVolPopup(callUi.username, e.clientX, e.clientY, false);
+});
+$('#cv-camera').addEventListener('contextmenu', (e) => {
+  if (callUi.group || !callUi.username) return;
+  e.preventDefault();
+  openVolPopup(callUi.username, e.clientX, e.clientY, false);
+});
+$('#cv-screen').addEventListener('contextmenu', (e) => {
+  if (callUi.group || !callUi.username) return;
+  e.preventDefault();
+  openVolPopup(callUi.username, e.clientX, e.clientY, true);
+});
+
+function openVolPopup(peer, x, y, showStream) {
+  const popup = $('#vol-popup');
+  $('#vol-popup-name').textContent = peer;
+  const savedMic = parseFloat(localStorage.getItem('sona-vol-' + peer) || '100');
+  const savedStream = parseFloat(localStorage.getItem('sona-streamvol-' + peer) || '100');
+  $('#vol-slider').value = savedMic;
+  $('#vol-stream-slider').value = savedStream;
+  // Show/hide stream volume controls based on context.
+  const streamEls = ['#vol-stream-sep', '#vol-stream-label', '#vol-stream-slider', '#vol-stream-labels'];
+  streamEls.forEach((sel) => { $(sel).hidden = !showStream; });
+  popup.style.left = Math.min(x, window.innerWidth - 240) + 'px';
+  popup.style.top = Math.min(y, window.innerHeight - (showStream ? 160 : 100)) + 'px';
+  popup.hidden = false;
+  $('#vol-slider').dataset.peer = peer;
+  $('#vol-stream-slider').dataset.peer = peer;
+}
+
+$('#vol-popup-close').onclick = () => { $('#vol-popup').hidden = true; };
+$('#vol-slider').addEventListener('input', (e) => {
+  const peer = e.target.dataset.peer;
+  if (!peer) return;
+  const pct = parseFloat(e.target.value);
+  const gain = pct / 100;
+  localStorage.setItem('sona-vol-' + peer, String(pct));
+  invoke('call_set_peer_volume', { peer, gain }).catch(() => {});
+});
+$('#vol-stream-slider').addEventListener('input', (e) => {
+  const peer = e.target.dataset.peer;
+  if (!peer) return;
+  const pct = parseFloat(e.target.value);
+  const gain = pct / 100;
+  localStorage.setItem('sona-streamvol-' + peer, String(pct));
+  invoke('call_set_screen_volume', { peer, gain }).catch(() => {});
+});
+document.addEventListener('click', (e) => {
+  const popup = $('#vol-popup');
+  if (popup.hidden) return;
+  if (!popup.contains(e.target) && !e.target.closest('.participant-tile') && !e.target.closest('#call-avatar') && !e.target.closest('#cv-screen') && !e.target.closest('#cv-camera')) {
+    popup.hidden = true;
+  }
+});
 

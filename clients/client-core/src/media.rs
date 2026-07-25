@@ -394,32 +394,49 @@ pub mod video {
         Screen,
     }
 
-    /// Camera encode target: ~600 kb/s @ up to 30 fps (VGA-ish source).
-    pub const CAMERA_BITRATE: u32 = 600_000;
+    /// Camera encode target: ~1.5 Mb/s @ up to 30 fps (VGA-ish source, HW encode).
+    pub const CAMERA_BITRATE: u32 = 1_500_000;
     pub const CAMERA_MAX_FPS: f32 = 30.0;
-    /// Screen encode target: ~1.5 Mb/s @ up to 15 fps (text must stay readable).
-    pub const SCREEN_BITRATE: u32 = 1_500_000;
-    pub const SCREEN_MAX_FPS: f32 = 15.0;
+    /// Screen encode target: ~8 Mb/s @ up to 60 fps (HW encode handles this at <5% GPU).
+    /// Software fallback (OpenH264) uses lower values via SW_SCREEN_BITRATE.
+    pub const SCREEN_BITRATE: u32 = 8_000_000;
+    pub const SCREEN_MAX_FPS: f32 = 60.0;
+    /// Software fallback bitrate/fps — used when no hardware encoder is available.
+    pub const SW_SCREEN_BITRATE: u32 = 2_000_000;
+    pub const SW_SCREEN_MAX_FPS: f32 = 20.0;
+    pub const SW_CAMERA_BITRATE: u32 = 600_000;
     /// Periodic IDR interval in frames: bounded damage after any decoder hiccup, and a
     /// keyframe-request never waits forever even if the control cell were lost.
     const IDR_INTERVAL_FRAMES: u32 = 300;
 
+    enum EncoderInner {
+        Hw(Box<dyn crate::hw_codec::HwEncoder>),
+        Sw(encoder::Encoder),
+    }
+
     pub struct Encoder {
-        inner: encoder::Encoder,
+        inner: EncoderInner,
     }
 
     impl Encoder {
         pub fn realtime(content: Content) -> Result<Encoder, String> {
+            // Try hardware encoder first (Windows: MF MFT for NVENC/VCN/QuickSync).
+            if let Some(hw) = crate::hw_codec::try_encoder(content) {
+                return Ok(Encoder {
+                    inner: EncoderInner::Hw(hw),
+                });
+            }
+            // Software fallback: OpenH264 with conservative bitrate/fps.
             let (usage, bitrate, fps) = match content {
                 Content::Camera => (
                     UsageType::CameraVideoRealTime,
-                    CAMERA_BITRATE,
+                    SW_CAMERA_BITRATE,
                     CAMERA_MAX_FPS,
                 ),
                 Content::Screen => (
                     UsageType::ScreenContentRealTime,
-                    SCREEN_BITRATE,
-                    SCREEN_MAX_FPS,
+                    SW_SCREEN_BITRATE,
+                    SW_SCREEN_MAX_FPS,
                 ),
             };
             let cfg = EncoderConfig::new()
@@ -429,8 +446,10 @@ pub mod video {
                 .rate_control_mode(RateControlMode::Bitrate)
                 .intra_frame_period(IntraFramePeriod::from_num_frames(IDR_INTERVAL_FRAMES));
             Ok(Encoder {
-                inner: encoder::Encoder::with_api_config(OpenH264API::from_source(), cfg)
-                    .map_err(|e| e.to_string())?,
+                inner: EncoderInner::Sw(
+                    encoder::Encoder::with_api_config(OpenH264API::from_source(), cfg)
+                        .map_err(|e| e.to_string())?,
+                ),
             })
         }
 
@@ -441,72 +460,89 @@ pub mod video {
             if !frame.valid() {
                 return Err("invalid frame".into());
             }
-            let buf = YUVBuffer::from_vec(frame.i420.clone(), frame.width, frame.height);
-            Ok(self.inner.encode(&buf).map_err(|e| e.to_string())?.to_vec())
+            match &mut self.inner {
+                EncoderInner::Hw(hw) => hw.encode(frame),
+                EncoderInner::Sw(sw) => {
+                    let buf = YUVBuffer::from_vec(frame.i420.clone(), frame.width, frame.height);
+                    Ok(sw.encode(&buf).map_err(|e| e.to_string())?.to_vec())
+                }
+            }
         }
 
         /// Force the next encoded frame to be an IDR (peer decoder asked for sync).
         pub fn force_keyframe(&mut self) {
-            self.inner.force_intra_frame();
+            match &mut self.inner {
+                EncoderInner::Hw(hw) => hw.force_keyframe(),
+                EncoderInner::Sw(sw) => sw.force_intra_frame(),
+            }
         }
     }
 
+    enum DecoderInner {
+        Hw(Box<dyn crate::hw_codec::HwDecoder>),
+        Sw(decoder::Decoder),
+    }
+
     pub struct Decoder {
-        inner: decoder::Decoder,
+        inner: DecoderInner,
     }
 
     impl Decoder {
         pub fn new() -> Result<Decoder, String> {
+            // Try hardware decoder first.
+            if let Some(hw) = crate::hw_codec::try_decoder() {
+                return Ok(Decoder {
+                    inner: DecoderInner::Hw(hw),
+                });
+            }
             Ok(Decoder {
-                inner: decoder::Decoder::new().map_err(|e| e.to_string())?,
+                inner: DecoderInner::Sw(
+                    decoder::Decoder::new().map_err(|e| e.to_string())?,
+                ),
             })
         }
 
         /// Decode one access unit. `Ok(None)` = no picture yet (e.g. bare SPS/PPS).
         pub fn decode(&mut self, packet: &[u8]) -> Result<Option<Frame>, String> {
-            let Some(yuv) = self.inner.decode(packet).map_err(|e| e.to_string())? else {
-                return Ok(None);
-            };
-            let (w, h) = yuv.dimensions();
-            // Bound decoder-reported dimensions before allocating: the stream is only
-            // peer-authenticated, so a malicious call peer could otherwise declare huge
-            // dimensions to force an oversized allocation (memory amplification). Reuse the
-            // same 4096 cap the encode side enforces via `Frame::valid` (L-4).
-            if w == 0 || h == 0 || w > 4096 || h > 4096 || w % 2 != 0 || h % 2 != 0 {
-                return Err(format!("decoded frame dimensions out of bounds: {w}x{h}"));
+            match &mut self.inner {
+                DecoderInner::Hw(hw) => return hw.decode(packet),
+                DecoderInner::Sw(sw) => {
+                    let Some(yuv) = sw.decode(packet).map_err(|e| e.to_string())? else {
+                        return Ok(None);
+                    };
+                    let (w, h) = yuv.dimensions();
+                    if w == 0 || h == 0 || w > 4096 || h > 4096 || w % 2 != 0 || h % 2 != 0 {
+                        return Err(format!("decoded frame dimensions out of bounds: {w}x{h}"));
+                    }
+                    let (sy, su, sv) = yuv.strides();
+                    let (cw, ch) = (w / 2, h / 2);
+                    if sy < w
+                        || su < cw
+                        || sv < cw
+                        || yuv.y().len() < (h - 1) * sy + w
+                        || yuv.u().len() < (ch - 1) * su + cw
+                        || yuv.v().len() < (ch - 1) * sv + cw
+                    {
+                        return Err("decoded frame planes inconsistent with dimensions".into());
+                    }
+                    let mut i420 = vec![0u8; w * h * 3 / 2];
+                    for (row, dst) in i420[..w * h].chunks_exact_mut(w).enumerate() {
+                        dst.copy_from_slice(&yuv.y()[row * sy..row * sy + w]);
+                    }
+                    let (upl, vpl) = i420[w * h..].split_at_mut(cw * ch);
+                    for (row, dst) in upl.chunks_exact_mut(cw).enumerate() {
+                        dst.copy_from_slice(&yuv.u()[row * su..row * su + cw]);
+                    }
+                    for (row, dst) in vpl.chunks_exact_mut(cw).enumerate() {
+                        dst.copy_from_slice(&yuv.v()[row * sv..row * sv + cw]);
+                    }
+                    Ok(Some(Frame {
+                        width: w,
+                        height: h,
+                        i420,
+                    }))
+                }
             }
-            let (sy, su, sv) = yuv.strides();
-            let (cw, ch) = (w / 2, h / 2);
-            // The decoder is only peer-authenticated, so its self-reported strides and plane
-            // lengths are untrusted too. If the (dimensions, stride, plane-length) triple is
-            // inconsistent, the per-row `plane[row*stride .. row*stride + width]` slices below
-            // would panic and take down the call-media task — return an error instead so a
-            // crafted stream is a dropped frame, not a crash.
-            if sy < w
-                || su < cw
-                || sv < cw
-                || yuv.y().len() < (h - 1) * sy + w
-                || yuv.u().len() < (ch - 1) * su + cw
-                || yuv.v().len() < (ch - 1) * sv + cw
-            {
-                return Err("decoded frame planes inconsistent with dimensions".into());
-            }
-            let mut i420 = vec![0u8; w * h * 3 / 2];
-            for (row, dst) in i420[..w * h].chunks_exact_mut(w).enumerate() {
-                dst.copy_from_slice(&yuv.y()[row * sy..row * sy + w]);
-            }
-            let (upl, vpl) = i420[w * h..].split_at_mut(cw * ch);
-            for (row, dst) in upl.chunks_exact_mut(cw).enumerate() {
-                dst.copy_from_slice(&yuv.u()[row * su..row * su + cw]);
-            }
-            for (row, dst) in vpl.chunks_exact_mut(cw).enumerate() {
-                dst.copy_from_slice(&yuv.v()[row * sv..row * sv + cw]);
-            }
-            Ok(Some(Frame {
-                width: w,
-                height: h,
-                i420,
-            }))
         }
     }
 }

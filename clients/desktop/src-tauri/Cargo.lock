@@ -19,6 +19,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aec3"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e818d61bd2cc5c60e23870b4da8bb24ba417065835680f7588c5a2386a4ccc2"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "num-complex",
+ "rustfft",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -812,6 +824,7 @@ dependencies = [
  "tokio",
  "tokio-socks",
  "tokio-tungstenite",
+ "windows 0.61.3",
  "x509-parser",
  "zeroize",
 ]
@@ -5286,6 +5299,7 @@ dependencies = [
 name = "sona-desktop"
 version = "0.0.0"
 dependencies = [
+ "aec3",
  "base64 0.22.1",
  "client-core",
  "cpal",
@@ -5298,6 +5312,7 @@ dependencies = [
  "nnnoiseless",
  "nokhwa",
  "notify-rust",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2 0.10.9",

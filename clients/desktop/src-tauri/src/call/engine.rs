@@ -69,7 +69,8 @@ pub(crate) async fn spawn_call(
     android_media::ensure_mic_permission();
     // Audio device init and the network join are independent — overlap them so call
     // setup takes max(mic init, join) instead of the sum.
-    let audio_task = eng().spawn_blocking(audio::start);
+    let peer_username_for_audio = peer_username.clone();
+    let audio_task = eng().spawn_blocking(move || audio::start(Some(peer_username_for_audio)));
     let media = client
         .join_call(&call_id)
         .await
@@ -79,6 +80,7 @@ pub(crate) async fn spawn_call(
 
     let media_ui = &eng().media_ui;
     let toggles = client_core::media::MediaToggles::default();
+    let screen_source = Arc::new(std::sync::Mutex::new(media_shell::CaptureSource::PrimaryMonitor));
     let connected = Arc::new(AtomicBool::new(false));
     let connected_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let peer_media2 = Arc::new(AtomicBool::new(peer_media2_now));
@@ -97,7 +99,7 @@ pub(crate) async fn spawn_call(
         let io = client_core::media::MediaIo {
             audio,
             camera: media_shell::SlotSource::camera(media_ui.clone()),
-            screen: media_shell::SlotSource::screen(media_ui.clone()),
+            screen: media_shell::SlotSource::screen(media_ui.clone(), screen_source.clone()),
             screen_audio: media_shell::SystemAudioSource::new(),
             sink: media_shell::ShellSink {
                 ui: media_ui.clone(),
@@ -249,6 +251,7 @@ pub(crate) async fn spawn_call(
         peer_key,
         caller,
         toggles,
+        screen_source,
         connected,
         connected_at,
         peer_media2,

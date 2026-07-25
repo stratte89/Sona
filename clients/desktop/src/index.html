@@ -76,6 +76,12 @@
             <span class="cset-switch" aria-hidden="true"></span>
           </button>
           <p class="cset-hint" id="cset-shareaudio-hint">Include this device's sound when sharing your screen.</p>
+          <div class="cset-divider"></div>
+          <label class="cset-label" for="cset-input-device">Microphone</label>
+          <select class="cset-select" id="cset-input-device"></select>
+          <label class="cset-label" for="cset-output-device">Speaker</label>
+          <select class="cset-select" id="cset-output-device"></select>
+          <p class="cset-hint">Audio devices apply on the next call. Active calls keep their current device.</p>
         </div>
       </div>
       <!-- Self-view: what *you* are sending (camera / screen), PiP over the stage. -->
@@ -99,6 +105,8 @@
         <div class="avatar call-avatar" id="call-avatar">?</div>
         <div class="call-name" id="call-name">—</div>
         <div class="call-state" id="call-state">calling…</div>
+        <!-- Group call participant tiles (voice-only, one per connected peer). -->
+        <div class="call-participants" id="call-participants" hidden></div>
         <div class="call-actions">
           <button class="call-btn" id="call-mute" aria-label="Mute" data-icon="mic" hidden></button>
           <button class="call-btn" id="call-speaker" aria-label="Loudspeaker" data-icon="vol" hidden></button>
@@ -109,6 +117,20 @@
         </div>
         <p class="call-hint">End-to-end encrypted · routed through your relay · no IP shared</p>
       </div>
+    </div>
+    <!-- Peer volume popup: right-click a peer tile/avatar to adjust their volume. -->
+    <div class="vol-popup" id="vol-popup" hidden>
+      <div class="vol-popup-header">
+        <span id="vol-popup-name">—</span>
+        <button class="icon-btn" id="vol-popup-close" aria-label="Close" data-icon="x"></button>
+      </div>
+      <label class="vol-popup-label" for="vol-slider">Mic volume</label>
+      <input type="range" class="vol-slider" id="vol-slider" min="0" max="200" value="100" />
+      <div class="vol-popup-labels"><span>0%</span><span>100%</span><span>200%</span></div>
+      <div class="vol-popup-sep" id="vol-stream-sep" hidden></div>
+      <label class="vol-popup-label" for="vol-stream-slider" id="vol-stream-label" hidden>Stream volume</label>
+      <input type="range" class="vol-slider" id="vol-stream-slider" min="0" max="200" value="100" hidden />
+      <div class="vol-popup-labels" id="vol-stream-labels" hidden><span>0%</span><span>100%</span><span>200%</span></div>
     </div>
 
     <div class="lightbox" id="lightbox" hidden>

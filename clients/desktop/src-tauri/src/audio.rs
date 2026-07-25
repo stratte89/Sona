@@ -38,16 +38,127 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 /// Frames buffered toward the sound card (~120 ms jitter absorption) and from the mic.
 const CHANNEL_FRAMES: usize = 6;
 
+/// AEC toggle (UI, default on). Desktop: gates WebRTC AEC3 in the capture
+/// callback. When the user wears a headset, echo is structurally impossible
+/// and AEC can be disabled to avoid any signal degradation.
+pub static ECHO_CANCELLATION: AtomicBool = AtomicBool::new(true);
+
 /// Noise-suppression toggle (UI, default on). Desktop: gates RNNoise in the capture
 /// callback, effective immediately mid-call. Android's equivalent is the platform
 /// `NoiseSuppressor` effect, toggled over the Kotlin bridge instead — see
 /// [`crate::android_media::set_voice_noise_suppression`].
 pub static NOISE_SUPPRESSION: AtomicBool = AtomicBool::new(true);
 
+/// Preferred input device name (empty = system default). Set by `call_set_audio_devices`.
+pub static AUDIO_INPUT_DEVICE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+/// Preferred output device name (empty = system default). Set by `call_set_audio_devices`.
+pub static AUDIO_OUTPUT_DEVICE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Per-peer volume gains for 1:1 calls: peer username → gain multiplier (0.0–2.0, 1.0 = unity).
+/// Applied in the playout callback to the voice portion of the mix.
+pub static PEER_VOLUME: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, f32>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Per-peer screen-audio volume gains: peer username → gain multiplier (0.0–2.0, 1.0 = unity).
+/// Applied in the playout callback to the aux (screen audio) portion of the mix.
+pub static SCREEN_VOLUME: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, f32>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// List available audio input and output devices for the settings UI.
+/// Returns JSON: `{ "inputs": [{"name": ..., "is_default": true}], "outputs": [...] }`.
+#[cfg(not(target_os = "android"))]
+pub fn list_audio_devices() -> serde_json::Value {
+    use serde_json::json;
+    let host = cpal::default_host();
+    let default_in = host.default_input_device().and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+    let default_out = host.default_output_device().and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+    let inputs: Vec<serde_json::Value> = host
+        .input_devices()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .map(|name| {
+            json!({
+                "name": name,
+                "is_default": default_in.as_deref() == Some(&name),
+            })
+        })
+        .collect();
+    let outputs: Vec<serde_json::Value> = host
+        .output_devices()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .map(|name| {
+            json!({
+                "name": name,
+                "is_default": default_out.as_deref() == Some(&name),
+            })
+        })
+        .collect();
+    json!({ "inputs": inputs, "outputs": outputs })
+}
+
+#[cfg(target_os = "android")]
+pub fn list_audio_devices() -> serde_json::Value {
+    serde_json::json!({ "inputs": [], "outputs": [] })
+}
+
+/// Set preferred audio devices (empty string = system default). Applied on the next call start.
+pub fn set_audio_devices(input: &str, output: &str) {
+    if let Ok(mut w) = AUDIO_INPUT_DEVICE.write() {
+        *w = input.to_string();
+    }
+    if let Ok(mut w) = AUDIO_OUTPUT_DEVICE.write() {
+        *w = output.to_string();
+    }
+}
+
+/// Set per-peer volume gain (0.0 = mute, 1.0 = unity, 2.0 = 2× loud). Applied live.
+pub fn set_peer_volume(peer: &str, gain: f32) {
+    if let Ok(mut w) = PEER_VOLUME.write() {
+        w.insert(peer.to_string(), gain);
+    }
+}
+
+/// Set per-peer screen-audio volume gain (0.0 = mute, 1.0 = unity, 2.0 = 2× loud). Applied live.
+pub fn set_screen_volume(peer: &str, gain: f32) {
+    if let Ok(mut w) = SCREEN_VOLUME.write() {
+        w.insert(peer.to_string(), gain);
+    }
+}
+
+/// Resolve a device by name, falling back to the system default.
+#[cfg(not(target_os = "android"))]
+fn find_device(host: &cpal::Host, name: &str, is_input: bool) -> Option<cpal::Device> {
+    if name.is_empty() {
+        return if is_input {
+            host.default_input_device()
+        } else {
+            host.default_output_device()
+        };
+    }
+    if is_input {
+        host.input_devices()
+            .into_iter()
+            .flatten()
+            .find(|d| d.description().map(|desc| desc.name() == name).unwrap_or(false))
+            .or_else(|| host.default_input_device())
+    } else {
+        host.output_devices()
+            .into_iter()
+            .flatten()
+            .find(|d| d.description().map(|desc| desc.name() == name).unwrap_or(false))
+            .or_else(|| host.default_output_device())
+    }
+}
+
 /// The engine-side endpoints. Dropping it (or the stop flag) ends the audio thread.
+/// `render_tx` feeds the playout signal back to the capture thread for AEC.
 pub struct ShellAudio {
     cap_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     play_tx: SyncSender<[i16; SAMPLES_PER_FRAME]>,
+    render_tx: SyncSender<[i16; SAMPLES_PER_FRAME]>,
     stop: Arc<AtomicBool>,
 }
 
@@ -69,6 +180,9 @@ impl AudioIo for ShellAudio {
     }
 
     fn write_frame(&mut self, frame: &[i16; SAMPLES_PER_FRAME]) {
+        // Feed the playout signal to the AEC render queue (non-blocking: if the
+        // capture thread isn't consuming, we don't stall playout).
+        let _ = self.render_tx.try_send(*frame);
         // If playout is full (device stalled), dropping late audio beats growing a lag.
         let _ = self.play_tx.try_send(*frame);
     }
@@ -98,11 +212,13 @@ pub(crate) fn resample(input: &[f32], from_hz: u32, to_hz: u32, out: &mut Vec<f3
 
 /// Start capture + playout on default devices. Returns the engine-side [`ShellAudio`]
 /// plus the aux (peer screen-audio) sender for the sink, or a human-readable error
-/// (no device, backend failure).
-pub fn start() -> Result<(ShellAudio, SyncSender<[i16; SCREEN_AUDIO_SAMPLES]>), String> {
+/// (no device, backend failure). `peer_username` is used for per-peer volume gain in
+/// 1:1 calls; pass `None` for group calls (mixing is in the engine, not the playout).
+pub fn start(peer_username: Option<String>) -> Result<(ShellAudio, SyncSender<[i16; SCREEN_AUDIO_SAMPLES]>), String> {
     let (cap_tx, cap_rx) = sync_channel::<[i16; SAMPLES_PER_FRAME]>(CHANNEL_FRAMES);
     let (play_tx, play_rx) = sync_channel::<[i16; SAMPLES_PER_FRAME]>(CHANNEL_FRAMES);
     let (aux_tx, aux_rx) = sync_channel::<[i16; SCREEN_AUDIO_SAMPLES]>(CHANNEL_FRAMES);
+    let (render_tx, render_rx) = sync_channel::<[i16; SAMPLES_PER_FRAME]>(CHANNEL_FRAMES);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
 
@@ -120,7 +236,7 @@ pub fn start() -> Result<(ShellAudio, SyncSender<[i16; SCREEN_AUDIO_SAMPLES]>), 
     std::thread::Builder::new()
         .name("sona-call-audio".into())
         .spawn(move || {
-            if let Err(e) = audio_thread(cap_tx, play_rx, aux_rx, stop_thread) {
+            if let Err(e) = audio_thread(cap_tx, play_rx, aux_rx, render_rx, stop_thread, peer_username) {
                 eprintln!("[call] audio thread ended: {e}");
             }
         })
@@ -130,10 +246,22 @@ pub fn start() -> Result<(ShellAudio, SyncSender<[i16; SCREEN_AUDIO_SAMPLES]>), 
         ShellAudio {
             cap_rx,
             play_tx,
+            render_tx,
             stop,
         },
         aux_tx,
     ))
+}
+
+/// Raw pointer wrapper for AEC pipeline — !Send types like aec3's LinearPipeline
+/// need to cross the Send boundary of cpal's build_input_stream. The callback
+/// only runs on one thread, so this is sound.
+struct AecSendPtr(*mut Option<aec3::pipelines::linear::LinearPipeline>);
+unsafe impl Send for AecSendPtr {}
+impl AecSendPtr {
+    unsafe fn get(&mut self) -> &mut Option<aec3::pipelines::linear::LinearPipeline> {
+        &mut *self.0
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -141,10 +269,14 @@ fn audio_thread(
     cap_tx: SyncSender<[i16; SAMPLES_PER_FRAME]>,
     play_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     aux_rx: Receiver<[i16; SCREEN_AUDIO_SAMPLES]>,
+    render_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     stop: Arc<AtomicBool>,
+    peer_username: Option<String>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
-    let output = host.default_output_device().ok_or("no output")?;
+    let in_name = AUDIO_INPUT_DEVICE.read().map(|s| s.clone()).unwrap_or_default();
+    let out_name = AUDIO_OUTPUT_DEVICE.read().map(|s| s.clone()).unwrap_or_default();
+    let output = find_device(&host, &out_name, false).ok_or("no output")?;
     let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
     let out_rate = out_cfg.sample_rate();
     let out_ch = out_cfg.channels() as usize;
@@ -158,6 +290,7 @@ fn audio_thread(
         in_ch: usize,
         in_rate: u32,
         cap_tx: SyncSender<[i16; SAMPLES_PER_FRAME]>,
+        render_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     ) -> Result<cpal::Stream, String>
     where
         T: cpal::SizedSample,
@@ -166,6 +299,25 @@ fn audio_thread(
         use nnnoiseless::DenoiseState;
         let mut mono = Vec::<f32>::new();
         let mut at48 = Vec::<f32>::new();
+        // AEC: WebRTC AEC3 via the aec3 crate's linear pipeline. Processes 10 ms
+        // blocks (480 samples at 48 kHz mono). The render signal (speaker playout)
+        // is fed via render_rx; the AEC removes it from the captured mic signal.
+        // Gated by ECHO_CANCELLATION. The pipeline is !Send (uses Rc internally)
+        // but cpal's build_input_stream requires Send closures. The callback only
+        // ever runs on one thread (cpal guarantee), so we store it as a raw pointer
+        // in a Send wrapper and deref inside the callback.
+        let aec_format = aec3::nodes::audio::AudioFormat::ten_ms(48_000, 1);
+        let pipeline_box = Box::new(
+            aec3::pipelines::linear::builder(aec_format, aec_format)
+                .initial_delay_ms(116)
+                .build()
+                .ok()
+        );
+        let mut aec_ptr = AecSendPtr(Box::into_raw(pipeline_box));
+        let aec_samples = aec_format.sample_count(); // 480
+        let mut render_pending = Vec::<f32>::new();
+        let mut capture_pending = Vec::<f32>::new();
+        let mut aec_output = vec![0f32; aec_samples];
         // Noise suppression (gated by NOISE_SUPPRESSION): RNNoise runs on 10 ms blocks
         // (480 samples) in i16-range floats, exactly half an engine frame — no extra
         // buffering layer. When toggled off the samples pass through the same chunking
@@ -185,7 +337,42 @@ fn audio_thread(
                         mono.push(sum / in_ch as f32);
                     }
                     resample(&mono, in_rate, SAMPLE_RATE, &mut at48);
-                    dn_in.extend(at48.iter().map(|s| s.clamp(-1.0, 1.0) * 32767.0));
+                    // Drain render reference frames from the playout path.
+                    while let Ok(rframe) = render_rx.try_recv() {
+                        for &s in rframe.iter() {
+                            render_pending.push(s as f32 / 32768.0);
+                        }
+                    }
+                    // AEC: process in 10 ms (480-sample) blocks.
+                    capture_pending.extend(at48.iter().map(|s| s.clamp(-1.0, 1.0)));
+                    if ECHO_CANCELLATION.load(Ordering::Relaxed) {
+                        let aec_pipeline = unsafe { aec_ptr.get() };
+                        if let Some(ref mut pipeline) = aec_pipeline {
+                            while capture_pending.len() >= aec_samples && render_pending.len() >= aec_samples {
+                                // Feed render frame (far-end / speaker reference).
+                                let render_frame = render_pending[..aec_samples].to_vec();
+                                let _ = pipeline.handle_render_frame(&render_frame);
+                                // Process capture frame (near-end / mic).
+                                let capture_frame = capture_pending[..aec_samples].to_vec();
+                                if pipeline.process_capture_frame(&capture_frame, &mut aec_output).unwrap_or(false) {
+                                    dn_in.extend(aec_output.iter().map(|s| s * 32767.0));
+                                } else {
+                                    // AEC not ready yet — pass through.
+                                    dn_in.extend(capture_frame.iter().map(|s| s * 32767.0));
+                                }
+                                capture_pending.drain(..aec_samples);
+                                render_pending.drain(..aec_samples);
+                            }
+                        } else {
+                            // AEC pipeline failed to build — pass through.
+                            dn_in.extend(capture_pending.drain(..).map(|s| s * 32767.0));
+                            render_pending.clear();
+                        }
+                    } else {
+                        // AEC disabled — pass through, draining render to avoid backlog.
+                        dn_in.extend(capture_pending.drain(..).map(|s| s * 32767.0));
+                        render_pending.clear();
+                    }
                     while dn_in.len() >= DenoiseState::FRAME_SIZE {
                         if NOISE_SUPPRESSION.load(Ordering::Relaxed) {
                             denoise.process_frame(&mut dn_out, &dn_in[..DenoiseState::FRAME_SIZE]);
@@ -211,19 +398,19 @@ fn audio_thread(
             .map_err(|e| format!("capture: {e}"))
     }
     let in_stream = {
-        let input = host.default_input_device().ok_or("no microphone")?;
+        let input = find_device(&host, &in_name, true).ok_or("no microphone")?;
         let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
         let in_rate = in_cfg.sample_rate();
         let in_ch = in_cfg.channels() as usize;
         match in_cfg.sample_format() {
             cpal::SampleFormat::F32 => {
-                build_capture::<f32>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx)?
+                build_capture::<f32>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx, render_rx)?
             }
             cpal::SampleFormat::I16 => {
-                build_capture::<i16>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx)?
+                build_capture::<i16>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx, render_rx)?
             }
             cpal::SampleFormat::U16 => {
-                build_capture::<u16>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx)?
+                build_capture::<u16>(&input, in_cfg.clone().into(), in_ch, in_rate, cap_tx, render_rx)?
             }
             other => return Err(format!("unsupported capture format {other:?}")),
         }
@@ -238,11 +425,12 @@ fn audio_thread(
         out_rate: u32,
         play_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
         aux_rx: Receiver<[i16; SCREEN_AUDIO_SAMPLES]>,
+        peer_username: String,
     ) -> Result<cpal::Stream, String>
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
-        let mut queue = Vec::<f32>::new(); // mono at device rate, pending output
+        let mut queue = Vec::<f32>::new();
         let mut frame48 = Vec::<f32>::new();
         let mut updev = Vec::<f32>::new();
         device
@@ -251,18 +439,28 @@ fn audio_thread(
                 move |data: &mut [T], _| {
                     let needed = data.len() / out_ch;
                     while queue.len() < needed {
-                        // One 20 ms step: voice and/or screen audio, summed at 48 kHz
-                        // (stereo aux downmixed — the voice path is mono end-to-end).
                         let voice = play_rx.try_recv().ok();
                         let aux = aux_rx.try_recv().ok();
                         if voice.is_none() && aux.is_none() {
-                            break; // underrun → pad with silence below
+                            break;
                         }
+                        // Per-peer volume gain for 1:1 calls (1.0 = unity).
+                        let gain = PEER_VOLUME
+                            .read()
+                            .ok()
+                            .and_then(|m| m.get(&peer_username).copied())
+                            .unwrap_or(1.0);
+                        // Per-peer screen-audio volume gain (1.0 = unity).
+                        let screen_gain = SCREEN_VOLUME
+                            .read()
+                            .ok()
+                            .and_then(|m| m.get(&peer_username).copied())
+                            .unwrap_or(1.0);
                         frame48.clear();
                         for i in 0..SAMPLES_PER_FRAME {
-                            let v = voice.map_or(0.0, |f| f[i] as f32 / 32768.0);
+                            let v = voice.map_or(0.0, |f| (f[i] as f32 / 32768.0) * gain);
                             let a = aux.map_or(0.0, |f| {
-                                (f[2 * i] as f32 + f[2 * i + 1] as f32) / 2.0 / 32768.0
+                                ((f[2 * i] as f32 + f[2 * i + 1] as f32) / 2.0 / 32768.0) * screen_gain
                             });
                             frame48.push((v + a).clamp(-1.0, 1.0));
                         }
@@ -291,6 +489,7 @@ fn audio_thread(
             out_rate,
             play_rx,
             aux_rx,
+            peer_username.clone().unwrap_or_default(),
         )?,
         cpal::SampleFormat::I16 => build_playout::<i16>(
             &output,
@@ -299,6 +498,7 @@ fn audio_thread(
             out_rate,
             play_rx,
             aux_rx,
+            peer_username.clone().unwrap_or_default(),
         )?,
         cpal::SampleFormat::U16 => build_playout::<u16>(
             &output,
@@ -307,6 +507,7 @@ fn audio_thread(
             out_rate,
             play_rx,
             aux_rx,
+            peer_username.clone().unwrap_or_default(),
         )?,
         other => return Err(format!("unsupported playout format {other:?}")),
     };
@@ -340,7 +541,9 @@ fn audio_thread(
     cap_tx: SyncSender<[i16; SAMPLES_PER_FRAME]>,
     play_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     aux_rx: Receiver<[i16; SCREEN_AUDIO_SAMPLES]>,
+    _render_rx: Receiver<[i16; SAMPLES_PER_FRAME]>,
     stop: Arc<AtomicBool>,
+    _peer_username: Option<String>,
 ) -> Result<(), String> {
     let session = VOICE_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::android_media::set_voice_capture(true);

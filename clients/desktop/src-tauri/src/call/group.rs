@@ -139,6 +139,7 @@ pub(crate) async fn establish_group_leg(
         Ok(media) => {
             let _ = leg_tx.send(client_core::groupcall::GroupLeg {
                 peer_key,
+                username,
                 media,
                 key_b64,
                 caller,
@@ -222,7 +223,7 @@ pub(crate) async fn spawn_group_call(
     #[cfg(target_os = "android")]
     android_media::ensure_mic_permission();
     let (audio, _aux_tx) = eng()
-        .spawn_blocking(audio::start)
+        .spawn_blocking(|| audio::start(None))
         .await
         .map_err(|e| e.to_string())??;
 

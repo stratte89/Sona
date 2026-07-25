@@ -19,6 +19,12 @@ $('#ch-new').onclick = () => {
 
 const isMuted = (c) => c.muted_until && c.muted_until > Math.floor(Date.now() / 1000);
 
+const BASE_TITLE = 'Sona';
+function updateTitleBadge(convs) {
+  const total = convs.reduce((n, c) => n + (c.unread || 0), 0);
+  document.title = total > 0 ? `(${total > 99 ? '99+' : total}) ${BASE_TITLE}` : BASE_TITLE;
+}
+
 // ── Incoming typing indicators (B): each entry expires ~6s after the last refresh.
 // Value carries WHO types (groups have many senders); 1:1 leaves `name` unset.
 const typingState = new Map(); // conversation id (peer key or group id) -> { exp, name }
@@ -179,6 +185,7 @@ async function loadChats() {
   }
   reconcileThread(list, items);
   scheduleGlobalHits(q); // content hits render below the name matches
+  updateTitleBadge(convs);
 }
 let lastConvs = [];
 $('#ch-search').addEventListener('input', loadChats);

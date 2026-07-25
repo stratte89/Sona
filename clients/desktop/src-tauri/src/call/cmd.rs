@@ -323,32 +323,45 @@ pub async fn call_set_camera(state: tauri::State<'_, AppState>, on: bool) -> Res
     Ok(())
 }
 
-/// Start/stop the screen-share track (primary monitor).
+/// Start/stop the screen-share track. `source` selects which monitor or window to
+/// share: "monitor:0", "window:5", or None for primary monitor.
 #[tauri::command]
-pub async fn call_set_screen(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+pub async fn call_set_screen(
+    state: tauri::State<'_, AppState>,
+    on: bool,
+    source: Option<String>,
+) -> Result<(), String> {
     let s = state.inner.lock().await;
     let call = s.call.as_ref().ok_or("no active call")?;
     call.toggles
         .screen_on
         .store(on, std::sync::atomic::Ordering::Relaxed);
-    // The UI applies its share-system-audio preference via `call_set_screen_audio`
-    // right after enabling the share; here only the stop side is owned — sharing
-    // system audio without a screen share is not a thing.
-    if !on {
+    if on {
+        if let Some(src_str) = source {
+            let src = media_shell::parse_source(&src_str);
+            if let Ok(mut ss) = call.screen_source.lock() {
+                *ss = src;
+            }
+        }
+    } else {
         call.toggles
             .screen_audio_on
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(target_os = "android")]
     {
-        // Reset the bridge's audio intent with the projection so a stale "wanted"
-        // can't attach AudioPlaybackCapture to the next share uninvited.
         if !on {
             android_media::set_screen_audio_capture(false);
         }
         android_media::set_screen_capture(on);
     }
     Ok(())
+}
+
+/// List available monitors and windows for the screen-share source picker.
+#[tauri::command]
+pub fn call_list_screens() -> serde_json::Value {
+    media_shell::list_sources()
 }
 
 /// Toggle system-audio alongside an active screen share. No-ops (returns an error the
@@ -368,6 +381,39 @@ pub async fn call_set_screen_audio(
         .store(on, std::sync::atomic::Ordering::Relaxed);
     #[cfg(target_os = "android")]
     android_media::set_screen_audio_capture(on);
+    Ok(())
+}
+
+/// List available audio input and output devices for the settings UI.
+#[tauri::command]
+pub fn call_list_audio_devices() -> serde_json::Value {
+    audio::list_audio_devices()
+}
+
+/// Set preferred audio input and output devices (empty string = system default).
+/// Applied on the next call start; does not affect an active call.
+#[tauri::command]
+pub fn call_set_audio_devices(input: String, output: String) -> Result<(), String> {
+    audio::set_audio_devices(&input, &output);
+    Ok(())
+}
+
+/// Set per-peer volume gain (0.0 = mute, 1.0 = unity, 2.0 = 2× loud).
+/// Works for both 1:1 and group calls. Applied live — no call restart needed.
+#[tauri::command]
+pub fn call_set_peer_volume(peer: String, gain: f32) -> Result<(), String> {
+    audio::set_peer_volume(&peer, gain);
+    if let Ok(mut w) = client_core::groupcall::PEER_VOLUMES.write() {
+        w.insert(peer, gain);
+    }
+    Ok(())
+}
+
+/// Set per-peer screen-audio volume gain (0.0 = mute, 1.0 = unity, 2.0 = 2× loud).
+/// Only affects the screenshare audio stream, not the voice stream. Applied live.
+#[tauri::command]
+pub fn call_set_screen_volume(peer: String, gain: f32) -> Result<(), String> {
+    audio::set_screen_volume(&peer, gain);
     Ok(())
 }
 

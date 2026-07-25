@@ -217,6 +217,98 @@ enum CaptureKind {
     Screen,
 }
 
+/// Which screen source to capture: a specific monitor, a specific window, or the
+/// primary monitor as fallback. Set by `call_set_screen` and read by the capture
+/// thread at startup; changing it stops the old thread (via `running` flag) so the
+/// next poll restarts capture with the new source.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum CaptureSource {
+    #[default]
+    PrimaryMonitor,
+    Monitor(usize),
+    Window(usize),
+}
+
+/// Parse a source string like "monitor:1" or "window:5" into a CaptureSource.
+/// `None` or unrecognized → PrimaryMonitor.
+pub fn parse_source(s: &str) -> CaptureSource {
+    let (kind, idx) = s.split_once(':').unwrap_or(("", "0"));
+    let idx: usize = idx.parse().unwrap_or(0);
+    match kind {
+        "monitor" => CaptureSource::Monitor(idx),
+        "window" => CaptureSource::Window(idx),
+        _ => CaptureSource::PrimaryMonitor,
+    }
+}
+
+/// List available monitors and windows for the source picker UI.
+/// Returns JSON-serializable info; filters out tiny/system windows.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn list_sources() -> serde_json::Value {
+    use serde_json::json;
+    let monitors: Vec<serde_json::Value> = xcap::Monitor::all()
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    json!({
+                        "id": format!("monitor:{}", m.id().unwrap_or(0)),
+                        "name": m.name().unwrap_or_default().to_string(),
+                        "width": m.width().unwrap_or(0),
+                        "height": m.height().unwrap_or(0),
+                        "is_primary": m.is_primary().unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let windows: Vec<serde_json::Value> = xcap::Window::all()
+        .map(|ws| {
+            ws.iter()
+                .filter(|w| {
+                    let w_h = w.width().unwrap_or(0) * w.height().unwrap_or(0);
+                    w_h > 100 * 100 && !w.is_minimized().unwrap_or(true)
+                })
+                .map(|w| {
+                    json!({
+                        "id": format!("window:{}", w.id().unwrap_or(0)),
+                        "title": w.title().unwrap_or_default().to_string(),
+                        "width": w.width().unwrap_or(0),
+                        "height": w.height().unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "monitors": monitors, "windows": windows })
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_sources() -> serde_json::Value {
+    use serde_json::json;
+    let monitors: Vec<serde_json::Value> = (|| {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::randr::ConnectionExt as _;
+        let (conn, screen_num) = x11rb::connect(None).ok()?;
+        let screen = &conn.setup().roots[screen_num];
+        let mons = conn.randr_get_monitors(screen.root, true).ok()?.reply().ok()?;
+        Some(mons.monitors.iter().enumerate().map(|(i, m)| {
+            json!({
+                "id": format!("monitor:{}", i),
+                "name": format!("Display {}", i + 1),
+                "width": m.width,
+                "height": m.height,
+                "is_primary": m.primary != 0,
+            })
+        }).collect())
+    })().unwrap_or_default();
+    json!({ "monitors": monitors, "windows": [] })
+}
+
+#[cfg(target_os = "android")]
+pub fn list_sources() -> serde_json::Value {
+    serde_json::json!({ "monitors": [], "windows": [] })
+}
+
 /// A [`VideoSource`] backed by a lazily-spawned platform capture thread (desktop) or
 /// the Kotlin JNI bridge (Android, where the bridge fills the slot instead). Every
 /// frame handed to the engine is also mirrored (throttled + shrunk) to the UI channel
@@ -226,6 +318,9 @@ pub struct SlotSource {
     kind: CaptureKind,
     ui: UiChannel,
     last_preview: Instant,
+    /// Screen capture source selector — shared with the command handler so
+    /// `call_set_screen` can change it and the capture thread picks it up.
+    screen_source: Arc<Mutex<CaptureSource>>,
 }
 
 impl SlotSource {
@@ -235,14 +330,16 @@ impl SlotSource {
             kind: CaptureKind::Camera,
             ui,
             last_preview: Instant::now() - PREVIEW_INTERVAL,
+            screen_source: Arc::new(Mutex::new(CaptureSource::PrimaryMonitor)),
         }
     }
-    pub fn screen(ui: UiChannel) -> SlotSource {
+    pub fn screen(ui: UiChannel, source: Arc<Mutex<CaptureSource>>) -> SlotSource {
         SlotSource {
             shared: SlotShared::new(),
             kind: CaptureKind::Screen,
             ui,
             last_preview: Instant::now() - PREVIEW_INTERVAL,
+            screen_source: source,
         }
     }
 
@@ -278,12 +375,18 @@ impl VideoSource for SlotSource {
         if !self.shared.running.swap(true, Ordering::Relaxed) {
             let shared = self.shared.clone();
             let kind = self.kind;
+            let source = self.screen_source.clone();
             std::thread::Builder::new()
                 .name("sona-media-capture".into())
                 .spawn(move || {
                     let r = match kind {
                         CaptureKind::Camera => capture_camera(&shared),
-                        CaptureKind::Screen => capture_screen(&shared),
+                        CaptureKind::Screen => {
+                            let src = source.lock()
+                                .map(|s| *s)
+                                .unwrap_or(CaptureSource::PrimaryMonitor);
+                            capture_screen(&shared, src)
+                        }
                     };
                     if let Err(e) = r {
                         eprintln!("[media] capture ended: {e}");
@@ -344,15 +447,16 @@ fn capture_camera(shared: &SlotShared) -> Result<(), String> {
 
 // ── Screen capture ──────────────────────────────────────────────────────────────────
 
-/// Screen share frame rate. Text/UI content doesn't need more; keeps X11 `GetImage`
-/// cost and encode bitrate down.
+/// Screen share frame rate. With hardware encoding (NVENC/VCN/QuickSync) the GPU
+/// handles 60 fps at <5% usage; without it the software fallback (OpenH264) runs at
+/// a conservative 20 fps to avoid saturating the CPU.
 #[cfg(not(target_os = "android"))]
-const SCREEN_FPS_INTERVAL: Duration = Duration::from_millis(100);
+const SCREEN_FPS_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 
-/// Linux/X11: grab the primary monitor via pure-Rust XCB. No system deps beyond the X
+/// Linux/X11: grab the specified monitor via pure-Rust XCB. No system deps beyond the X
 /// server itself. (Wayland sessions need the PipeWire portal — not wired yet.)
 #[cfg(target_os = "linux")]
-fn capture_screen(shared: &SlotShared) -> Result<(), String> {
+fn capture_screen(shared: &SlotShared, source: CaptureSource) -> Result<(), String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::randr::ConnectionExt as _;
     use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
@@ -364,12 +468,18 @@ fn capture_screen(shared: &SlotShared) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .reply()
         .map_err(|e| format!("randr: {e}"))?;
-    let mon = monitors
-        .monitors
-        .iter()
-        .find(|m| m.primary)
-        .or_else(|| monitors.monitors.first())
-        .ok_or("no monitor")?;
+    let mon = match source {
+        CaptureSource::Monitor(idx) => monitors
+            .monitors
+            .get(idx)
+            .ok_or("monitor index out of range")?,
+        _ => monitors
+            .monitors
+            .iter()
+            .find(|m| m.primary)
+            .or_else(|| monitors.monitors.first())
+            .ok_or("no monitor")?,
+    };
     let (mx, my, mw, mh) = (mon.x, mon.y, mon.width, mon.height);
 
     while shared.wanted() {
@@ -390,17 +500,48 @@ fn capture_screen(shared: &SlotShared) -> Result<(), String> {
 }
 
 /// Windows/macOS: `xcap` (Windows Graphics Capture / CoreGraphics).
+/// Supports monitor selection and window capture (game windows in borderless
+/// fullscreen are visible via Windows Graphics Capture's swap-chain capture).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn capture_screen(shared: &SlotShared) -> Result<(), String> {
-    let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
-    let mon = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .or_else(|| monitors.first())
-        .ok_or("no monitor")?;
+fn capture_screen(shared: &SlotShared, source: CaptureSource) -> Result<(), String> {
+    match source {
+        CaptureSource::PrimaryMonitor => {
+            let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
+            let mon = monitors
+                .iter()
+                .find(|m| m.is_primary().unwrap_or(false))
+                .or_else(|| monitors.first())
+                .ok_or("no monitor")?;
+            capture_xcap_monitor(shared, mon)
+        }
+        CaptureSource::Monitor(idx) => {
+            let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
+            let mon = monitors.get(idx).ok_or("monitor index out of range")?;
+            capture_xcap_monitor(shared, mon)
+        }
+        CaptureSource::Window(idx) => {
+            let windows = xcap::Window::all().map_err(|e| e.to_string())?;
+            let win = windows.get(idx).ok_or("window index out of range")?;
+            while shared.wanted() {
+                let t = Instant::now();
+                let img = win.capture_image().map_err(|e| e.to_string())?;
+                let (w, h) = (img.width() as usize, img.height() as usize);
+                let d = decim_for(w, 1920);
+                if let Some(f) = packed_to_i420(img.as_raw(), w, h, 4, (0, 1, 2), d) {
+                    shared.publish(f);
+                }
+                std::thread::sleep(SCREEN_FPS_INTERVAL.saturating_sub(t.elapsed()));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn capture_xcap_monitor(shared: &SlotShared, mon: &xcap::Monitor) -> Result<(), String> {
     while shared.wanted() {
         let t = Instant::now();
-        let img = mon.capture_image().map_err(|e| e.to_string())?; // RGBA
+        let img = mon.capture_image().map_err(|e| e.to_string())?;
         let (w, h) = (img.width() as usize, img.height() as usize);
         let d = decim_for(w, 1920);
         if let Some(f) = packed_to_i420(img.as_raw(), w, h, 4, (0, 1, 2), d) {

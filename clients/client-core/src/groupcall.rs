@@ -36,6 +36,11 @@ use crate::call::{
 };
 use crate::{ClientError, Result};
 
+/// Per-peer volume gains for group calls: username → gain multiplier (0.0–2.0, 1.0 = unity).
+/// Written by the shell's `call_set_peer_volume` command; read by the mixing loop every tick.
+pub static PEER_VOLUMES: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, f32>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
 /// Max buffered playout frames per leg (60 ms): enough to ride out scheduling jitter,
 /// small enough that a slow leg can't build audible lag before frames are dropped.
 const JITTER_FRAMES: usize = 3;
@@ -46,6 +51,8 @@ const JITTER_FRAMES: usize = 3;
 pub struct GroupLeg {
     /// The peer's ratchet-authenticated identity key (who this leg reaches).
     pub peer_key: String,
+    /// The peer's username (for per-peer volume gain lookup).
+    pub username: String,
     pub media: CallMedia,
     pub key_b64: String,
     pub caller: bool,
@@ -66,6 +73,7 @@ pub enum GroupCallEvent {
 /// what the tick loop needs.
 struct LegState {
     peer_key: String,
+    username: String,
     keys: CallKeys,
     decoder: codec::Decoder,
     /// Sealed-frame writer toward the pump task (unbounded: a stalled socket must never
@@ -153,6 +161,7 @@ pub async fn run_group_call(
                     spawn_leg_pump(leg.media, id, in_tx.clone(), out_rx);
                     legs.insert(id, LegState {
                         peer_key: leg.peer_key,
+                        username: leg.username,
                         keys,
                         decoder,
                         out_tx,
@@ -210,13 +219,18 @@ pub async fn run_group_call(
                     }
                 }
                 // ── Mix one playout frame per leg with buffered audio. ──
+                let vol_snapshot = PEER_VOLUMES.read().ok();
                 let mut mix = [0i32; SAMPLES_PER_FRAME];
                 let mut any = false;
                 for leg in legs.values_mut() {
                     if let Some(frame) = leg.playout.pop_front() {
                         any = true;
+                        let gain = vol_snapshot
+                            .as_ref()
+                            .and_then(|m| m.get(&leg.username).copied())
+                            .unwrap_or(1.0);
                         for (m, s) in mix.iter_mut().zip(frame.iter()) {
-                            *m += *s as i32;
+                            *m += (*s as f32 * gain).clamp(-32768.0, 32767.0) as i32;
                         }
                     }
                 }

@@ -73,6 +73,18 @@ keyring = { version = "3", default-features = false, features = ["sync-secret-se
 jni = "0.21"
 ndk-context = "0.1"
 
+# Hardware video encode/decode on Windows: Media Foundation MFT discovers
+# NVENC (NVIDIA), VCN (AMD), and QuickSync (Intel) via a single API.
+# MIT/Apache-2.0 licensed; no external SDKs or vendor-specific libraries.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 # Run the real relay in-process for end-to-end tests. Test-only — never shipped to a client.
 server = { path = "../../crates/server" }

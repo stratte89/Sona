@@ -480,10 +480,54 @@ mod desktop {
         }
     }
 
+    /// Flash the Windows taskbar button orange (like Discord/Telegram) when a
+    /// message arrives while the window is unfocused or minimized. Uses
+    /// `FlashWindowEx` with `FLASHW_TIMERNOFG` so the highlight persists until
+    /// the user actually focuses the window — exactly the UX users expect.
+    #[cfg(target_os = "windows")]
+    fn flash_taskbar() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
+        };
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Some(app) = crate::engine::global().ui_handle() else {
+            return;
+        };
+        use tauri::Manager as _;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = h.hwnd.get() as *mut _;
+        let fi = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        unsafe {
+            let _ = FlashWindowEx(&fi);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn flash_taskbar() {}
+
     /// Desktop keeps the plugin's fire-and-forget model: post the newest line only.
     pub fn show_message(_chat_key: &str, lines: &[NotifLine]) {
         if let Some(last) = lines.last() {
             plugin_show(&last.title, &last.body);
+            // Flash the taskbar button when the window is not focused (Discord-style).
+            if !crate::engine::global().is_focused() {
+                flash_taskbar();
+            }
         }
     }
 

@@ -51,6 +51,10 @@ tauri-plugin-single-instance = "2"
 # Noise suppression for call capture (pure-Rust RNNoise). Android instead uses the
 # platform NoiseSuppressor attached to its VOICE_COMMUNICATION capture (audio.rs).
 nnnoiseless = { version = "0.5", default-features = false }
+# Acoustic echo cancellation (WebRTC AEC3) for desktop. Removes speaker feedback
+# from the mic signal when the user is on speakers (not a headset). Android uses
+# the platform AEC via VOICE_COMMUNICATION AudioRecord instead.
+aec3 = "0.3"
 
 # Screen share, Windows/macOS: Windows Graphics Capture / CoreGraphics.
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
@@ -89,4 +93,6 @@ notify-rust = "4.18"
 webview2-com = "0.38"
 # Toast notifications need this process to DECLARE its AppUserModelID (see lib.rs).
 # Version already in the dependency graph, so this pulls nothing new.
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Raw window handle for getting the HWND to flash the taskbar button.
+raw-window-handle = "0.6"
