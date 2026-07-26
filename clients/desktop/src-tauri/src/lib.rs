@@ -34,6 +34,11 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tokio::sync::Mutex;
 
+// Screen-share echo suppression. Not built for Android: its system-audio capture
+// (AudioPlaybackCapture) can never pick up the call's own VOICE_COMMUNICATION playout,
+// so there is no echo to remove there.
+#[cfg(not(target_os = "android"))]
+mod aec;
 #[cfg(target_os = "android")]
 mod android_media;
 mod attr_heal;
@@ -44,6 +49,10 @@ mod cmd;
 mod delivery_service;
 pub(crate) mod engine;
 mod hw_attest;
+// Hardware H.264 encoding, desktop only: Android already encodes on the device's media
+// block, through MediaCodec inside the Kotlin bridge.
+#[cfg(not(target_os = "android"))]
+mod hwenc;
 #[cfg(target_os = "android")]
 mod jni_entry;
 mod media_shell;
@@ -622,6 +631,9 @@ pub fn run() {
             call::cmd::call_set_route,
             call::cmd::call_tone,
             call::cmd::call_set_noise_suppression,
+            call::cmd::call_media_devices,
+            call::cmd::call_set_media_device,
+            call::cmd::screen_sources,
             cmd::files::gif_available,
             cmd::files::gif_search,
             cmd::files::gif_trending,

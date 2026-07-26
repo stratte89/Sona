@@ -339,6 +339,32 @@ Screen audio is Opus stereo 64 kb/s CBR at the same 20 ms cadence as voice. Cont
 cells carry `track_on` / `track_off` / `keyframe_req` (a decoder that lost sync asks
 the sender to force an IDR, rate-limited to 1/s/track).
 
+**Hardware encoding (desktop, optional, invisible on the wire).** A full-resolution
+software encode can cost more per frame than the frame interval it is aiming for, and
+the casualty is not the video — it is the 20 ms voice tick, which then has to fight the
+encoder for a core. Where the machine has a GPU encoder the shell supplies one:
+**Media Foundation** on Windows (one path for NVIDIA/AMD/Intel — `MFTEnumEx` returns
+whatever the driver registered) and **NVENC** on Linux/NVIDIA. Both are loaded at
+runtime and never linked, so a machine without them starts and runs exactly as before.
+
+Three properties keep this from being a risk:
+* *It changes nothing above the encoder.* The trait hands back an Annex-B access unit
+  and everything downstream — sealing, cells, padding, the wire — is byte-identical to
+  the software path. A peer cannot tell which encoded a frame, and old clients need no
+  changes.
+* *It has to prove itself.* Before a call depends on it, a backend encodes a synthetic
+  frame and must hand back something **our own decoder** accepts as a keyframe of the
+  right size. One failure and hardware encode is off for the life of the process.
+  The fallback is not a degraded mode — it is the software encoder that was always there.
+* *It never sees a key.* Encoding happens **before** sealing: the encoder turns pixels
+  into an access unit and the media layer seals that with the per-call, per-track key.
+  No key, no plaintext frame and no ciphertext ever reaches a driver.
+
+Transient failures are separated from permanent ones: NVENC caps concurrent sessions per
+driver and other applications spend from the same budget, so one track failing to get a
+session falls back for that track alone and leaves a track that is encoding happily
+untouched.
+
 **Relay changes.** The per-frame cap rises to the largest v2 cell (16 409 bytes +
 headers) and each member gets a token-bucket byte budget (1 MiB/s sustained, 4 MiB
 burst) so the blind relay cannot be repurposed as a bulk pipe. The relay still stores

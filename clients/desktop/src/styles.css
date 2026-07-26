@@ -772,32 +772,60 @@ textarea { line-height: 1.4; }
 .vc-dur { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
 .bubble.out .vc-dur { color: rgba(255, 255, 255, .75); }
 
-/* ── Voice calls ────────────────────────────────────────────────── */
+/* ── Voice calls ─────────────────────────────────────────────────────────────────
+   Three stacked regions: the top bar (collapse + gear, and on a phone the identity),
+   the stage (peer video, or the avatar when there is none), and the control bar. The
+   bar is a floating pill on a desktop window — identity left, media toggles centre,
+   End right — and a plain row of round buttons on a phone. */
 .callui {
   position: fixed; inset: 0; z-index: 60;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(4, 6, 8, .88);
+  display: flex; flex-direction: column;
+  background: rgba(4, 6, 8, .94);
   backdrop-filter: blur(6px);
 }
-.call-card {
-  display: flex; flex-direction: column; align-items: center; gap: 14px;
-  padding: 34px 30px;
-  min-width: 260px;
+.call-top {
+  display: flex; align-items: center; gap: 12px; flex: none;
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 4px;
 }
-.call-avatar {
-  width: 84px; height: 84px; font-size: 34px;
+.call-icon {
+  flex: none; width: 42px; height: 42px; border: none; border-radius: 50%;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--panel-2); color: var(--muted);
 }
+.call-icon svg { width: 20px; height: 20px; }
+.call-topid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.call-topname {
+  font-size: 19px; font-weight: 700;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.call-topstate {
+  font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums;
+  display: flex; align-items: center; gap: 6px; min-height: 18px;
+}
+.call-stage {
+  position: relative; flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center; padding: 10px 16px;
+}
+.call-idle { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.call-avatar { width: 108px; height: 108px; font-size: 42px; }
 .callui.ringing .call-avatar { animation: callpulse 1.6s ease-in-out infinite; }
 @keyframes callpulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, .35); }
   50% { box-shadow: 0 0 0 18px rgba(16, 185, 129, 0); }
 }
-.call-name { font-size: 22px; font-weight: 700; }
-.call-state {
-  color: var(--muted); font-variant-numeric: tabular-nums; min-height: 20px;
-  display: flex; align-items: center; gap: 7px;
+.call-hint { color: var(--faint); font-size: 12px; margin: 0; text-align: center; }
+.call-bar { flex: none; display: flex; align-items: center; }
+.call-barid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.call-barname {
+  font-size: 15px; font-weight: 700;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.call-actions { display: flex; gap: 22px; margin-top: 10px; }
+.call-barstate {
+  font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums;
+  display: flex; align-items: center; gap: 6px; min-height: 18px;
+}
+.call-actions { display: flex; align-items: center; gap: 14px; }
+.call-end { display: flex; align-items: center; gap: 14px; }
 .call-btn {
   width: 56px; height: 56px; border: none; border-radius: 50%; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
@@ -807,18 +835,44 @@ textarea { line-height: 1.4; }
 .call-btn.ok { background: var(--brand); color: #06281c; }
 .call-btn.danger { background: var(--danger); color: #2b0707; }
 .call-btn.on { background: var(--brand-dim); }
-.call-hint { color: var(--faint); font-size: 12px; margin: 6px 0 0; text-align: center; }
 
-/* ── Call settings (gear top-right → small modal) ───────────────── */
-.call-gear {
-  position: absolute; z-index: 3;
-  top: calc(env(safe-area-inset-top, 0px) + 14px);
-  right: calc(env(safe-area-inset-right, 0px) + 14px);
-  width: 42px; height: 42px; border: none; border-radius: 50%; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--panel-2); color: var(--muted);
+/* Phone: identity in the top bar, controls as one centred row of circles. */
+@media (max-width: 700px) {
+  .call-barid { display: none; }
+  .call-bar {
+    justify-content: center; gap: 12px;
+    padding: 12px 12px calc(20px + env(safe-area-inset-bottom, 0px));
+  }
+  .call-actions { gap: 12px; }
+  .call-btn { width: 54px; height: 54px; }
 }
-.call-gear svg { width: 20px; height: 20px; }
+
+/* Desktop: the bar floats over the stage as a pill, and hang-up is a labelled
+   button — a lone red circle in a wide bar reads as an afterthought. */
+@media (min-width: 701px) {
+  /* Identity moves into the pill, so the top bar keeps only the two controls —
+     settings then minimise, in the corner, as on Signal desktop. */
+  .call-top { justify-content: flex-end; }
+  .call-top .call-topid { display: none; }
+  #call-collapse { order: 2; }
+  .call-stage { padding-bottom: 118px; }
+  .call-bar {
+    position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    width: min(660px, calc(100vw - 48px));
+    gap: 20px; padding: 12px 16px;
+    background: var(--panel-2); border: 1px solid var(--line-2);
+    border-radius: 20px; box-shadow: var(--shadow);
+  }
+  .call-btn { width: 48px; height: 48px; }
+  .call-btn svg { width: 22px; height: 22px; }
+  #call-hangup, #call-accept { width: auto; min-width: 84px; border-radius: 999px; }
+  #call-hangup svg, #call-accept svg { display: none; }
+  #call-hangup::after { content: "End"; font-size: 14px; font-weight: 700; }
+  #call-accept::after { content: "Answer"; font-size: 14px; font-weight: 700; }
+  /* Turning down a call that is still ringing is a decline, not an end. */
+  .callui.incoming #call-hangup::after { content: "Decline"; }
+}
 /* "cset-" prefix — "cs-" belongs to the chat-settings screen; sharing it broke that
    layout (absolute-positioned .cs-card leaked into the page cards). */
 .call-settings { position: absolute; inset: 0; z-index: 4; } /* backdrop: tap outside closes */
@@ -849,18 +903,120 @@ textarea { line-height: 1.4; }
 .cset-row.on .cset-switch { background: var(--brand-dim); }
 .cset-row.on .cset-switch::after { transform: translateX(18px); background: var(--brand-2); }
 .cset-hint { color: var(--faint); font-size: 12px; margin: 4px 0 0; }
+/* Device dropdowns — the same pair appears in Settings as .devfield. */
+.cset-devices { padding-bottom: 4px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+.cset-field { display: block; margin-bottom: 8px; }
+.cset-field > span, .devfield > span { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
+.cset-field select, .devfield select {
+  width: 100%; padding: 8px 10px; border-radius: var(--r-sm);
+  background: var(--panel-2); border: 1px solid var(--line-2); color: var(--text);
+  font-size: 13.5px; font-family: inherit; cursor: pointer;
+  /* Long device names must not stretch the card. */
+  max-width: 100%; text-overflow: ellipsis;
+}
+.cset-field select:disabled, .devfield select:disabled { opacity: .5; cursor: not-allowed; }
+.devfield { display: block; padding: 11px 14px; }
+.devfield + .devfield { border-top: 1px solid var(--line); }
+
+/* ── Share picker (which screen / which window) ─────────────────── */
+/* Above .callui (60) and the on-call modal (65): it is opened from the call bar. */
+.sharepick {
+  position: fixed; inset: 0; z-index: 66; display: flex; align-items: center; justify-content: center;
+  background: rgba(2,4,5,.72); backdrop-filter: blur(4px); animation: drop .15s ease;
+}
+.sp-card:focus { outline: none; }
+.sp-card {
+  position: relative; display: flex; flex-direction: column;
+  width: min(760px, 94vw); max-height: min(620px, 88vh);
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: 16px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.sp-head { display: flex; align-items: center; padding: 16px 18px 10px; }
+.sp-head h3 { margin: 0; font-size: 16px; }
+.sp-tabs { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--line); }
+.sp-tab {
+  padding: 9px 14px 10px; border: none; background: none; cursor: pointer;
+  color: var(--muted); font-size: 13.5px; font-family: inherit;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.sp-tab:hover { color: var(--text); }
+.sp-tab.on { color: var(--brand-2); border-bottom-color: var(--brand-2); }
+.sp-body { flex: 1; overflow-y: auto; padding: 14px 18px; min-height: 180px; }
+.sp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 12px; }
+.sp-item {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+  color: var(--text); font-family: inherit; text-align: left; cursor: pointer;
+  /* No transform on hover: these are live screenshots, and nudging them reads as jitter. */
+  transition: border-color .12s, background .12s;
+}
+.sp-item:hover { border-color: var(--line-2); }
+/* Selected: brand border, a tint, and a tick over the preview. Three signals, because
+   one thumbnail among a dozen thumbnails is exactly where a lone border gets missed. */
+.sp-item.sel { border-color: var(--brand-2); background: rgba(16,185,129,.10); }
+.sp-item.sel .sp-name { color: var(--brand-2); }
+.sp-thumb {
+  position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden;
+  background: #05080a; display: grid; place-items: center;
+}
+.sp-thumb img { width: 100%; height: 100%; object-fit: contain; }
+.sp-tick {
+  position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--brand-2); box-shadow: 0 2px 8px rgba(0,0,0,.45);
+  opacity: 0; transform: scale(.7); transition: opacity .12s, transform .12s;
+}
+.sp-tick::after {
+  content: ""; position: absolute; left: 7.5px; top: 5px; width: 5px; height: 10px;
+  border: solid #04150e; border-width: 0 2.4px 2.4px 0; transform: rotate(45deg);
+}
+.sp-item.sel .sp-tick { opacity: 1; transform: scale(1); }
+.sp-thumb .sp-noimg { color: var(--faint); font-size: 12px; }
+.sp-name {
+  font-size: 13px; font-weight: 600; line-height: 1.25;
+  /* Window titles are arbitrary length; one line, ellipsised. */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sp-detail { font-size: 11.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-empty { margin: 28px 0; text-align: center; color: var(--faint); font-size: 13.5px; }
+.sp-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 18px; border-top: 1px solid var(--line); background: var(--bg-2);
+}
+.sp-foot .btn { margin-top: 0; }
+.sp-check {
+  display: inline-flex; align-items: center; gap: 9px; padding: 4px 2px;
+  border: none; background: none; cursor: pointer; color: var(--muted);
+  font-size: 13.5px; font-family: inherit;
+}
+.sp-check:hover { color: var(--text); }
+.sp-box {
+  flex: none; width: 19px; height: 19px; border-radius: 6px;
+  border: 1.5px solid var(--line-2); background: var(--panel-2);
+  position: relative; transition: background .12s, border-color .12s;
+}
+.sp-box::after {
+  content: ""; position: absolute; left: 5.5px; top: 2px; width: 5px; height: 9.5px;
+  border: solid #04150e; border-width: 0 2.2px 2.2px 0; transform: rotate(45deg) scale(0);
+  transition: transform .12s;
+}
+.sp-check.on { color: var(--text); }
+.sp-check.on .sp-box { background: var(--brand-2); border-color: var(--brand-2); }
+.sp-check.on .sp-box::after { transform: rotate(45deg) scale(1); }
+@media (max-width: 640px) {
+  .sp-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .sp-body { padding: 12px 14px; }
+  .sp-head, .sp-tabs, .sp-foot { padding-left: 14px; padding-right: 14px; }
+}
 
 /* ── Video calls / screen share ─────────────────────────────────── */
-/* With live video the card grows into a stage: tiles on top, controls below. */
-.callui.has-video .call-card { width: min(96vw, 1200px); max-height: 96vh; }
-.callui.has-video .call-avatar { display: none; }
-.callui.has-video .call-name { font-size: 16px; }
+/* With live video the tiles take the whole stage and the avatar steps aside. */
+.callui.has-video .call-idle { display: none; }
 .call-video {
   display: flex; gap: 10px; align-items: center; justify-content: center;
-  width: 100%; min-height: 0; flex: 1;
+  width: 100%; height: 100%; min-height: 0;
 }
 .cv-tile {
-  max-width: 100%; max-height: 72vh;
+  max-width: 100%; max-height: 100%;
   border-radius: 12px; background: #000;
   box-shadow: 0 6px 30px rgba(0, 0, 0, .5);
 }
@@ -870,9 +1026,53 @@ textarea { line-height: 1.4; }
 @media (max-width: 700px) {
   .call-video.both { flex-direction: column; }
   .call-video.both .cv-camera { width: 40%; align-self: flex-end; }
-  .call-actions { gap: 14px; }
-  .call-btn { width: 50px; height: 50px; }
 }
+
+/* ── Minimised call bubble ───────────────────────────────────────────────────────
+   Parked over the app while a call runs collapsed. Positioned purely by transform
+   from the top-left (same mechanism as the self-view PiP) so drag and corner-snap
+   are one thing. Sits above the app chrome but below the lightbox/toasts. */
+.callmini {
+  /* Read by placeMini (JS) — see there for why the insets travel as properties. */
+  --cm-sat: env(safe-area-inset-top, 0px); --cm-sab: env(safe-area-inset-bottom, 0px);
+  --cm-sal: env(safe-area-inset-left, 0px); --cm-sar: env(safe-area-inset-right, 0px);
+  position: fixed; left: 0; top: 0; z-index: 49;
+  width: 136px; border-radius: 16px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--line-2);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  touch-action: none; will-change: transform; cursor: grab;
+  user-select: none;
+}
+.callmini.snap { transition: transform .22s cubic-bezier(.2, .8, .25, 1); }
+.cm-stage {
+  position: relative; height: 100px; background: #000;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.cm-stage .call-video { gap: 0; }
+.cm-stage .cv-tile { border-radius: 0; box-shadow: none; }
+/* A screen share plus a camera will not fit a 136 px bubble: the share wins. */
+.cm-stage .call-video.both .cv-camera { display: none; }
+.cm-avatar { width: 54px; height: 54px; font-size: 22px; }
+.cm-expand {
+  position: absolute; top: 6px; right: 6px;
+  width: 28px; height: 28px; border: none; border-radius: 50%; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(10, 14, 17, .72); color: var(--text);
+}
+.cm-expand svg { width: 14px; height: 14px; }
+.cm-bar { display: flex; align-items: center; gap: 6px; padding: 7px 8px; }
+.cm-time {
+  flex: 1; min-width: 0; font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.cm-btn {
+  flex: none; width: 30px; height: 30px; border: none; border-radius: 50%;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--panel); color: var(--text);
+}
+.cm-btn svg { width: 15px; height: 15px; }
+.cm-btn.on { background: var(--brand-dim); }
+.cm-btn.danger { background: var(--danger); color: #2b0707; }
 
 /* ── Self-view PiP (your outgoing camera / screen) ────────────────
    Positioned purely via transform from the top-left (JS: placePip) so dragging and
@@ -1467,10 +1667,8 @@ input:focus-visible, textarea:focus-visible { outline: 2px solid var(--brand-2);
 }
 .fab { bottom: calc(20px + env(safe-area-inset-bottom, 0px)); }
 .toast { top: calc(16px + env(safe-area-inset-top, 0px)); }
-.call-card {
-  padding-top: calc(34px + env(safe-area-inset-top, 0px));
-  padding-bottom: calc(34px + env(safe-area-inset-bottom, 0px));
-}
+/* The call screen carries its own insets (top bar / control bar), so nothing extra
+   is needed here — the rules above already fold env() into both. */
 
 /* ── GIF tiles (relay-proxied search — used by the composer GIF pane) ──────── */
 .gif-tile {

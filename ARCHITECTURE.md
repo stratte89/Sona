@@ -345,15 +345,19 @@ sona/                   # backend workspace (Cargo.toml: members = crates/*, exc
 - **Beyond the plan (all shipped):** groups with admin-signed membership epochs + content
   quarantine (`docs/GROUPS.md`); Signal-style multi-device with KT device rosters,
   QR linking, hardware attestation, primary transfer (`docs/MULTI_DEVICE.md`); voice,
-  video, screen-share, and mesh group calls over blind relay rooms (WS + QUIC);
+  video, screen-share (with system audio), and mesh group calls over blind relay rooms
+  (WS + QUIC), with camera/microphone/share pickers and optional GPU H.264 encoding;
   headless delivery engine, native ring, UnifiedPush/FCM wake-class push
   (`docs/NOTIFICATIONS.md`); message requests; disappearing messages; username rename +
   release/takeover; account deletion; relay access tiers (open/token/stealth);
   SOCKS5/Tor routing; GrapheneOS-grade Android hardening (StrongBox, MTE —
   `docs/ANDROID_HARDENING.md`).
 
-Test status: **1,108 tests green** (175 backend + 933 client), clippy clean across both
-workspaces, fmt-gated CI, plus a no-monolith file-size ratchet.
+Test status: **352 tests green** — 176 backend (`cargo test`), 147 client SDK
+(`cd clients && cargo test`, which spins a real relay up in-process) and 29 in the app
+shell (`cd clients/desktop/src-tauri && cargo test --lib`). Seven more are `#[ignore]`d
+because they need hardware that CI does not have: a GPU encoder, a microphone, a screen.
+Clippy clean across both workspaces, fmt-gated CI, plus a no-monolith file-size ratchet.
 
 ---
 

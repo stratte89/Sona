@@ -110,6 +110,8 @@ const ICONS = {
   image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor" stroke="none"/><path d="M21 15l-5-5L5 21"/></svg>',
   flip:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg>',
   expand:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>',
+  // Collapse-the-call-into-a-bubble: a screen with a picture-in-picture tile.
+  pip:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><rect x="11.5" y="11" width="8" height="6" rx="1.5" fill="currentColor" stroke="none"/></svg>',
 };
 const icon = (name) => ICONS[name] || '';
 $$('[data-icon]').forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
@@ -428,6 +430,13 @@ function routeBack() {
   if (!$('#modal').hidden) { closeModal(); return true; }
   if (!$('#msheet').hidden) { closeMsgSheet(); return true; }
   if (!$('#ctxmenu').hidden) { hideCtx(); return true; }
+  // Back on a live call screen minimises it into the bubble (the call keeps running)
+  // rather than navigating the app underneath it. An incoming ring has no bubble to
+  // fall back to, so it keeps the screen until it is answered or declined.
+  if (!$('#callui').hidden && callUi.mode && callUi.mode !== 'incoming') {
+    setCollapsed(true);
+    return true;
+  }
   if (current === 'thread' && !$('#th-searchbar').hidden) { $('#th-searchclose').click(); return true; }
   const to = BACK_TO[current];
   if (to) { navBack(to); return true; }

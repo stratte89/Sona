@@ -24,6 +24,15 @@ async function openSettings() {
   renderDelivery(); // async fill-in (talks to the relay for capabilities)
   renderProxy();
   await renderDevices();
+  await renderAudioDevices();
+}
+
+// Microphone/output/camera pickers. Desktop only, and the same preferences the
+// call-settings gear writes — either place can change them, both show the result.
+async function renderAudioDevices() {
+  if (IS_ANDROID) return;
+  await refreshAudioDevices();
+  $('#se-audio-sec').hidden = !audioDev.supported;
 }
 
 // ── Own profile picture ──────────────────────────────────────────────────────────

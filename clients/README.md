@@ -34,6 +34,14 @@ cargo test -p client-core        # end-to-end tests run the real relay in-proces
 ```
 
 The Tauri shells (`desktop/`) call into `client-core` and contain no security logic.
+They have tests of their own — audio, pixel handling, notifications, the hardware
+encoder — in their detached workspace:
+
+```sh
+cd clients/desktop/src-tauri
+cargo test --lib                 # add `-- --ignored` for the tests that need real
+                                 # hardware (a GPU encoder, a microphone, a screen)
+```
 
 ## Building the desktop / Android app (Tauri 2)
 
@@ -58,7 +66,9 @@ cargo tauri build    # produce installers
 
 ### Android
 
-Prerequisites: Android SDK + NDK, JDK 17+, and the Rust Android targets:
+Prerequisites: Android SDK + NDK, a **JDK Gradle actually supports** — use Android
+Studio's bundled JBR (21); a bleeding-edge JDK fails with "Unsupported class file major
+version" — and the Rust Android targets:
 
 ```sh
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android

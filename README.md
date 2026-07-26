@@ -41,6 +41,33 @@ evidence. Its ignorance isn't a policy you have to trust. It's the structure.
 The honest floor — what a store-and-forward relay irreducibly learns — is stated
 plainly in the [threat model](docs/THREAT_MODEL.md). We don't pretend otherwise.
 
+## Built against Chat Control
+
+<img src="assets/sona-chat-control.png" alt="Sona standing over a smashed surveillance camera and an EU Chat Control plaque" width="200" align="right" />
+
+The EU's **CSA Regulation** — "Chat Control" — would oblige messengers to scan private
+messages for unlawful material. End-to-end encryption leaves a server with nothing to
+scan, so in practice such a mandate lands on the **client**: the scanner has to sit on
+your device, next to the plaintext, before anything is encrypted. That is a wiretap with
+better manners, and once the mechanism exists, what it looks for is a configuration
+change.
+
+Sona's answer isn't a legal argument. It's the same structure as everything above:
+
+- **No operator to compel.** You run the relay. There is no company holding your
+  messages and no counterparty to serve an order to.
+- **Nothing to hand over.** The relay stores ciphertext, one-way recipient hashes and
+  padded cells. A scanning order against it has nothing to scan.
+- **A scanner can't be added quietly.** Every crate is AGPL-3.0-or-later and the whole
+  source is here. [Reproducible builds](docs/REPRODUCIBLE_BUILDS.md) let anyone check
+  that the binary they run is the source they read — so a build with a scanner in it is
+  a *different* build, and provably so.
+
+The honest limit, stated as plainly as the rest: no messenger can defend you against
+your own operating system. If the device itself is compelled to inspect the screen or
+the keyboard, that is below the application and outside what any app can reach. Sona
+defends every layer it actually controls — and hands the guards nothing at the door.
+
 ## What's inside the walls
 
 Everything a modern messenger does, all end-to-end encrypted, on **Windows, Linux, and
@@ -49,8 +76,10 @@ Android** from one Rust codebase:
 **Chats** — groups with cryptographic admin control, disappearing messages, message
 requests (strangers knock first), edits, reactions, pins, replies, @mentions,
 forwarding, voice notes, media galleries, GIFs via a privacy proxy, global search.
-**Calls** — voice, video, and screen share over blind relay rooms (WebSocket + QUIC);
-group calls as a mesh the relay can't tell from 1:1 calls.
+**Calls** — voice, video, and screen share (with system audio) over blind relay rooms
+(WebSocket + QUIC); a Signal-style call screen that collapses into a bubble; hardware
+H.264 encoding where the GPU has it and can prove it works; group calls as a mesh the
+relay can't tell from 1:1 calls.
 **Multi-device** — Signal-style linking with QR + hardware attestation, KT-published
 device rosters, primary transfer, encrypted history sync.
 **Delivery** — headless engine, native call ring, content-free push (UnifiedPush or
@@ -67,8 +96,9 @@ Double Ratchet), [ct-merkle](https://github.com/rozbb/ct-merkle) (RFC 6962, the
 construction behind Certificate Transparency), Argon2id + XChaCha20-Poly1305, Ed25519.
 One Rust crypto core, compiled directly into every client.
 
-**1,108 tests green** (175 backend + 933 client), clippy-clean, fmt-gated, fuzzed,
-security-audited with every finding remediated.
+**352 tests green** (176 backend + 147 client SDK + 29 app shell), clippy-clean,
+fmt-gated, fuzzed, security-audited with every finding remediated. A further 7 are
+`#[ignore]`d because they need real hardware — a GPU encoder, a microphone, a screen.
 
 ## The docs
 

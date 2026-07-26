@@ -51,6 +51,8 @@ tauri-plugin-single-instance = "2"
 # Noise suppression for call capture (pure-Rust RNNoise). Android instead uses the
 # platform NoiseSuppressor attached to its VOICE_COMMUNICATION capture (audio.rs).
 nnnoiseless = { version = "0.5", default-features = false }
+# Share-picker previews: one small PNG per screen/window, inlined as a data URL.
+png = "0.17"
 
 # Screen share, Windows/macOS: Windows Graphics Capture / CoreGraphics.
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
@@ -69,9 +71,12 @@ libc = "0.2"
 # webview. Version pinned to the one wry links against.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
-# Screen share, Linux/X11: pure-Rust XCB (GetImage + RandR monitor picking). No
-# system deps; Wayland needs the PipeWire portal and is not wired yet.
-x11rb = { version = "0.13", features = ["randr"] }
+# Screen share, Linux/X11: pure-Rust XCB (RandR monitor/window picking, GetImage, and
+# MIT-SHM so a 4K grab doesn't ship 33 MB per frame over the X socket). No system deps;
+# Wayland needs the PipeWire portal and is not wired yet.
+x11rb = { version = "0.13", features = ["randr", "shm"] }
+# mmap for the MIT-SHM segment the X server hands back as an fd (media_shell::x11).
+libc = "0.2"
 # Screen-share system audio: the ALSA host cannot enumerate Pulse/PipeWire "monitor"
 # sources, so Linux additionally enables cpal's PulseAudio host (a pure-Rust protocol
 # client; PipeWire serves the same protocol via pipewire-pulse).
@@ -90,3 +95,11 @@ webview2-com = "0.38"
 # Toast notifications need this process to DECLARE its AppUserModelID (see lib.rs).
 # Version already in the dependency graph, so this pulls nothing new.
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+# Hardware H.264 encode via Media Foundation (hwenc::mediafoundation). One code path for
+# NVIDIA/AMD/Intel — MFTEnumEx returns whichever encoder the driver registered. Same
+# major version webview2-com already pulls in, so no second copy of the bindings.
+windows = { version = "0.61", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+] }

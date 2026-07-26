@@ -54,7 +54,8 @@ async function startVoice() {
   vbShow('init');
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Same microphone the call settings pinned, when the webview can be pointed at it.
+    stream = await openMicStream();
   } catch (e) {
     vrec = null;
     vbShow(null);
@@ -68,39 +69,61 @@ async function startVoice() {
            mr: null, ctx: null, proc: null, src: null, pcm: null, rate: 0,
            duration: 0, preview: null, timer: null,
            pkCtx: null, analyser: null, pkSrc: null, pkBuf: null, peaks: [], finalPeaks: [] };
-  // Amplitude capture for the waveform (G): a light analyser over the same stream, sampled
-  // on the UI tick. Independent of the recorder type, best-effort (ignored on failure).
+  // One AudioContext over the mic stream feeds both taps below: the analyser (live
+  // waveform) and, when the recorder can't be trusted, the raw-PCM capture.
   try {
-    vrec.pkCtx = new (window.AudioContext || window.webkitAudioContext)();
-    vrec.analyser = vrec.pkCtx.createAnalyser();
-    vrec.analyser.fftSize = 256;
-    vrec.pkSrc = vrec.pkCtx.createMediaStreamSource(stream);
-    vrec.pkSrc.connect(vrec.analyser);
-    vrec.pkBuf = new Uint8Array(vrec.analyser.frequencyBinCount);
+    vrec.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    vrec.pkCtx = vrec.ctx; // same context; closed once, on stop/cancel
+    vrec.src = vrec.ctx.createMediaStreamSource(stream);
+    vrec.rate = vrec.ctx.sampleRate;
     // WebViews (Android especially) hand out SUSPENDED AudioContexts — a suspended tap
-    // reads constant 128s, i.e. a flat waveform. We're inside the mic-press gesture, so
-    // resume() is allowed here.
-    if (vrec.pkCtx.state !== 'running') vrec.pkCtx.resume().catch(() => {});
+    // reads constant 128s, i.e. a flat waveform, and captures no PCM at all. We're
+    // inside the mic-press gesture, so resume() is allowed here.
+    if (vrec.ctx.state !== 'running') vrec.ctx.resume().catch(() => {});
+  } catch (_) { vrec.ctx = null; vrec.pkCtx = null; vrec.src = null; }
+  // Amplitude capture for the waveform (G), sampled on the UI tick. Independent of the
+  // recorder type, best-effort (ignored on failure).
+  try {
+    vrec.analyser = vrec.ctx.createAnalyser();
+    vrec.analyser.fftSize = 256;
+    vrec.src.connect(vrec.analyser);
+    vrec.pkSrc = vrec.src;
+    vrec.pkBuf = new Uint8Array(vrec.analyser.frequencyBinCount);
   } catch (_) { vrec.analyser = null; }
-  const candidates = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4'];
-  const mime = (window.MediaRecorder && candidates.find((m) => MediaRecorder.isTypeSupported(m))) || null;
+  // Opus containers first — every engine that can produce one does so correctly.
+  // audio/mp4 is last and only for WKWebView (Safari/macOS), where it is the only
+  // option: WebKitGTK ALSO reports mp4 as supported, builds the MediaRecorder without
+  // complaint, and then emits zero bytes — the "empty voice message" on Linux. So an
+  // mp4-only recorder is treated as unproven and shadowed by the PCM tap below, which
+  // takes over at stop if the recorder came up empty.
+  const OPUS_MIMES = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'];
+  const mime = (window.MediaRecorder &&
+    OPUS_MIMES.concat(['audio/mp4']).find((m) => MediaRecorder.isTypeSupported(m))) || null;
   if (mime) {
     vrec.mime = mime.split(';')[0];
-    vrec.mr = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 });
-    vrec.mr.ondataavailable = (e) => { if (e.data && e.data.size && vrec) vrec.chunks.push(e.data); };
-    vrec.mr.start(250);
-  } else {
-    // WebKitGTK without MediaRecorder: raw PCM via ScriptProcessor, encoded to 16 kHz
-    // mono WAV on stop. Bigger than opus but plays everywhere.
-    vrec.mime = 'audio/wav';
-    vrec.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    vrec.rate = vrec.ctx.sampleRate;
-    vrec.pcm = [];
-    vrec.src = vrec.ctx.createMediaStreamSource(stream);
-    vrec.proc = vrec.ctx.createScriptProcessor(4096, 1, 1);
-    vrec.proc.onaudioprocess = (e) => { if (vrec && vrec.pcm) vrec.pcm.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-    vrec.src.connect(vrec.proc);
-    vrec.proc.connect(vrec.ctx.destination);
+    try {
+      vrec.mr = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 });
+      vrec.mr.ondataavailable = (e) => { if (e.data && e.data.size && vrec) vrec.chunks.push(e.data); };
+      vrec.mr.start(250);
+    } catch (_) { vrec.mr = null; }
+  }
+  // Raw PCM via ScriptProcessor → 16 kHz mono WAV on stop. Bigger than opus but plays
+  // everywhere; runs whenever no proven opus recorder is going (no MediaRecorder at
+  // all, construction failed, or mp4-only) so a silent recorder is never the only take.
+  if (vrec.ctx && vrec.src && (!vrec.mr || !OPUS_MIMES.includes(mime))) {
+    try {
+      vrec.pcm = [];
+      vrec.proc = vrec.ctx.createScriptProcessor(4096, 1, 1);
+      vrec.proc.onaudioprocess = (e) => { if (vrec && vrec.pcm) vrec.pcm.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      vrec.src.connect(vrec.proc);
+      // ScriptProcessor only runs while it reaches the destination; it writes nothing
+      // to its output buffer, so this is a silent connection (no mic echo).
+      vrec.proc.connect(vrec.ctx.destination);
+    } catch (_) { vrec.proc = null; vrec.pcm = null; }
+  }
+  if (!vrec.mr && !vrec.proc) {
+    cancelVoice();
+    return toast('This device cannot record audio', 'err');
   }
   $('#vb-time').textContent = '0:00';
   vbShow('rec');
@@ -197,26 +220,41 @@ async function stopVoice() {
   if (!vrec || vrec.starting || vrec.blob) return;
   clearInterval(vrec.timer);
   vrec.duration = Math.max(1, Math.round((Date.now() - vrec.startedAt) / 1000));
+  let blob = null;
   if (vrec.mr) {
     const mr = vrec.mr;
-    await new Promise((resolve) => { mr.onstop = resolve; mr.stop(); });
+    await new Promise((resolve) => {
+      mr.onstop = resolve;
+      try { mr.stop(); } catch (_) { resolve(); }
+    });
     if (!vrec) return; // cancelled while stopping
-    vrec.blob = new Blob(vrec.chunks, { type: vrec.mime });
-  } else {
-    vrec.proc.disconnect(); vrec.src.disconnect();
-    vrec.blob = encodeWav(vrec.pcm, vrec.rate);
+    const b = new Blob(vrec.chunks, { type: vrec.mime });
+    if (b.size) blob = b;
+  }
+  // The PCM tap: the take when there was no recorder, and the rescue when the recorder
+  // produced nothing (WebKitGTK's mp4 MediaRecorder — see startVoice).
+  if (vrec.proc) {
+    try { vrec.proc.disconnect(); } catch (_) {}
+    if (!blob && vrec.pcm && vrec.pcm.length) {
+      blob = encodeWav(vrec.pcm, vrec.rate);
+      vrec.mime = 'audio/wav';
+    }
     vrec.pcm = null;
-    vrec.ctx.close();
   }
   vrec.stream.getTracks().forEach((t) => t.stop());
   vrec.finalPeaks = downsamplePeaks(vrec.peaks, 60); // provisional (live capture)
-  try { if (vrec.pkCtx) { vrec.pkSrc.disconnect(); vrec.pkCtx.close(); } } catch (_) {}
+  try { if (vrec.src) vrec.src.disconnect(); } catch (_) {}
+  try { if (vrec.ctx) vrec.ctx.close(); } catch (_) {}
+  if (!blob || !blob.size) { // every path came up empty — say so, don't send a 0-byte note
+    cancelVoice();
+    return toast('Recording failed — no audio was captured', 'err');
+  }
+  vrec.blob = blob;
   vrec.url = URL.createObjectURL(vrec.blob);
   $('#vb-time').textContent = mss(vrec.duration);
   vbShow('preview');
   // Upgrade to the decoded-from-blob waveform (the accurate one). Async: guard
   // against a cancel/send that raced the decode.
-  const blob = vrec.blob;
   try {
     const p = await peaksFromBlob(blob, 60);
     if (p.length && vrec && vrec.blob === blob) vrec.finalPeaks = p;
@@ -228,8 +266,9 @@ function cancelVoice() {
   if (vrec.starting) { vrec = null; vbShow(null); return; } // mic never opened
   clearInterval(vrec.timer);
   try { if (vrec.mr && vrec.mr.state !== 'inactive') vrec.mr.stop(); } catch (_) {}
-  try { if (vrec.proc) { vrec.proc.disconnect(); vrec.src.disconnect(); vrec.ctx.close(); } } catch (_) {}
-  try { if (vrec.pkCtx) { vrec.pkSrc.disconnect(); vrec.pkCtx.close(); } } catch (_) {}
+  try { if (vrec.proc) vrec.proc.disconnect(); } catch (_) {}
+  try { if (vrec.src) vrec.src.disconnect(); } catch (_) {}
+  try { if (vrec.ctx) vrec.ctx.close(); } catch (_) {}
   vrec.stream.getTracks().forEach((t) => t.stop());
   if (vrec.preview) { vrec.preview.pause(); }
   if (vrec.url) URL.revokeObjectURL(vrec.url);

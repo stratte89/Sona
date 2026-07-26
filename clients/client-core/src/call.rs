@@ -156,6 +156,30 @@ pub mod codec {
             }
             Ok(n as usize)
         }
+
+        /// Conceal one lost 20 ms frame: libopus extrapolates from decoder state
+        /// (`opus_decode` with a NULL packet) instead of handing playout a hole.
+        ///
+        /// A gap filled with digital silence is a click at each edge, and a jittery
+        /// link is nothing but such gaps — the difference between "choppy" and "a
+        /// slightly soft syllable". The run is capped by the caller; libopus fades its
+        /// own extrapolation out over a few frames anyway.
+        pub fn conceal(&mut self, pcm: &mut [i16]) -> Result<usize, String> {
+            let n = unsafe {
+                ffi::opus_decode(
+                    self.ptr,
+                    std::ptr::null(),
+                    0,
+                    pcm.as_mut_ptr(),
+                    (pcm.len() / self.channels as usize) as i32,
+                    0,
+                )
+            };
+            if n < 0 {
+                return Err(format!("opus conceal: {n}"));
+            }
+            Ok(n as usize)
+        }
     }
 
     impl Drop for Decoder {
@@ -543,6 +567,57 @@ pub trait AudioIo: Send + 'static {
     fn read_frame(&mut self, buf: &mut [i16; SAMPLES_PER_FRAME]) -> bool;
     /// Hand 20 ms of decoded peer audio to the playout path.
     fn write_frame(&mut self, frame: &[i16; SAMPLES_PER_FRAME]);
+    /// Frames still queued toward the speaker, when the implementation knows.
+    ///
+    /// Drives packet-loss concealment: the engine only synthesises a replacement frame
+    /// once playout has genuinely run dry, so a burst that arrives late (rather than
+    /// never) is played as sent instead of being padded into a longer, drifting stream.
+    /// `None` — the default, and what the test doubles report — means "unknown", and
+    /// concealment stays off.
+    fn playout_queued(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Playout-gap tracking shared by the v1 and v2 session loops.
+///
+/// One tick of the session loop is one 20 ms frame of playout. When a tick passes with
+/// no voice frame from the peer *and* the shell's playout queue has run dry, the gap is
+/// real (not a late burst) and gets a concealed frame instead of a hole — see
+/// [`codec::Decoder::conceal`].
+#[derive(Default)]
+pub(crate) struct Conceal {
+    /// A voice frame arrived since the previous tick.
+    got_frame: bool,
+    /// Nothing is concealed before the first real frame: a call that has not started
+    /// carrying audio yet must stay quiet, not hum.
+    seen_any: bool,
+    /// Consecutive concealed frames, so a peer that has gone away for good does not
+    /// generate an endless synthesised stream.
+    run: u16,
+}
+
+impl Conceal {
+    /// 300 ms. Past that this is not jitter and libopus has faded to silence anyway.
+    const MAX_RUN: u16 = 15;
+
+    pub(crate) fn on_frame(&mut self) {
+        self.got_frame = true;
+        self.seen_any = true;
+        self.run = 0;
+    }
+
+    /// Call once per tick: `true` when playout wants a concealed frame.
+    pub(crate) fn tick(&mut self, playout_queued: Option<usize>) -> bool {
+        if std::mem::take(&mut self.got_frame) || !self.seen_any || self.run >= Self::MAX_RUN {
+            return false;
+        }
+        if playout_queued != Some(0) {
+            return false; // still frames in flight toward the speaker (or unknown)
+        }
+        self.run += 1;
+        true
+    }
 }
 
 /// Session-level events surfaced to the shell/UI.
@@ -587,6 +662,7 @@ pub async fn run_call(
     // by the relay anyway — this just avoids burning CPU while ringing).
     let mut peer_here = false;
     let mut connected_sent = false;
+    let mut conceal = Conceal::default();
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -608,6 +684,10 @@ pub async fn run_call(
                 if media.send_lossy(wire).await.is_err() {
                     let _ = events.send(CallEvent::Ended);
                     return Ok(());
+                }
+                // Nothing arrived this tick and the speaker has run dry: conceal.
+                if conceal.tick(audio.playout_queued()) && dec.conceal(&mut playout).is_ok() {
+                    audio.write_frame(&playout);
                 }
             }
             ev = media.next_event() => match ev? {
@@ -631,6 +711,7 @@ pub async fn run_call(
                     // by injecting garbage.
                     if let Ok(opus_bytes) = keys.open_frame(&wire) {
                         if dec.decode(&opus_bytes, &mut playout).is_ok() {
+                            conceal.on_frame();
                             audio.write_frame(&playout);
                         }
                     }
@@ -695,6 +776,55 @@ mod tests {
         let mut wrong = CallKeys::derive(&other.key_b64, false).unwrap();
         let w4 = caller.seal_frame(&[3u8; 10]).unwrap();
         assert!(wrong.open_frame(&w4).is_err());
+    }
+
+    #[test]
+    fn conceal_only_fires_on_a_real_gap_and_stops_when_the_peer_is_gone() {
+        let mut c = Conceal::default();
+        // Nothing has ever arrived: silence, not synthesised audio.
+        assert!(!c.tick(Some(0)));
+
+        c.on_frame();
+        assert!(
+            !c.tick(Some(0)),
+            "the frame that arrived this tick is the frame"
+        );
+        // Gap, but audio is still queued toward the speaker → it was a late burst.
+        assert!(!c.tick(Some(2)));
+        // Shell that cannot report its queue (test doubles) never conceals.
+        assert!(!c.tick(None));
+        // Dry playout and nothing arriving: conceal, up to the run cap.
+        for _ in 0..Conceal::MAX_RUN {
+            assert!(c.tick(Some(0)));
+        }
+        assert!(!c.tick(Some(0)), "peer is gone, not jittering");
+        // A frame re-arms the whole thing.
+        c.on_frame();
+        let _ = c.tick(Some(0));
+        assert!(c.tick(Some(0)));
+    }
+
+    #[test]
+    fn concealed_frames_decode_and_fade() {
+        let mut enc = codec::Encoder::voip_mono_cbr(SAMPLE_RATE, OPUS_BITRATE).unwrap();
+        let mut dec = codec::Decoder::mono(SAMPLE_RATE).unwrap();
+        let mut packet = [0u8; PADDED_PLAINTEXT];
+        let mut pcm = [0i16; SAMPLES_PER_FRAME];
+        // Feed a loud tone so the decoder has state to extrapolate from.
+        let tone: Vec<i16> = (0..SAMPLES_PER_FRAME)
+            .map(|i| ((i as f32 * 0.09).sin() * 12000.0) as i16)
+            .collect();
+        for _ in 0..5 {
+            let n = enc.encode(&tone, &mut packet).unwrap();
+            dec.decode(&packet[..n], &mut pcm).unwrap();
+        }
+        assert_eq!(dec.conceal(&mut pcm).unwrap(), SAMPLES_PER_FRAME);
+        // A long run of concealment must not run away into noise.
+        for _ in 0..Conceal::MAX_RUN {
+            dec.conceal(&mut pcm).unwrap();
+        }
+        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak < 12000, "concealment should fade, peaked at {peak}");
     }
 
     #[test]

@@ -1,5 +1,13 @@
 use crate::*;
 
+/// The share source the picker chose, as it comes over IPC.
+#[derive(serde::Deserialize)]
+pub struct ScreenSourcePick {
+    /// `"screen"` or `"window"`; anything else falls back to the primary monitor.
+    pub kind: String,
+    pub id: u32,
+}
+
 /// The UI reports which conversation it currently has open (peer key or group id), or
 /// `None` on the chat list / settings. Drives the "notify when a *different* chat is open"
 /// rule. Cheap; no session lock needed.
@@ -77,6 +85,22 @@ pub fn call_tone(kind: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Is this call's video going through a hardware H.264 encoder? Surfaced so "the share
+/// is smooth now" can be checked rather than assumed — and so the answer is visible when
+/// it is *not*, which is the case worth knowing about.
+fn hw_encode_active() -> bool {
+    #[cfg(not(target_os = "android"))]
+    {
+        hwenc::active()
+    }
+    // Android encodes on the device's media block via MediaCodec in the Kotlin bridge;
+    // there is no software path there to distinguish it from.
+    #[cfg(target_os = "android")]
+    {
+        true
+    }
+}
+
 /// The display name a native ring (and its missed-call entry) may show, honoring the
 /// notification privacy level: `"generic"` reveals nothing — the ring says just "Sona".
 pub(crate) fn ring_title(s: &Session, name: &str) -> String {
@@ -106,6 +130,7 @@ pub async fn call_status(state: tauri::State<'_, AppState>) -> Result<CallStatus
                 "peer_camera": c.peer_camera.load(Relaxed),
                 "peer_screen": c.peer_screen.load(Relaxed),
                 "screen_audio_available": media_shell::screen_audio_available(),
+                "hw_encode": hw_encode_active(),
                 "transport": c.transport,
             })
         }),
@@ -285,6 +310,87 @@ pub async fn call_hangup(state: tauri::State<'_, AppState>) -> Result<(), String
     Ok(())
 }
 
+/// The microphones, outputs and cameras this machine offers, plus which are pinned.
+///
+/// Desktop only. A phone has one microphone and one camera the front/back button
+/// flips, and its output is the earpiece/loudspeaker/Bluetooth *route* chooser — a
+/// device list there would be a second, contradictory way to say the same things.
+#[tauri::command]
+pub async fn call_media_devices() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        // Enumerating cameras opens each device to ask what it supports, and the sound
+        // server round-trips; neither belongs on an async worker thread.
+        eng()
+            .spawn_blocking(|| {
+                let (inputs, outputs) = audio::list_devices();
+                let (pin_in, pin_out) = audio::pinned_devices();
+                serde_json::json!({
+                    "supported": true,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "cameras": media_shell::list_cameras(),
+                    "input": pin_in,
+                    "output": pin_out,
+                    "camera": media_shell::pinned_camera(),
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(serde_json::json!({
+            "supported": false, "inputs": [], "outputs": [], "cameras": []
+        }))
+    }
+}
+
+/// Pin the microphone (`kind: "input"`), the output (`"output"`) or the camera
+/// (`"camera"`). An empty/absent `id` restores the platform default, including
+/// following it when the OS default changes. Applies to a call already in progress.
+#[tauri::command]
+pub fn call_set_media_device(kind: String, id: Option<String>) -> Result<(), String> {
+    if !matches!(kind.as_str(), "input" | "output" | "camera") {
+        return Err("unknown device kind".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let id = id.filter(|s| !s.is_empty());
+        match kind.as_str() {
+            "camera" => media_shell::set_camera(id),
+            other => audio::set_device(other == "input", id),
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = id;
+        Err("device selection is a desktop control".into())
+    }
+}
+
+/// Everything the user could share: each monitor and each ordinary application window,
+/// with a still preview. Desktop only — an Android share is the whole device, granted
+/// by the system's own MediaProjection consent dialog.
+#[tauri::command]
+pub async fn screen_sources() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        // Grabbing and PNG-encoding one preview per window is tens of milliseconds of
+        // blocking work; keep it off the async runtime's worker threads.
+        let list = eng()
+            .spawn_blocking(media_shell::screen_sources)
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok(serde_json::json!({ "supported": true, "sources": list }))
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(serde_json::json!({ "supported": false, "sources": [] }))
+    }
+}
+
 /// Toggle call noise suppression (default on). Desktop: gates RNNoise in the capture
 /// path; Android: the platform NoiseSuppressor effect on the voice mic. Global rather
 /// than per-call — it applies to the live call immediately and to every later one.
@@ -323,11 +429,28 @@ pub async fn call_set_camera(state: tauri::State<'_, AppState>, on: bool) -> Res
     Ok(())
 }
 
-/// Start/stop the screen-share track (primary monitor).
+/// Start/stop the screen-share track.
+///
+/// `source` names what to share — `{"kind": "screen"|"window", "id": <platform id>}`
+/// from [`screen_sources`]. Absent (and always on Android, where the MediaProjection
+/// covers the whole device) means the primary monitor. Set *before* the toggle so the
+/// capture thread's first frame is already of the right thing: starting on the primary
+/// monitor and switching a frame later would flash whatever is on it to the peer.
 #[tauri::command]
-pub async fn call_set_screen(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+pub async fn call_set_screen(
+    state: tauri::State<'_, AppState>,
+    on: bool,
+    source: Option<ScreenSourcePick>,
+) -> Result<(), String> {
     let s = state.inner.lock().await;
     let call = s.call.as_ref().ok_or("no active call")?;
+    if on {
+        media_shell::set_screen_target(match source {
+            Some(p) if p.kind == "screen" => media_shell::ScreenTarget::Screen(p.id),
+            Some(p) if p.kind == "window" => media_shell::ScreenTarget::Window(p.id),
+            _ => media_shell::ScreenTarget::Primary,
+        });
+    }
     call.toggles
         .screen_on
         .store(on, std::sync::atomic::Ordering::Relaxed);

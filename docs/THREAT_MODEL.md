@@ -163,7 +163,13 @@ forgery, and cross-track splices are all dropped), keys die at hangup. Video/scr
 tracks are enabled only when both peers advertise `media2` *inside the ratchet* and the
 relay allows it — a downgrade only ever yields a voice call, never a weaker video path.
 On Android the app's own window is FLAG_SECURE, so a screen share shows Sona itself as
-black: sharing your screen cannot leak your chats.
+black: sharing your screen cannot leak your chats. The share picker names the exact
+screen or window it is about to send before anything is captured, so a share is never
+wider than what was chosen. Where a GPU encoder is used it sits **before** sealing — it
+receives pixels and returns an H.264 access unit, which the media layer then seals with
+the per-call, per-track key — so no key, no plaintext frame and no ciphertext is ever
+handed to a driver. The pixels themselves are already the GPU's: that is where the
+screen was captured from.
 *Accepted (and documented):* the QUIC media path is visible as QUIC-on-UDP to an
 on-path observer (vs. WebSocket blending into HTTPS TCP) — same endpoints, same
 "a call is happening" information, so nothing new is learned; networks that block UDP

@@ -42,7 +42,8 @@ pub const MAX_FRAME_BYTES: usize = 1 + 8 + 16 * 1024 + 16;
 /// frames only when the relay says `media >= 2` (an old relay would close on them).
 pub const MEDIA_LEVEL: u8 = 2;
 /// Sustained per-member byte-rate budget (token bucket): 1 MiB/s comfortably covers
-/// voice + camera + screen + screen audio (~0.3 MiB/s) while capping bulk abuse.
+/// voice + camera + screen + screen audio (~0.5 MiB/s once cell padding is counted,
+/// with the screen encoder at its 3 Mb/s ceiling) while capping bulk abuse.
 pub const RATE_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// Token-bucket burst allowance (keyframes + fragmented cells arrive in clumps).
 pub const RATE_BURST_BYTES: u64 = 4 * 1024 * 1024;

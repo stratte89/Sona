@@ -97,12 +97,20 @@ pub(crate) async fn spawn_call(
         let io = client_core::media::MediaIo {
             audio,
             camera: media_shell::SlotSource::camera(media_ui.clone()),
-            screen: media_shell::SlotSource::screen(media_ui.clone()),
+            screen: media_shell::SlotSource::screen(media_ui.clone(), toggles.screen_width.clone()),
             screen_audio: media_shell::SystemAudioSource::new(),
             sink: media_shell::ShellSink {
                 ui: media_ui.clone(),
                 aux: aux_tx,
             },
+            // Hardware H.264 where this machine has proved it works; software
+            // otherwise, and software again the moment a hardware encoder misbehaves.
+            // Android has no entry here: its frames are encoded by MediaCodec inside the
+            // Kotlin bridge before they ever reach the engine.
+            #[cfg(not(target_os = "android"))]
+            encoders: Some(hwenc::factory()),
+            #[cfg(target_os = "android")]
+            encoders: None,
         };
         eng().spawn(async move {
             let _ = client_core::media::run_media_call(

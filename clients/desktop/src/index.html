@@ -59,13 +59,45 @@
       <button class="btn btn-ghost btn-sm scan-cancel" id="scan-cancel">Cancel</button>
     </div>
 
-    <!-- ── Call overlay (voice + video + screen share) ────────────── -->
+    <!-- ── Call overlay (voice + video + screen share) ────────────────────────────
+         Layout follows the platform: on a phone the peer's name and the elapsed time
+         sit in the top bar with a collapse arrow beside them; on a desktop window they
+         ride in the floating control bar at the bottom and the top bar keeps only the
+         gear + collapse. Both are the same DOM, switched by media query — the identity
+         is written into both slots (see paintCallId). -->
     <div class="callui" id="callui" hidden>
-      <!-- Call settings: gear top-right, small modal below it (audio prefs). -->
-      <button class="call-gear" id="call-gear" aria-label="Call settings" data-icon="gear" hidden></button>
+      <div class="call-top">
+        <button class="call-icon" id="call-collapse" aria-label="Minimise call" data-icon="pip"></button>
+        <div class="call-topid">
+          <span class="call-topname" id="call-topname">—</span>
+          <span class="call-topstate" id="call-topstate">calling…</span>
+        </div>
+        <!-- Call settings: gear top-right, small modal below it (audio prefs). -->
+        <button class="call-icon" id="call-gear" aria-label="Call settings" data-icon="gear" hidden></button>
+      </div>
       <div class="call-settings" id="call-settings" hidden>
         <div class="cset-card">
           <h4>Call settings</h4>
+          <!-- Device pickers: desktop only. A phone has one microphone, one camera the
+               front/back button flips, and an output that is the
+               earpiece/loudspeaker/Bluetooth chooser in the control bar. The same
+               selects appear in Settings; both write the same preference, so changing
+               either updates the other. -->
+          <div class="cset-devices" id="cset-devices" hidden>
+            <label class="cset-field">
+              <span>Microphone</span>
+              <select data-dev="input" aria-label="Microphone"></select>
+            </label>
+            <label class="cset-field">
+              <span>Output</span>
+              <select data-dev="output" aria-label="Audio output"></select>
+            </label>
+            <label class="cset-field">
+              <span>Camera</span>
+              <select data-dev="camera" aria-label="Camera"></select>
+            </label>
+            <p class="cset-hint">Applies to this call straight away, and to voice messages.</p>
+          </div>
           <button class="cset-row" id="cset-ns" type="button">
             <span>Noise suppression</span>
             <span class="cset-switch" aria-hidden="true"></span>
@@ -76,6 +108,7 @@
             <span class="cset-switch" aria-hidden="true"></span>
           </button>
           <p class="cset-hint" id="cset-shareaudio-hint">Include this device's sound when sharing your screen.</p>
+          <p class="cset-hint" id="cset-hw" hidden></p>
         </div>
       </div>
       <!-- Self-view: what *you* are sending (camera / screen), PiP over the stage. -->
@@ -90,24 +123,80 @@
         </div>
         <span class="self-tag">You</span>
       </div>
-      <div class="call-card">
-        <!-- Peer video: screen share dominates when present, camera rides along. -->
+      <div class="call-stage" id="call-stage">
+        <!-- Peer video: screen share dominates when present, camera rides along.
+             MOVED (not duplicated) into the minimised bubble when the call is
+             collapsed — the WebGL contexts painting it survive the reparent. -->
         <div class="call-video" id="call-video" hidden>
           <canvas class="cv-tile cv-screen" id="cv-screen" hidden></canvas>
           <canvas class="cv-tile cv-camera" id="cv-camera" hidden></canvas>
         </div>
-        <div class="avatar call-avatar" id="call-avatar">?</div>
-        <div class="call-name" id="call-name">—</div>
-        <div class="call-state" id="call-state">calling…</div>
+        <div class="call-idle" id="call-idle">
+          <div class="avatar call-avatar" id="call-avatar">?</div>
+          <p class="call-hint">End-to-end encrypted · routed through your relay · no IP shared</p>
+        </div>
+      </div>
+      <div class="call-bar">
+        <div class="call-barid">
+          <span class="call-barname" id="call-barname">—</span>
+          <span class="call-barstate" id="call-barstate">calling…</span>
+        </div>
         <div class="call-actions">
-          <button class="call-btn" id="call-mute" aria-label="Mute" data-icon="mic" hidden></button>
           <button class="call-btn" id="call-speaker" aria-label="Loudspeaker" data-icon="vol" hidden></button>
           <button class="call-btn" id="call-cam" aria-label="Camera" data-icon="cam" hidden></button>
+          <button class="call-btn" id="call-mute" aria-label="Mute" data-icon="mic" hidden></button>
           <button class="call-btn" id="call-share" aria-label="Share screen" data-icon="screen" hidden></button>
+        </div>
+        <div class="call-end">
           <button class="call-btn ok" id="call-accept" aria-label="Accept call" data-icon="phone" hidden></button>
           <button class="call-btn danger" id="call-hangup" aria-label="Hang up" data-icon="phonedown"></button>
         </div>
-        <p class="call-hint">End-to-end encrypted · routed through your relay · no IP shared</p>
+      </div>
+    </div>
+
+    <!-- ── Minimised call bubble ───────────────────────────────────────────────────
+         Where the call goes when collapsed, so the chat list and every conversation
+         stay usable mid-call. Draggable, snaps to the nearest corner; tapping the
+         stage (or the expand button) brings the full screen back. -->
+    <div class="callmini" id="callmini" hidden>
+      <div class="cm-stage" id="cm-stage">
+        <div class="avatar cm-avatar" id="cm-avatar">?</div>
+        <button class="cm-expand" id="cm-expand" aria-label="Back to call" data-icon="expand"></button>
+      </div>
+      <div class="cm-bar">
+        <span class="cm-time" id="cm-time">0:00</span>
+        <button class="cm-btn" id="cm-mute" aria-label="Mute" data-icon="mic"></button>
+        <button class="cm-btn danger" id="cm-hangup" aria-label="Hang up" data-icon="phonedown"></button>
+      </div>
+    </div>
+
+    <!-- ── Share picker ────────────────────────────────────────────────────────────
+         Shown before a desktop screen share starts: pick a monitor or one application
+         window, with a live still of each. Android never sees this — its share is the
+         whole device, granted by the system's own MediaProjection consent dialog. -->
+    <div class="sharepick" id="sharepick" hidden>
+      <div class="sp-card" role="dialog" aria-modal="true" aria-labelledby="sp-title" tabindex="-1">
+        <div class="sp-head">
+          <h3 id="sp-title">Share your screen</h3>
+          <button class="modal-x" id="sp-x" aria-label="Cancel" data-icon="x"></button>
+        </div>
+        <div class="sp-tabs" role="tablist">
+          <button class="sp-tab on" id="sp-tab-screen" data-tab="screen" role="tab" aria-selected="true">Screens</button>
+          <button class="sp-tab" id="sp-tab-window" data-tab="window" role="tab" aria-selected="false">Applications</button>
+        </div>
+        <div class="sp-body" id="sp-body">
+          <!-- Radiogroup: exactly one source is shared, so the tiles behave like radios
+               rather than a multi-select. -->
+          <div class="sp-grid" id="sp-grid" role="radiogroup" aria-label="What to share"></div>
+          <p class="sp-empty" id="sp-empty" hidden></p>
+        </div>
+        <div class="sp-foot">
+          <button class="sp-check" id="sp-audio" type="button" role="checkbox" aria-checked="false">
+            <span class="sp-box" aria-hidden="true"></span>
+            <span>Stream system audio</span>
+          </button>
+          <button class="btn btn-sm" id="sp-go" disabled>Share</button>
+        </div>
       </div>
     </div>
 
@@ -707,6 +796,28 @@
             unlock until you sign in with the password. Fingerprint unlock and auto-unlock
             are mutually exclusive; the PIN can stay on alongside either.</p>
 
+          <!-- Desktop only (see the call-settings copy of these three). -->
+          <div id="se-audio-sec" hidden>
+            <h2 class="section-h">Microphone, output &amp; camera</h2>
+            <div class="card">
+              <label class="devfield">
+                <span>Microphone</span>
+                <select data-dev="input" aria-label="Microphone"></select>
+              </label>
+              <label class="devfield">
+                <span>Output</span>
+                <select data-dev="output" aria-label="Audio output"></select>
+              </label>
+              <label class="devfield">
+                <span>Camera</span>
+                <select data-dev="camera" aria-label="Camera"></select>
+              </label>
+            </div>
+            <p class="hint">Used for calls and voice messages. "System default" follows
+              whatever your operating system is set to, including when you change it.
+              The same three settings live behind the gear during a call.</p>
+          </div>
+
           <h2 class="section-h">Privacy</h2>
           <div class="card">
             <button class="rowbtn" id="se-reqs"><span class="rowico" data-icon="users"></span>Message requests<em id="se-reqs-state"></em></button>
@@ -786,12 +897,15 @@
     <script src="js/36-mentions.js"></script>
     <script src="js/37-gallery.js"></script>
     <script src="js/38-emoji.js"></script>
+    <script src="js/39-audiodev.js"></script>
     <script src="js/40-voice.js"></script>
     <script src="js/50-media.js"></script>
     <script src="js/60-settings.js"></script>
     <script src="js/61-updates.js"></script>
     <script src="js/70-applock.js"></script>
     <script src="js/80-calls.js"></script>
+    <script src="js/81-callmini.js"></script>
+    <script src="js/82-sharepick.js"></script>
     <script src="js/99-boot.js"></script>
   </body>
 </html>

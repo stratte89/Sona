@@ -179,17 +179,32 @@ WRAP
 build_exe() {
   ensure_exe_prereqs
   log "building Windows NSIS installer (cross, cargo-xwin)"
+  local stamp; stamp="$(mktemp)"
   ( cd "$DESKTOP" && \
     env PATH="$XWIN_TOOLS:$HOME/.local/bin:$PATH" \
         NSIS_PATH="$NSIS_PREFIX/usr/share/nsis" \
         TARGET_CFLAGS="-FIintrin.h" \
         CMAKE="$XWIN_TOOLS/cmake-sona" \
-        cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis ) 1>&2
+        cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis ) 1>&2 \
+    || die "windows cross-build failed"
   local exe
-  exe="$(ls -t "$DESKTOP"/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe | head -1)"
-  [ -f "$exe" ] || die "no .exe produced"
+  exe="$(pick_fresh "$stamp" ".exe" "$DESKTOP"/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe)"
   cp "$exe" "$DEST/"
   echo "$exe"
+}
+
+# ---- artifact selection ---------------------------------------------------------------
+# Pick the newest match, and REFUSE one that predates this build. A stage that fails but
+# still exits 0 (tauri has done exactly that on a cross-build compile error) would
+# otherwise hand back the PREVIOUS release's file and it would ship as the new version —
+# which is how a stale 0.1.14 Windows installer once came out of a 0.1.15 release run.
+pick_fresh() { # pick_fresh <stamp-file> <what> <glob...>
+  local stamp="$1" what="$2"; shift 2
+  local f
+  f="$(ls -t "$@" 2>/dev/null | head -1)"
+  [ -n "$f" ] && [ -f "$f" ] || die "no $what produced"
+  [ "$f" -nt "$stamp" ] || die "$what is STALE: $f predates this run — the build stage failed silently"
+  printf '%s\n' "$f"
 }
 
 build_deb() {
@@ -228,10 +243,10 @@ EOF
   # broken ~/.local/bin pip shim (missing module) — point $CMAKE at the same working
   # bundled binary the apk build uses, or the deb dies before it starts.
   local CMAKE_BIN; CMAKE_BIN="$(pick_cmake)" || die "no usable cmake found"
-  ( cd "$DESKTOP" && CMAKE="$CMAKE_BIN" cargo tauri build --bundles deb )
+  local stamp; stamp="$(mktemp)"
+  ( cd "$DESKTOP" && CMAKE="$CMAKE_BIN" cargo tauri build --bundles deb ) || die ".deb build failed"
   local deb
-  deb="$(ls -t "$DESKTOP"/src-tauri/target/release/bundle/deb/*.deb | head -1)"
-  [ -f "$deb" ] || die "no .deb produced"
+  deb="$(pick_fresh "$stamp" ".deb" "$DESKTOP"/src-tauri/target/release/bundle/deb/*.deb)"
   cp "$deb" "$DEST/"
   echo "$deb"
 }
@@ -298,10 +313,10 @@ build_apk() {
   rm -rf "$DESKTOP"/src-tauri/target/*-linux-android*/release/build/opusic-sys-* 2>/dev/null || true
 
   log "building arm64 .apk"
-  ( cd "$DESKTOP" && cargo tauri android build --target aarch64 --apk )
+  local stamp; stamp="$(mktemp)"
+  ( cd "$DESKTOP" && cargo tauri android build --target aarch64 --apk ) || die ".apk build failed"
   local apk
-  apk="$(ls -t "$DESKTOP"/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk | head -1)"
-  [ -f "$apk" ] || die "no .apk produced"
+  apk="$(pick_fresh "$stamp" ".apk" "$DESKTOP"/src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk)"
   cp "$apk" "$DEST/Sona-${VERSION}-arm64.apk"
   echo "$apk"
 }

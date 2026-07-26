@@ -7,6 +7,8 @@ const callUi = {
   // media v2 state
   videoReady: false, cameraOn: false, screenOn: false, screenAudioOn: false,
   screenAudioAvail: false, peerCam: false, peerScr: false, channel: null,
+  // Whether the backend ended up on a hardware H.264 encoder (desktop diagnostics).
+  hwEncode: false,
   // user hung up while setup was still in flight → kill the call when it lands
   cancelled: false,
   // group call: same overlay, voice-only; `peers` = usernames with audio flowing
@@ -15,6 +17,8 @@ const callUi = {
   reconnecting: false,
   // Android: call audio routed to the loudspeaker (earpiece is the default).
   speakerOn: false,
+  // Minimised into the corner bubble (the rest of the app is in use).
+  collapsed: false,
   // Android audio routes: {bt, bt_name, route} from the backend; null off-call.
   // pendingRoute = user's pick made before 'connected' (applied when audio starts).
   routes: null, pendingRoute: null,
@@ -176,6 +180,16 @@ class YuvCanvas {
     });
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
+  // Forget the picture. Resizing the canvas is what actually does it — that drops the
+  // drawing buffer and reallocates it as transparent black — and it hands a 1080p
+  // share's worth of GPU memory back at the same time. `paint` resizes again on the
+  // next frame, so nothing else has to know this happened.
+  clear() {
+    if (!this.gl) return;
+    this.canvas.width = 1;
+    this.canvas.height = 1;
+    this.gl.viewport(0, 0, 1, 1);
+  }
 }
 const yuvTiles = {}; // track id → YuvCanvas (1 = peer camera, 2 = peer screen, 101/102 = self)
 
@@ -185,9 +199,24 @@ function tileFor(track) {
   return { el, painter: yuvTiles[track] };
 }
 
+// Wipe every tile. Hiding one is not enough: a hidden canvas keeps the last frame it
+// was given, so the next thing to reveal it shows the *previous* call's picture — which
+// is how the peer's shared screen ended up behind the ringing state of the call after
+// it. It is also somebody's screen sitting in GPU memory long after they stopped
+// sharing it, which is not ours to keep.
+function clearTiles() {
+  Object.values(yuvTiles).forEach((t) => t.clear());
+}
+
 // One frame from the backend: track(1) || w(2 BE) || h(2 BE) || I420. w=h=0 → off.
 // Tracks 1/2 are the peer; 101/102 are the local self-view preview.
 function onMediaFrame(msg) {
+  // Only a connected call has media. Anything arriving outside one is a straggler from
+  // the call that just ended: the frame channel is process-wide and outlives any single
+  // call, and a frame already queued on it can be delivered after the end-of-call event
+  // has been handled. Painting it would re-show the video stage over the avatar card,
+  // and it would stay that way until the next call tore it down.
+  if (callUi.mode !== 'connected') return;
   let bytes;
   if (msg instanceof ArrayBuffer) bytes = new Uint8Array(msg);
   else if (ArrayBuffer.isView(msg)) bytes = new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
@@ -229,6 +258,8 @@ function updateVideoStage() {
   $('#call-video').hidden = !(cam || scr);
   $('#callui').classList.toggle('has-video', cam || scr);
   $('#call-video').classList.toggle('both', cam && scr);
+  // The bubble shows the peer's video when there is one, the avatar otherwise.
+  $('#cm-avatar').hidden = cam || scr;
 }
 
 function setCallButtons() {
@@ -307,16 +338,51 @@ function placePip(animate) {
   window.addEventListener('resize', () => { if (!pip.drag) placePip(false); });
 })();
 
+// Mute is shown in two places (control bar + bubble); one writer keeps them in step.
+function paintMuted(on) {
+  callUi.muted = on;
+  for (const id of ['#call-mute', '#cm-mute']) {
+    $(id).innerHTML = icon(on ? 'micoff' : 'mic');
+    $(id).classList.toggle('on', on);
+  }
+}
+
+// Identity and status live in two slots at once (top bar on a phone, control pill on
+// a desktop window — see the CSS), plus the bubble; every writer goes through these.
+function paintCallId() {
+  const name = callUi.username || '—';
+  $('#call-topname').textContent = name;
+  $('#call-barname').textContent = name;
+  for (const id of ['#call-avatar', '#cm-avatar']) {
+    const av = $(id);
+    av.textContent = initial(name);
+    av.style.setProperty('--av-h', hue(name));
+  }
+}
+// `html` sticks until the next call; omit it to just repaint the current text (used
+// when the layout changes, e.g. on collapse/expand).
+let callStateHtml = '';
+function paintCallState(html) {
+  if (html !== undefined) callStateHtml = html;
+  $('#call-topstate').innerHTML = callStateHtml;
+  $('#call-barstate').innerHTML = callStateHtml;
+}
+
 function showCall(mode, username) {
+  const wasMode = callUi.mode;
   callUi.mode = mode;
   if (username) callUi.username = username;
-  const name = callUi.username || '—';
-  $('#call-name').textContent = name;
-  const av = $('#call-avatar');
-  av.textContent = initial(name);
-  av.style.setProperty('--av-h', hue(name));
+  // Collapse is for a call in progress; an incoming ring always takes the screen.
+  if (mode === 'incoming' && callUi.collapsed) setCollapsed(false);
+  paintCallId();
+  // The collapse control reads as "minimise" on a desktop window and as "back" on a
+  // phone, matching where the identity sits in each layout.
+  $('#call-collapse').innerHTML = icon(window.innerWidth <= 700 ? 'back' : 'pip');
   $('#call-accept').hidden = mode !== 'incoming';
   $('#call-mute').hidden = mode !== 'connected';
+  $('#cm-mute').hidden = mode !== 'connected';
+  // Nothing to minimise into while a call is only ringing at us.
+  $('#call-collapse').hidden = mode === 'incoming';
   // Loudspeaker toggle: phones only (earpiece↔speaker routing; desktop has no
   // earpiece). Available from the first ring — before 'connected' it arms the
   // preference, which is applied to routing the moment audio starts.
@@ -328,6 +394,9 @@ function showCall(mode, username) {
     // Sync persisted prefs into the backend on connect (a fresh process starts with
     // backend defaults, which may not match; routing resets with each audio session).
     invoke('call_set_noise_suppression', { on: nsOn() }).catch(() => {});
+    // Device pins are re-asserted the same way. Setting one it already holds is a
+    // no-op in the backend, so this never rebuilds a healthy stream mid-call.
+    applyAudioDevicePrefs();
     if (IS_ANDROID && callUi.pendingRoute) {
       // Route picked while still ringing/connecting: apply now that audio exists.
       const want = callUi.pendingRoute;
@@ -340,13 +409,16 @@ function showCall(mode, username) {
     refreshRoutes();
   }
   if (IS_ANDROID && mode && mode !== 'incoming') refreshRoutes();
-  const state = $('#call-state');
-  if (mode === 'connecting') state.innerHTML = '<span class="spinner-sm"></span> establishing secure connection…';
-  else state.textContent =
+  paintCallState(
+    mode === 'connecting' ? '<span class="spinner-sm"></span> establishing secure connection…' :
     mode === 'incoming' ? 'incoming call' :
-    mode === 'outgoing' ? 'ringing…' : '0:00';
+    mode === 'outgoing' ? 'ringing…' :
+    // Re-entering 'connected' (reconnect) keeps the running timer's text.
+    wasMode === 'connected' ? callStateHtml : '0:00');
   $('#callui').classList.toggle('ringing', mode !== 'connected');
-  $('#callui').hidden = false;
+  $('#callui').classList.toggle('incoming', mode === 'incoming');
+  $('#callui').hidden = callUi.collapsed;
+  $('#callmini').hidden = !callUi.collapsed;
   // Caller-side ringback while the peer's phone rings; stops the moment audio flows.
   // Callee-side in-app ringtone while the overlay shows 'incoming'; any transition
   // away (accept → connecting, decline/handled → hideCall) silences it.
@@ -358,9 +430,8 @@ function showCall(mode, username) {
     callUi.timer = setInterval(() => {
       if (callUi.reconnecting) return; // status line shows "reconnecting…"
       const t = mss(Math.floor((Date.now() - callUi.startedAt) / 1000));
-      $('#call-state').textContent = callUi.group
-        ? `${t} · ${callUi.peers.size + 1} in call`
-        : t;
+      paintCallState(callUi.group ? `${t} · ${callUi.peers.size + 1} in call` : t);
+      $('#cm-time').textContent = t;
     }, 500);
   }
 }
@@ -380,20 +451,33 @@ function hideCall() {
   $('#call-speaker').classList.remove('on');
   $('#call-speaker').innerHTML = icon('vol');
   $('#call-settings').hidden = true;
+  closeSharePick(); // the call ended while the picker was up
   callUi.videoReady = false; callUi.cameraOn = false; callUi.screenOn = false;
   callUi.screenAudioOn = false; callUi.peerCam = false; callUi.peerScr = false;
   $('#call-mute').innerHTML = icon('mic');
+  $('#cm-mute').innerHTML = icon('mic');
+  $('#cm-mute').classList.remove('on');
+  $('#cm-time').textContent = '0:00';
   $('#cv-camera').hidden = true;
   $('#cv-screen').hidden = true;
+  clearTiles();
   updateVideoStage();
   updateSelfStage();
   $$('#call-self .self-note').forEach((n) => (n.hidden = false)); // re-arm for the next call
   $('#callui').classList.remove('has-video');
+  $('#callui').classList.remove('incoming');
+  // Order matters: setCollapsed(false) puts the peer-video element back on the stage
+  // before the overlay closes, so the next call starts with the DOM where it belongs.
+  setCollapsed(false);
   $('#callui').hidden = true;
+  $('#callmini').hidden = true;
 }
 
 $('#th-call').onclick = async () => {
-  if (cur.keyChanged || !cur.peer || callUi.mode) return;
+  // Already in a call: the call button is the way back to it (you got here by
+  // minimising it), not a second dial.
+  if (callUi.mode) { setCollapsed(false); return; }
+  if (cur.keyChanged || !cur.peer) return;
   // Overlay comes up instantly — key exchange, mic init and the room join run behind
   // this state, and the backend's "outgoing" event flips it to "ringing…".
   callUi.cancelled = false;
@@ -503,6 +587,16 @@ $('#call-speaker').onclick = async () => {
 // share-system-audio. Both persisted across calls and app restarts; on by default.
 const nsOn = () => localStorage.getItem('sona-ns') !== '0';
 const shareAudioPref = () => localStorage.getItem('sona-sharesysaudio') !== '0';
+// One writer for the share-system-audio preference, because it is shown in two places
+// (the gear's switch and the share picker's checkbox) and changing either has to move
+// the other — including when the picker is what changed it.
+function setShareAudioPref(on) {
+  localStorage.setItem('sona-sharesysaudio', on ? '1' : '0');
+  $('#cset-shareaudio').classList.toggle('on', on);
+  $('#sp-audio').classList.toggle('on', on);
+  $('#sp-audio').setAttribute('aria-checked', on ? 'true' : 'false');
+}
+
 $('#call-gear').onclick = async () => {
   const pane = $('#call-settings');
   pane.hidden = !pane.hidden;
@@ -513,6 +607,16 @@ $('#call-gear').onclick = async () => {
     await refreshScreenAudioAvail();
     $('#cset-shareaudio').hidden = !callUi.screenAudioAvail;
     $('#cset-shareaudio-hint').hidden = !callUi.screenAudioAvail;
+    $('#cset-devices').hidden = IS_ANDROID || !audioDev.supported;
+    if (!IS_ANDROID) refreshAudioDevices();
+    // Whether video is going through the GPU. Shown only while it matters (a call with
+    // video negotiated), and worded so that "software" reads as information, not fault:
+    // on a machine without a usable hardware encoder it is the correct outcome.
+    const hw = $('#cset-hw');
+    hw.hidden = !callUi.videoReady;
+    hw.textContent = callUi.hwEncode
+      ? 'Video encoding: hardware (GPU)'
+      : 'Video encoding: software';
   }
 };
 // Tap outside the card closes the modal.
@@ -529,8 +633,7 @@ $('#cset-ns').onclick = async () => {
 };
 $('#cset-shareaudio').onclick = async () => {
   const next = !shareAudioPref();
-  localStorage.setItem('sona-sharesysaudio', next ? '1' : '0');
-  $('#cset-shareaudio').classList.toggle('on', next);
+  setShareAudioPref(next);
   // Live-apply to a share already running; otherwise it just takes effect next share.
   if (callUi.screenOn && callUi.screenAudioAvail) {
     try {
@@ -544,9 +647,7 @@ $('#call-mute').onclick = async () => {
   const next = !callUi.muted;
   try {
     await invoke(callUi.group ? 'group_call_set_muted' : 'call_set_muted', { muted: next });
-    callUi.muted = next;
-    $('#call-mute').innerHTML = icon(next ? 'micoff' : 'mic');
-    $('#call-mute').classList.toggle('on', next);
+    paintMuted(next);
   } catch (e) { toast(say(e), 'err'); }
 };
 $('#call-cam').onclick = async () => {
@@ -559,17 +660,19 @@ $('#call-cam').onclick = async () => {
     updateSelfStage();
   } catch (e) { toast(say(e), 'err'); }
 };
-$('#call-share').onclick = async () => {
-  const next = !callUi.screenOn;
+// Start (or stop) the screen-share track. `source` is the picker's choice — omitted on
+// Android and as the fallback everywhere, meaning the primary monitor.
+async function setScreenShare(on, source) {
   try {
-    await invoke('call_set_screen', { on: next });
-    callUi.screenOn = next;
+    await invoke('call_set_screen', { on, source: source || null });
+    callUi.screenOn = on;
     callUi.screenAudioOn = false; // backend clears audio with the share
-    if (next) {
+    if (on) {
       $('#self-scr .self-note').hidden = false;
-      // System audio rides the share per the call-settings preference. Ordering is
-      // audio *after* share on purpose: the gap direction is silence, never a leak
-      // (and on Android the bridge attaches capture once the projection lands).
+      // System audio rides the share per the preference the picker just confirmed.
+      // Ordering is audio *after* share on purpose: the gap direction is silence,
+      // never a leak (and on Android the bridge attaches capture once the projection
+      // lands).
       if (callUi.screenAudioAvail && shareAudioPref()) {
         try {
           await invoke('call_set_screen_audio', { on: true });
@@ -580,7 +683,7 @@ $('#call-share').onclick = async () => {
     setCallButtons();
     updateSelfStage();
   } catch (e) { toast(say(e), 'err'); }
-};
+}
 
 // Group-call events drive the same overlay in voice-only mode. Connectivity is
 // per-peer: the first peer with flowing audio flips the overlay to "connected";
@@ -595,7 +698,7 @@ function onGroupCallEvent(ev) {
     case 'incoming':
       callUi.group = true;
       showCall('incoming', p.name || 'Group');
-      $('#call-state').textContent = `incoming group call · ${p.from || ''}`;
+      paintCallState(`incoming group call · ${escapeHtml(p.from || '')}`);
       maybeAutoAnswer();
       break;
     case 'outgoing':
@@ -639,7 +742,7 @@ function onCallEvent(ev) {
     case 'reconnecting':
       callUi.reconnecting = true;
       if (!callUi.mode) showCall('connecting', p.username);
-      $('#call-state').innerHTML = '<span class="spinner-sm"></span> reconnecting…';
+      paintCallState('<span class="spinner-sm"></span> reconnecting…');
       break;
     case 'video_ready': callUi.videoReady = !!p.ready; refreshScreenAudioAvail(); break;
     case 'peer_track':
@@ -668,15 +771,12 @@ async function resyncCall() {
       callUi.screenOn = !!st.active.screen_on;
       callUi.screenAudioOn = !!st.active.screen_audio_on;
       callUi.screenAudioAvail = !!st.active.screen_audio_available;
+      callUi.hwEncode = !!st.active.hw_encode;
       callUi.peerCam = !!st.active.peer_camera;
       callUi.peerScr = !!st.active.peer_screen;
       showCall(st.active.connected ? 'connected' : 'outgoing', st.active.username);
       updateSelfStage();
-      if (st.active.muted) {
-        callUi.muted = true;
-        $('#call-mute').innerHTML = icon('micoff');
-        $('#call-mute').classList.add('on');
-      }
+      if (st.active.muted) paintMuted(true);
       bindMediaChannel(); // frames resume painting after a reload
     } else if (st.incoming) {
       showCall('incoming', st.incoming.username);
@@ -684,20 +784,16 @@ async function resyncCall() {
     } else if (st.reconnecting) {
       callUi.reconnecting = true;
       showCall('connecting', st.reconnecting.username);
-      $('#call-state').innerHTML = '<span class="spinner-sm"></span> reconnecting…';
+      paintCallState('<span class="spinner-sm"></span> reconnecting…');
     } else if (st.group_active) {
       callUi.group = true;
       callUi.peers = new Set(st.group_active.peers || []);
       showCall(callUi.peers.size ? 'connected' : 'outgoing', st.group_active.name);
-      if (st.group_active.muted) {
-        callUi.muted = true;
-        $('#call-mute').innerHTML = icon('micoff');
-        $('#call-mute').classList.add('on');
-      }
+      if (st.group_active.muted) paintMuted(true);
     } else if (st.group_incoming) {
       callUi.group = true;
       showCall('incoming', st.group_incoming.name);
-      $('#call-state').textContent = `incoming group call · ${st.group_incoming.from || ''}`;
+      paintCallState(`incoming group call · ${escapeHtml(st.group_incoming.from || '')}`);
       maybeAutoAnswer();
     }
   } catch (_) {}
@@ -708,6 +804,7 @@ async function refreshScreenAudioAvail() {
   try {
     const st = await invoke('call_status');
     callUi.screenAudioAvail = !!(st.active && st.active.screen_audio_available);
+    callUi.hwEncode = !!(st.active && st.active.hw_encode);
   } catch (_) {}
   setCallButtons();
 }

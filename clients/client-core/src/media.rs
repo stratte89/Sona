@@ -33,7 +33,7 @@
 //!   sources hand over only their freshest frame, and decode runs off the socket task
 //!   so a slow decode can't stall voice.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use chacha20poly1305::{
@@ -361,7 +361,8 @@ impl ControlMsg {
 pub mod video {
     use openh264::decoder;
     use openh264::encoder::{
-        self, BitRate, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+        self, BitRate, Complexity, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        UsageType,
     };
     use openh264::formats::{YUVBuffer, YUVSource};
     use openh264::OpenH264API;
@@ -397,29 +398,65 @@ pub mod video {
     /// Camera encode target: ~600 kb/s @ up to 30 fps (VGA-ish source).
     pub const CAMERA_BITRATE: u32 = 600_000;
     pub const CAMERA_MAX_FPS: f32 = 30.0;
-    /// Screen encode target: ~1.5 Mb/s @ up to 15 fps (text must stay readable).
-    pub const SCREEN_BITRATE: u32 = 1_500_000;
-    pub const SCREEN_MAX_FPS: f32 = 15.0;
+    /// Screen encode target: ~3 Mb/s @ up to 20 fps.
+    ///
+    /// The original 1.5 Mb/s @ 15 fps was chosen for a shared text editor. What people
+    /// actually share is motion — a game, a video, a scrolling page — and at that
+    /// budget a 1080p source spends the whole frame on quantisation noise and still
+    /// stutters. Motion reads as "laggy" long before resolution reads as "soft", so
+    /// the rate and the frame rate both go up; the capture side caps resolution
+    /// instead (`media_shell::SCREEN_MAX_W`).
+    pub const SCREEN_BITRATE: u32 = 3_000_000;
+    pub const SCREEN_MAX_FPS: f32 = 20.0;
     /// Periodic IDR interval in frames: bounded damage after any decoder hiccup, and a
     /// keyframe-request never waits forever even if the control cell were lost.
     const IDR_INTERVAL_FRAMES: u32 = 300;
+
+    /// One H.264 encoder, whatever is actually doing the work.
+    ///
+    /// The software encoder below always exists; a platform may offer a hardware one
+    /// through [`super::EncoderFactory`]. Everything downstream — the sealing, the
+    /// cells, the wire — is identical either way: this trait hands back an Annex-B
+    /// access unit and nothing above it knows or cares where it came from.
+    pub trait H264Encode: Send {
+        /// Encode one frame. An empty return means "the rate controller skipped this
+        /// one, send nothing", which is not an error.
+        fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, String>;
+        /// Make the next encoded frame an IDR (the peer's decoder lost sync).
+        fn force_keyframe(&mut self);
+    }
 
     pub struct Encoder {
         inner: encoder::Encoder,
     }
 
+    impl H264Encode for Encoder {
+        fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>, String> {
+            Encoder::encode(self, frame)
+        }
+        fn force_keyframe(&mut self) {
+            Encoder::force_keyframe(self)
+        }
+    }
+
     impl Encoder {
         pub fn realtime(content: Content) -> Result<Encoder, String> {
-            let (usage, bitrate, fps) = match content {
+            let (usage, bitrate, fps, complexity) = match content {
                 Content::Camera => (
                     UsageType::CameraVideoRealTime,
                     CAMERA_BITRATE,
                     CAMERA_MAX_FPS,
+                    Complexity::Medium,
                 ),
+                // Screen frames are 4–9× the pixels of a camera frame at a comparable
+                // deadline. Low complexity buys back the encode time that a full-screen
+                // share needs to hit its frame rate at all, and the extra bitrate above
+                // more than pays for the coding efficiency it gives up.
                 Content::Screen => (
                     UsageType::ScreenContentRealTime,
                     SCREEN_BITRATE,
                     SCREEN_MAX_FPS,
+                    Complexity::Low,
                 ),
             };
             let cfg = EncoderConfig::new()
@@ -427,6 +464,12 @@ pub mod video {
                 .bitrate(BitRate::from_bps(bitrate))
                 .max_frame_rate(FrameRate::from_hz(fps))
                 .rate_control_mode(RateControlMode::Bitrate)
+                .complexity(complexity)
+                // Auto — one encode thread per core the machine has. Single-threaded
+                // 1080p screen encoding costs more than the whole inter-frame budget on
+                // an ordinary laptop, which is most of where "the share was laggy"
+                // comes from.
+                .num_threads(0)
                 .intra_frame_period(IntraFramePeriod::from_num_frames(IDR_INTERVAL_FRAMES));
             Ok(Encoder {
                 inner: encoder::Encoder::with_api_config(OpenH264API::from_source(), cfg)
@@ -559,13 +602,38 @@ impl ScreenAudioSource for NoScreenAudio {
 /// notices within one tick. Mic mute keeps the voice cadence (silence goes out);
 /// camera/screen toggles start/stop those tracks (visible to the relay as bandwidth —
 /// see the module docs).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MediaToggles {
     pub muted: Arc<AtomicBool>,
     pub camera_on: Arc<AtomicBool>,
     pub screen_on: Arc<AtomicBool>,
     pub screen_audio_on: Arc<AtomicBool>,
+    /// Width the screen capture should decimate to, written by the encode governor and
+    /// read by the platform capture source. See [`SCREEN_WIDTHS`].
+    pub screen_width: Arc<AtomicU32>,
 }
+
+impl Default for MediaToggles {
+    fn default() -> Self {
+        MediaToggles {
+            muted: Arc::default(),
+            camera_on: Arc::default(),
+            screen_on: Arc::default(),
+            screen_audio_on: Arc::default(),
+            screen_width: Arc::new(AtomicU32::new(SCREEN_WIDTHS[0])),
+        }
+    }
+}
+
+/// Capture widths the governor walks between, widest first. Dropping resolution is the
+/// lever with the most effect per step: encode cost is roughly linear in pixels, so
+/// 1920 → 1280 is well over half the work.
+pub const SCREEN_WIDTHS: [u32; 4] = [1920, 1440, 1280, 960];
+
+/// Share of one core's wall time the screen encoder may spend. Above this the machine
+/// has nothing left for the 20 ms voice tick, and the call — which is the part that
+/// must not break — starts stuttering before the video does.
+const ENCODE_BUDGET: f32 = 0.5;
 
 /// Session events surfaced to the shell/UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +651,16 @@ pub enum MediaEvent {
     Ended,
 }
 
+/// How the engine obtains an encoder for a track.
+///
+/// The shell supplies this so platform-specific hardware encoders can live in the
+/// platform crate — `client-core` stays free of any OS media API. Returning `None` (or
+/// having no factory at all) means the built-in software encoder, which is also the
+/// automatic outcome whenever a hardware encoder fails to prove itself; see the
+/// shell's probe. Never called on the socket task.
+pub type EncoderFactory =
+    Arc<dyn Fn(video::Content) -> Option<Box<dyn video::H264Encode>> + Send + Sync>;
+
 /// Everything the platform shell plugs into the engine.
 pub struct MediaIo<A, C, S, SA, K>
 where
@@ -597,6 +675,8 @@ where
     pub screen: S,
     pub screen_audio: SA,
     pub sink: K,
+    /// Optional hardware-encoder source; `None` = software only.
+    pub encoders: Option<EncoderFactory>,
 }
 
 /// Cells from the socket to the decode task.
@@ -639,7 +719,23 @@ where
         screen,
         mut screen_audio,
         sink,
+        encoders,
     } = io;
+    // No factory, or one that declines a track, means the built-in software encoder.
+    let make: EncoderFactory = match encoders {
+        Some(f) => Arc::new(move |content| {
+            f(content).or_else(|| {
+                video::Encoder::realtime(content)
+                    .ok()
+                    .map(|e| Box::new(e) as Box<dyn video::H264Encode>)
+            })
+        }),
+        None => Arc::new(|content| {
+            video::Encoder::realtime(content)
+                .ok()
+                .map(|e| Box::new(e) as Box<dyn video::H264Encode>)
+        }),
+    };
 
     // Voice: identical to v1 (keys, codec, framing).
     let mut voice_keys = CallKeys::derive(key_b64, caller)?;
@@ -682,7 +778,18 @@ where
                 content: video::Content,
                 on: Arc<AtomicBool>,
                 kf: Arc<AtomicBool>,
-                enc: Option<video::Encoder>,
+                enc: Option<Box<dyn video::H264Encode>>,
+                /// Where a replacement comes from; see [`EncoderFactory`].
+                make: EncoderFactory,
+                /// Smoothed encode cost, seconds per frame.
+                cost: f32,
+                /// Earliest the next frame may be encoded — the governor's throttle.
+                next_at: Option<std::time::Instant>,
+                /// Index into [`SCREEN_WIDTHS`]; screen leg only.
+                level: usize,
+                width: Option<Arc<AtomicU32>>,
+                /// Frame interval this leg is nominally aiming for.
+                interval: std::time::Duration,
             }
             async fn pump<V: VideoSource>(
                 leg: &mut Leg<V>,
@@ -690,21 +797,28 @@ where
             ) {
                 if !leg.on.load(Ordering::Relaxed) {
                     leg.enc = None; // off→on later restarts with a fresh IDR
+                    leg.next_at = None;
+                    leg.cost = 0.0;
                     return;
                 }
                 if tx.capacity() == 0 {
                     return; // backlogged: drop before encoding
                 }
+                let now = std::time::Instant::now();
+                if leg.next_at.is_some_and(|t| now < t) {
+                    return; // governor is holding this leg back
+                }
                 let Some(frame) = leg.source.frame() else {
                     return;
                 };
                 if leg.enc.is_none() {
-                    leg.enc = video::Encoder::realtime(leg.content).ok();
+                    leg.enc = (leg.make)(leg.content);
                 }
                 let Some(enc) = leg.enc.as_mut() else { return };
                 if leg.kf.swap(false, Ordering::Relaxed) {
                     enc.force_keyframe();
                 }
+                let started = std::time::Instant::now();
                 let encoded = match enc.encode(&frame) {
                     Ok(e) if !e.is_empty() => e,
                     Ok(_) => return, // rate controller skipped the frame
@@ -713,11 +827,60 @@ where
                         return;
                     }
                 };
+                leg.govern(started.elapsed());
                 if let Ok(cells) = leg.seal.seal_cells(&encoded) {
                     let _ = tx.try_send(cells);
                 }
             }
 
+            impl<V: VideoSource> Leg<V> {
+                /// Keep the encoder inside its share of the machine.
+                ///
+                /// Software H.264 on a full-resolution screen can cost more than the
+                /// frame interval it is trying to hit, and when it does, the thing that
+                /// breaks first is not the video — it is the 20 ms voice tick, which now
+                /// has to fight the encoder for a core. That is the "their voice broke up
+                /// while I was sharing" report, and it is a scheduling problem, not a
+                /// bandwidth one: the fix is to spend less CPU, not fewer bits.
+                ///
+                /// So measure what a frame actually costs and hold the leg to
+                /// [`ENCODE_BUDGET`] of one core, first by pacing frames further apart,
+                /// and — because cost is roughly linear in pixels — by stepping the
+                /// capture down through [`SCREEN_WIDTHS`] when pacing alone is not
+                /// enough. Both recover when the load does.
+                fn govern(&mut self, took: std::time::Duration) {
+                    let took = took.as_secs_f32();
+                    // Fast to rise, slow to fall: react to a machine getting busy within
+                    // a frame or two, give back resolution only once it has really eased.
+                    self.cost = if took > self.cost {
+                        0.5 * self.cost + 0.5 * took
+                    } else {
+                        0.95 * self.cost + 0.05 * took
+                    };
+                    let nominal = self.interval.as_secs_f32();
+                    let paced = (self.cost / ENCODE_BUDGET).max(nominal);
+                    self.next_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(paced));
+
+                    let Some(width) = self.width.as_ref() else {
+                        return; // camera: VGA-ish, never the problem — pacing is enough
+                    };
+                    // Pacing is already at half rate and still over budget: fewer pixels.
+                    if paced > nominal * 1.8 && self.level + 1 < SCREEN_WIDTHS.len() {
+                        self.level += 1;
+                    } else if paced < nominal * 1.05 && self.level > 0 && self.cost > 0.0 {
+                        self.level -= 1;
+                    } else {
+                        return;
+                    }
+                    width.store(SCREEN_WIDTHS[self.level], Ordering::Relaxed);
+                    // The next frame arrives at a new size; the encoder reinitialises
+                    // and emits an IDR on its own, but drop it so the change is clean.
+                    self.enc = None;
+                }
+            }
+
+            let secs = |fps: f32| std::time::Duration::from_secs_f32(1.0 / fps);
             let mut cam = Leg {
                 source: camera,
                 seal: seal_cam,
@@ -725,6 +888,12 @@ where
                 on: toggles.camera_on,
                 kf: kf_camera,
                 enc: None,
+                make: make.clone(),
+                cost: 0.0,
+                next_at: None,
+                level: 0,
+                width: None,
+                interval: secs(video::CAMERA_MAX_FPS),
             };
             let mut scr = Leg {
                 source: screen,
@@ -733,6 +902,12 @@ where
                 on: toggles.screen_on,
                 kf: kf_screen,
                 enc: None,
+                make,
+                cost: 0.0,
+                next_at: None,
+                level: 0,
+                width: Some(toggles.screen_width.clone()),
+                interval: secs(video::SCREEN_MAX_FPS),
             };
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -827,6 +1002,7 @@ where
     let mut opus_buf = [0u8; crate::call::PADDED_PLAINTEXT];
     let mut peer_here = false;
     let mut connected_sent = false;
+    let mut conceal = crate::call::Conceal::default();
     let mut relay_media2 = false;
     let mut video_ready_sent: Option<bool> = None;
     // Which of our tracks the peer currently believes are on (for edge-triggered
@@ -838,7 +1014,15 @@ where
 
     let result: Result<()> = 'session: {
         loop {
+            // Biased: voice is the only track with a hard cadence, and a screen share
+            // produces cells far faster than 50 Hz. Left to `select!`'s random choice,
+            // a busy share wins the coin flip often enough to push the voice tick
+            // around — the call itself starts sounding chunky the moment someone shares
+            // their screen. Polled in order, the tick is served whenever it is due and
+            // video only ever uses what is left.
             tokio::select! {
+                biased;
+
                 _ = stop.changed() => break 'session Ok(()),
 
                 _ = tick.tick(), if peer_here => {
@@ -856,6 +1040,13 @@ where
                     };
                     if media.send_lossy(wire).await.is_err() {
                         break 'session Ok(());
+                    }
+                    // Nothing arrived this tick and the speaker has run dry: conceal
+                    // the gap rather than hand playout a hole (clicks at both edges).
+                    if conceal.tick(audio.playout_queued())
+                        && voice_dec.conceal(&mut playout).is_ok()
+                    {
+                        audio.write_frame(&playout);
                     }
 
                     // Re-evaluate negotiation every tick: the answer's caps can land
@@ -911,24 +1102,6 @@ where
                     }
                 }
 
-                // Sealed camera/screen cells from the encode task.
-                Some(cells) = cells_rx.recv() => {
-                    if media.send_cells(cells).await.is_err() {
-                        break 'session Ok(());
-                    }
-                }
-
-                // Our decoder lost sync — ask the peer for an IDR.
-                Some(track) = kfreq_rx.recv() => {
-                    let cell = match (ControlMsg::KeyframeReq { track: track as u8 }).seal(&mut ctl_seal) {
-                        Ok(c) => c,
-                        Err(e) => break 'session Err(e),
-                    };
-                    if media.send_cells(vec![cell]).await.is_err() {
-                        break 'session Ok(());
-                    }
-                }
-
                 ev = media.next_event() => match ev {
                     Err(e) => break 'session Err(e),
                     Ok(ev) => match ev {
@@ -962,6 +1135,7 @@ where
                             // Bad frames dropped, not fatal (untrusted relay), as in v1.
                             if let Ok(opus_bytes) = voice_keys.open_frame(&wire) {
                                 if voice_dec.decode(&opus_bytes, &mut playout).is_ok() {
+                                    conceal.on_frame();
                                     audio.write_frame(&playout);
                                 }
                             }
@@ -1011,6 +1185,27 @@ where
                     CallWireEvent::Closed => break 'session Ok(()),
                     },
                 },
+
+                // Our decoder lost sync — ask the peer for an IDR. Ahead of outbound
+                // video: an unanswered request costs the peer a second of broken
+                // picture, one late video frame costs 50 ms.
+                Some(track) = kfreq_rx.recv() => {
+                    let cell = match (ControlMsg::KeyframeReq { track: track as u8 }).seal(&mut ctl_seal) {
+                        Ok(c) => c,
+                        Err(e) => break 'session Err(e),
+                    };
+                    if media.send_cells(vec![cell]).await.is_err() {
+                        break 'session Ok(());
+                    }
+                }
+
+                // Sealed camera/screen cells from the encode task. Last on purpose —
+                // everything above is either on a deadline or already waiting.
+                Some(cells) = cells_rx.recv() => {
+                    if media.send_cells(cells).await.is_err() {
+                        break 'session Ok(());
+                    }
+                }
             }
         }
     };
