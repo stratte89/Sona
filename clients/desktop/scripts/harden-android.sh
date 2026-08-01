@@ -36,6 +36,17 @@
 #      denies getUserMedia (voice messages).
 #   7. proguard-sona.pro — keep rules so R8 doesn't strip the JNI-reflection-only
 #      bridge classes (MediaBridge controls, BiometricGate) from release builds.
+#   8. TelecomBridge.kt + androidx.core:core-telecom — Core-Telecom owns the call
+#      lifecycle and audio route (internal/CALL_PLAN.md §7): the pinned dependency, the
+#      MANAGE_OWN_CALLS / FOREGROUND_SERVICE_PHONE_CALL permissions it requires, and a
+#      keep rule for the JNI-reflection-only bridge.
+#   9. CallActivity.kt — the incoming-call screen. A self-managed Telecom call gets no
+#      system call UI, so the app has to draw its own; this one is showWhenLocked +
+#      turnScreenOn and holds nothing but a name and two buttons, so a call may go over
+#      the keyguard without the app's contents going with it. Declared alongside
+#      CallRingService, the phoneCall foreground service that holds the process for the
+#      ring window (without it Android freezes the app mid-ring and the notification
+#      rings out on its own).
 #
 # Modes:
 #   ./harden-android.sh          apply (default)
@@ -98,6 +109,8 @@ FCM_SRC="$SCRIPT_DIR/SonaFirebaseService.kt";   FCM_DST="$(dirname "$ACTIVITY")/
 UP_SRC="$SCRIPT_DIR/UnifiedPush.kt";            UP_DST="$(dirname "$ACTIVITY")/UnifiedPush.kt"
 HWATTEST_SRC="$SCRIPT_DIR/HwAttest.kt";         HWATTEST_DST="$(dirname "$ACTIVITY")/HwAttest.kt"
 UPDATE_SRC="$SCRIPT_DIR/UpdateBridge.kt";       UPDATE_DST="$(dirname "$ACTIVITY")/UpdateBridge.kt"
+TELECOM_SRC="$SCRIPT_DIR/TelecomBridge.kt";     TELECOM_DST="$(dirname "$ACTIVITY")/TelecomBridge.kt"
+CALLUI_SRC="$SCRIPT_DIR/CallActivity.kt";       CALLUI_DST="$(dirname "$ACTIVITY")/CallActivity.kt"
 STAT_ICON="$MAIN_DIR/res/drawable/ic_stat_sona.xml"
 
 # ---------------------------------------------------------------- check mode
@@ -143,6 +156,7 @@ notify_manifest_wired() {
   grep -q 'android:name=".SonaApp"' "$MANIFEST"     && grep -q 'android.permission.RECEIVE_BOOT_COMPLETED' "$MANIFEST"     && grep -q 'android.permission.USE_FULL_SCREEN_INTENT' "$MANIFEST"     && grep -q '"\.BootReceiver"' "$MANIFEST"     && grep -q '"\.DrainService"' "$MANIFEST"     && grep -q '"\.SonaFirebaseService"' "$MANIFEST"     && grep -q '"\.NotifActionReceiver"' "$MANIFEST"     && grep -q '"\.UnifiedPushReceiver"' "$MANIFEST"     && grep -q 'android:launchMode="singleTask"' "$MANIFEST"
 }
 up_queries_wired() { grep -q 'org.unifiedpush.android.distributor.REGISTER' "$MANIFEST"; }
+gms_queries_wired() { grep -q '"com.google.android.gms"' "$MANIFEST"; }
 memtag_wired() { grep -q 'android:memtagMode=' "$MANIFEST"; }
 attest_installed() { [ -f "$HWATTEST_DST" ] && cmp -s "$HWATTEST_SRC" "$HWATTEST_DST"; }
 attest_kept() { [ -f "$PRO_FILE" ] && grep -q 'HwAttest' "$PRO_FILE"; }
@@ -150,10 +164,28 @@ lifecycle_wired() { grep -q "SONA-LIFECYCLE" "$ACTIVITY"; }
 back_wired() { grep -q "SONA-BACK" "$ACTIVITY"; }
 firebase_gradle_wired() { grep -q 'firebase-messaging' "$GRADLE" && grep -q 'FCM_PROJECT' "$GRADLE"; }
 stat_icon_present() { [ -f "$STAT_ICON" ]; }
+telecom_installed() { [ -f "$TELECOM_DST" ] && cmp -s "$TELECOM_SRC" "$TELECOM_DST"; }
+telecom_gradle_wired() { grep -q 'core-telecom' "$GRADLE" 2>/dev/null; }
+telecom_permitted() {
+  grep -q 'android.permission.MANAGE_OWN_CALLS' "$MANIFEST" \
+    && grep -q 'android.permission.FOREGROUND_SERVICE_PHONE_CALL' "$MANIFEST"
+}
+telecom_kept() { [ -f "$PRO_FILE" ] && grep -q 'TelecomBridge' "$PRO_FILE"; }
+callui_installed() { [ -f "$CALLUI_DST" ] && cmp -s "$CALLUI_SRC" "$CALLUI_DST"; }
+callui_manifest_wired() {
+  grep -q '"\.CallActivity"' "$MANIFEST" \
+    && grep -q '"\.CallRingService"' "$MANIFEST" \
+    && grep -q 'android:showWhenLocked="true"' "$MANIFEST" \
+    && grep -q 'android:turnScreenOn="true"' "$MANIFEST" \
+    && grep -q '"\.CallAudioService"' "$MANIFEST" \
+    && grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' "$MANIFEST"
+}
 notify_kept() { [ -f "$PRO_FILE" ] && grep -q 'NotificationBridge' "$PRO_FILE" && grep -q 'UnifiedPushReceiver' "$PRO_FILE"; }
 perm_forwarder_wired() { grep -q "SONA-PERM" "$ACTIVITY"; }
 context_wired() { grep -q "SONA-CONTEXT" "$ACTIVITY"; }
 GRADLE="$GEN_DIR/app/build.gradle.kts"
+ROOT_GRADLE="$GEN_DIR/build.gradle.kts"
+kotlin_bumped() { grep -q 'kotlin-gradle-plugin:2\.' "$ROOT_GRADLE" 2>/dev/null; }
 signing_wired() { grep -q 'signingConfigs' "$GRADLE" 2>/dev/null; }
 media_permitted() {
   grep -q 'android.permission.CAMERA' "$MANIFEST" \
@@ -182,6 +214,7 @@ if [ "$MODE" = "check" ]; then
   if notify_installed; then note "notification pipeline (SonaApp/NotificationBridge/Boot/FCM): installed"; else note "notification pipeline: MISSING or stale"; ok=1; fi
   if notify_manifest_wired; then note "notification manifest wiring: present"; else note "notification manifest wiring: MISSING"; ok=1; fi
   if up_queries_wired; then note "UnifiedPush distributor <queries>: present"; else note "UnifiedPush distributor <queries>: MISSING (distributor discovery empty on Android 11+)"; ok=1; fi
+  if gms_queries_wired; then note "Play services <queries>: present"; else note "Play services <queries>: MISSING (FCM reported unavailable even where Play is installed)"; ok=1; fi
   if memtag_wired; then note "memtagMode (MTE opt-in): present"; else note "memtagMode (MTE opt-in): MISSING"; ok=1; fi
   if attest_installed; then note "HwAttest.kt: installed (current)"; else note "HwAttest.kt: MISSING or stale"; ok=1; fi
   if attest_kept; then note "proguard keep rule (HwAttest): present"; else note "proguard keep rule (HwAttest): MISSING"; ok=1; fi
@@ -194,6 +227,13 @@ if [ "$MODE" = "check" ]; then
   if update_installed; then note "UpdateBridge.kt: installed (current)"; else note "UpdateBridge.kt: MISSING or stale"; ok=1; fi
   if update_wired; then note "update install wiring (permission + result receiver): present"; else note "update install wiring: MISSING"; ok=1; fi
   if update_kept; then note "proguard keep rule (UpdateBridge): present"; else note "proguard keep rule (UpdateBridge): MISSING"; ok=1; fi
+  if telecom_installed; then note "TelecomBridge.kt: installed (current)"; else note "TelecomBridge.kt: MISSING or stale"; ok=1; fi
+  if telecom_gradle_wired; then note "gradle: core-telecom + coroutines wired"; else note "gradle: core-telecom NOT wired"; ok=1; fi
+  if telecom_permitted; then note "telecom permissions (MANAGE_OWN_CALLS + phoneCall FGS): present"; else note "telecom permissions: MISSING"; ok=1; fi
+  if callui_installed; then note "CallActivity.kt: installed (current)"; else note "CallActivity.kt: MISSING or stale"; ok=1; fi
+  if callui_manifest_wired; then note "call UI: CallActivity (showWhenLocked) + CallRingService (phoneCall) declared"; else note "call UI: NOT declared (a locked phone gets a redacted notification, not a call screen)"; ok=1; fi
+  if telecom_kept; then note "proguard keep rule (TelecomBridge): present"; else note "proguard keep rule (TelecomBridge): MISSING"; ok=1; fi
+  if kotlin_bumped; then note "Kotlin plugin: 2.x (Core-Telecom metadata readable)"; else note "Kotlin plugin: 1.9 (too old for core-telecom's 2.x metadata)"; ok=1; fi
   exit "$ok"
 fi
 
@@ -802,6 +842,19 @@ else
   note "UnifiedPush distributor <queries> declared"
 fi
 
+# ---------------------- 15c2b. Manifest: Play services package visibility
+# The same Android 11+ filtering hides com.google.android.gms from getPackageInfo, and
+# SonaApp gates Firebase init on that check (internal/CALL_PLAN.md §10.1: no FCM class is loaded
+# when Play is absent). Without this declaration the check is false on EVERY phone, so a
+# stock device would silently lose its FCM wake path. Added inside the block above —
+# a manifest may carry only one <queries> element.
+if gms_queries_wired; then
+  note "Play services <queries> already present — skipping"
+else
+  sed -i 's|</queries>|    <package android:name="com.google.android.gms" />\n    </queries>|' "$MANIFEST"
+  note "Play services <queries> declared"
+fi
+
 # ---------------------- 15c3. HwAttest.kt (device-link hardware attestation)
 # Ephemeral Keystore attestation chain for link requests, driven from Rust over JNI
 # reflection (hw_attest.rs) — needs an install + a proguard keep like the other bridges.
@@ -831,6 +884,111 @@ if firebase_gradle_wired; then
 else
   python3 "$SCRIPT_DIR/patch-gradle-fcm.py" "$GRADLE"
   note "gradle: firebase-messaging + FCM build fields wired"
+fi
+
+# ---------------------- 15d1. Kotlin 2.x for the generated project
+# The Tauri template pins the Kotlin Gradle plugin at 1.9.25, but Core-Telecom (and the
+# AndroidX/coroutines artifacts it pulls) ship class metadata version 2.1 — a 1.9 compiler
+# cannot read it, and the failure lands on EVERY Kotlin file in the project, including
+# wry's generated activity ("Class 'kotlin.Unit' was compiled with an incompatible
+# version of Kotlin"). Bumping the plugin is the fix; the sources here are plain Kotlin
+# and compile unchanged under K2.
+if kotlin_bumped; then
+  note "Kotlin plugin already 2.x — skipping"
+else
+  sed -i 's|kotlin-gradle-plugin:1\.[0-9.]*|kotlin-gradle-plugin:2.1.20|' "$ROOT_GRADLE"
+  note "Kotlin Gradle plugin bumped to 2.1.20 (Core-Telecom metadata)"
+fi
+
+# ---------------------- 15d2. Core-Telecom: the call lifecycle + audio-route authority
+# TelecomBridge.kt (CallsManager, CallControlScope per call, endpoint flows), the
+# permissions Telecom requires of a self-managed calling app, the pinned dependency, and
+# a keep rule -- the bridge is reached from Rust over JNI reflection only.
+if telecom_installed; then
+  note "TelecomBridge.kt already current — skipping"
+else
+  cp "$TELECOM_SRC" "$TELECOM_DST"
+  note "TelecomBridge.kt installed"
+fi
+
+if telecom_permitted; then
+  note "telecom permissions already present — skipping"
+else
+  # MANAGE_OWN_CALLS: required of every self-managed calling app.
+  # FOREGROUND_SERVICE_PHONE_CALL: the phoneCall FGS type Core-Telecom promotes an
+  # ongoing call with on Android 14+. Both are normal (non-runtime) permissions.
+  grep -q 'android.permission.MANAGE_OWN_CALLS' "$MANIFEST" || sed -i \
+    's|<application|<uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />\n    <application|' "$MANIFEST"
+  grep -q 'android.permission.FOREGROUND_SERVICE_PHONE_CALL' "$MANIFEST" || sed -i \
+    's|<application|<uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />\n    <application|' "$MANIFEST"
+  note "telecom permissions (MANAGE_OWN_CALLS + FOREGROUND_SERVICE_PHONE_CALL) added"
+fi
+
+if telecom_gradle_wired; then
+  note "gradle core-telecom wiring already present — skipping"
+else
+  python3 "$SCRIPT_DIR/patch-gradle-telecom.py" "$GRADLE"
+fi
+
+if telecom_kept; then
+  note "proguard keep rule (TelecomBridge) already present — skipping"
+else
+  cat >> "$PRO_FILE" <<'EOF'
+# TelecomBridge is reached from Rust over JNI reflection only — keep it, and keep the
+# Core-Telecom classes its callbacks are typed against.
+-keep class app.sona.messenger.TelecomBridge { *; }
+-keep class app.sona.messenger.TelecomBridge$* { *; }
+-keep class androidx.core.telecom.** { *; }
+EOF
+  note "proguard keep rule (TelecomBridge) appended"
+fi
+
+# ---------------------- 15d3. The incoming-call screen + the ring's foreground service
+# CallActivity.kt (a bare Answer/Decline screen that may show over the keyguard) and the
+# manifest declarations it and CallRingService need.
+#
+# A self-managed Telecom call gets NO system call UI — the platform draws one for managed
+# connection services only — so without this the ring's entire presence on a locked phone
+# was a notification the lock screen redacted down to a line of text with no buttons.
+# showWhenLocked/turnScreenOn are the whole point of the activity; phoneCall is the FGS
+# type that keeps the process unfrozen for the ring window.
+if callui_installed; then
+  note "CallActivity.kt already current — skipping"
+else
+  cp "$CALLUI_SRC" "$CALLUI_DST"
+  note "CallActivity.kt installed"
+fi
+
+if callui_manifest_wired; then
+  note "call UI manifest wiring already present — skipping"
+else
+  # taskAffinity="" + excludeFromRecents: a task of its own, so a call over the keyguard
+  # can never bring the app's task (and a conversation with it) up behind it, and the
+  # screen never lingers in recents. singleInstance keeps one ring screen, ever.
+  # '#' as the sed delimiter here, not '|': the configChanges value is pipe-separated.
+  grep -q '"\.CallActivity"' "$MANIFEST" || sed -i \
+    's#</application>#    <activity\n        android:name=".CallActivity"\n        android:exported="false"\n        android:showWhenLocked="true"\n        android:turnScreenOn="true"\n        android:excludeFromRecents="true"\n        android:taskAffinity=""\n        android:launchMode="singleInstance"\n        android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode"\n        android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />\n    </application>#' "$MANIFEST"
+  grep -q '"\.CallRingService"' "$MANIFEST" || sed -i \
+    's|</application>|    <service\n        android:name=".CallRingService"\n        android:exported="false"\n        android:foregroundServiceType="phoneCall" />\n    </application>|' "$MANIFEST"
+  # CallAudioService: the microphone hold for the duration of a call.
+  #
+  # Android's while-in-use rule strips mic, camera and location from any foreground service
+  # STARTED while the app is in the background — the declared type does not matter, and
+  # CallRingService is always background-started because a push wake is what starts it:
+  #
+  #   W ActivityManager: Foreground service started from background can not have
+  #   location/camera/microphone access: service app.sona.messenger/.CallRingService
+  #
+  # So the mic survived only while the UI was on screen and died the moment the phone was
+  # locked — the far end went silent while we still heard them. This service is started from
+  # MediaBridge.startVoiceMic, which always has an Activity and so always runs foreground,
+  # and it holds mic access from there for as long as the call lasts.
+  grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' "$MANIFEST" || sed -i \
+    's|<application|<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />\n    <application|' "$MANIFEST"
+  # '#' as the sed delimiter, not '|': foregroundServiceType is pipe-separated here too.
+  grep -q '"\.CallAudioService"' "$MANIFEST" || sed -i \
+    's#</application>#    <service\n        android:name=".CallAudioService"\n        android:exported="false"\n        android:foregroundServiceType="microphone|phoneCall" />\n    </application>#' "$MANIFEST"
+  note "call UI manifest wiring applied (CallActivity showWhenLocked + CallRingService phoneCall + CallAudioService microphone)"
 fi
 
 # ---------------------- 15e. Monochrome status-bar icon (ic_stat_sona)

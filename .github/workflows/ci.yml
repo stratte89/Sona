@@ -44,6 +44,42 @@ jobs:
         working-directory: ${{ matrix.workspace.dir }}
         run: cargo clippy --all-targets ${{ matrix.workspace.flags }} -- -D warnings
 
+  # The Tauri shell is a DETACHED package (its own [workspace]), so neither matrix leg
+  # above compiles it — which meant the whole desktop crate had no CI at all. That is how
+  # a one-enum audio regression (see docs/CALL_AUDIO.md) went six releases unnoticed with
+  # nothing able to catch it. Lib tests only: no webview is driven here, just the logic
+  # that has unit tests, including the audio buffer-size guards.
+  desktop:
+    name: test & clippy (desktop shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri + audio system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libasound2-dev libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/desktop/src-tauri
+      - name: cargo fmt
+        working-directory: clients/desktop/src-tauri
+        run: cargo fmt --all --check
+      - name: cargo test
+        working-directory: clients/desktop/src-tauri
+        # --lib: the harness tests that drive real speakers are #[ignore]d and stay that way.
+        run: cargo test --lib
+      - name: cargo clippy
+        working-directory: clients/desktop/src-tauri
+        # Not `-D warnings` yet: this crate carries a backlog the other two do not, and a
+        # gate nobody can turn green gets deleted. Tighten once the backlog is cleared.
+        run: cargo clippy --all-targets
+
   audit:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest

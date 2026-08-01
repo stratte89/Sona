@@ -6,6 +6,15 @@ impl Client {
     /// number — but do NOT start a session yet. Lets the caller check the key against a
     /// previously-pinned one before trusting it.
     pub async fn discover(&self, account: &Account, username: &str) -> Result<Discovered> {
+        self.discover_as(&account.ratchet_ref().identity_key(), username)
+            .await
+    }
+
+    /// [`discover`](Self::discover) without the account: the safety number needs only our
+    /// own identity key, so a shell that must not hold its session lock across the network
+    /// can snapshot that key, discover off-lock, and call
+    /// [`start_session`](Self::start_session) once it takes the lock back.
+    pub async fn discover_as(&self, my_identity_key: &str, username: &str) -> Result<Discovered> {
         let hash = IdentityHash::from_identifier(username).as_str().to_string();
 
         let resp = self
@@ -42,7 +51,7 @@ impl Client {
             return Err(ClientError::KtVerification(check));
         }
 
-        let safety = safety_number(&account.ratchet_ref().identity_key(), &bundle.identity_key);
+        let safety = safety_number(my_identity_key, &bundle.identity_key);
         Ok(Discovered {
             username: username.to_string(),
             identity_hash: hash,

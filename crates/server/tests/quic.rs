@@ -179,6 +179,63 @@ async fn quic_members_pair_datagrams_and_streams_flow() {
     assert!(next_line(&mut b.ctrl).await.contains("peer_left"));
 }
 
+/// Voice must not wait behind a video frame that is still arriving.
+///
+/// A reliable stream is only complete when its last byte lands, and on a congested or
+/// lossy uplink that can be a retransmit away — tens to hundreds of milliseconds. The
+/// relay used to read datagrams and drain uni streams in one `select!`, so those
+/// milliseconds were milliseconds it also spent not forwarding voice: one screen share
+/// made both parties' speech break up. The two paths now live in separate tasks, and this
+/// is the property that says so — a video stream deliberately left half-written must cost
+/// the voice path nothing at all.
+#[tokio::test]
+async fn a_half_sent_video_frame_does_not_stall_voice() {
+    let (_ws, addr, hash) = spawn_relay().await;
+
+    let mut a = quic_join(addr, &hash, CALL_ID).await;
+    next_line(&mut a.ctrl).await;
+    let mut b = quic_join(addr, &hash, CALL_ID).await;
+    assert!(next_line(&mut b.ctrl).await.contains(r#""peers":2"#));
+    assert!(next_line(&mut a.ctrl).await.contains("peer_joined"));
+
+    // A video frame that starts and then hangs: the length prefix promises a second cell
+    // that never comes, so the relay's `read_to_end` on this stream cannot finish. The
+    // stream is deliberately *not* finished and stays open for the rest of the test.
+    let cells = vec![vec![1u8; 1049], vec![1u8; 800]];
+    let framed = frame_cells(&cells);
+    let mut stuck = a.conn.open_uni().await.unwrap();
+    stuck.write_all(&framed[..framed.len() / 2]).await.unwrap();
+
+    // Voice keeps its cadence straight through it. Every frame must arrive, in order,
+    // while that stream is still outstanding.
+    for i in 0..10u8 {
+        let mut voice = vec![0u8; 280];
+        voice[279] = i; // marker, so ordering is checked and not just arrival
+        a.conn.send_datagram(voice.clone().into()).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), b.conn.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("voice frame {i} stalled behind an unfinished video frame"))
+            .unwrap();
+        assert_eq!(
+            got.as_ref(),
+            &voice[..],
+            "voice frame {i} arrived corrupted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // And the video frame still completes normally once its bytes do arrive — decoupling
+    // the two paths must not have cost the reliable path its reliability.
+    stuck.write_all(&framed[framed.len() / 2..]).await.unwrap();
+    stuck.finish().unwrap();
+    let mut incoming = tokio::time::timeout(std::time::Duration::from_secs(5), b.conn.accept_uni())
+        .await
+        .expect("the completed frame still crosses")
+        .unwrap();
+    let group = incoming.read_to_end(1 << 20).await.unwrap();
+    assert_eq!(parse_cells(&group).unwrap(), cells);
+}
+
 #[tokio::test]
 async fn mixed_ws_and_quic_members_bridge_both_framings() {
     let (base, addr, hash) = spawn_relay().await;

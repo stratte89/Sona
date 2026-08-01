@@ -27,6 +27,61 @@ second own device cancels the ring here; a caller hang-up pre-answer yields
 "Missed call"; an unanswered ring stops at 45 s with a missed-call entry; no double
 audio when the app is foregrounded.
 
+## Calls: Core-Telecom, arbitration, and the locked path
+
+The call-reliability work (`internal/CALL_PLAN.md`, which the `§` refs below cite) added
+surfaces the matrix above cannot
+reach. These need real hardware and, for several rows, a second and third device.
+
+**Telecom lifecycle and audio route** (§12.4). Voice and video, incoming and outgoing:
+
+| Case | Expect |
+|---|---|
+| Answer/hang up from a **Bluetooth headset**, a watch, or a car head unit | works — the call is a system call, not a notification action |
+| Route switch earpiece ↔ speaker ↔ Bluetooth ↔ wired | Telecom's endpoint changes; the in-call UI shows the endpoint Telecom actually selected, not the one requested |
+| Bluetooth connects/disconnects mid-ring and mid-call | route follows; no dead audio |
+| **Cellular call arrives** during a Sona ring, and during an active Sona call | the Sona call goes inactive (muted, not torn down) and comes back when the cellular call ends |
+| Mic/camera permission granted **during** connect | capture restarts; the call does not silently continue with no audio |
+| Audio fails to start | the call fails visibly — never a connected call with no sound |
+| Process killed mid-ring (`am kill`), then reopened | reconciliation restores a still-valid ring and disconnects one that ended; **no duplicate missed-call entry**, and no ring raised merely because a stored row exists |
+
+**Unlock-to-answer** (§8), with the vault locked, once per lock method (fingerprint,
+PIN-only, password-only):
+
+- Answer from the lock screen → the ringtone stops at once and the call shows
+  *connecting*, then Sona's unlock appears. Media starts only after the unlock.
+- Other devices **keep ringing** while this phone waits — it has won nothing yet.
+- Cancel or fail the unlock → only this device disconnects; a sibling can still answer.
+- Let the unlock time out (45 s) → no permanently "connecting" system call is left.
+- Unlock *after* the call already ended → the tombstone disconnects it; no late answer.
+- With the setting **off** and auto-unlock on, the answer completes without a prompt.
+
+**Multi-device arbitration** (§12.2). Run with Android as primary and as linked,
+paired with Windows and with Linux, and once with two Android devices:
+
+- every device rings within a second or so of the others (this is what the concurrent
+  fan fixed — a 10–15 s linked-device lag is a regression);
+- the first device to answer wins; **every** other device stops ringing, with the right
+  wording (*answered elsewhere* vs *declined elsewhere* vs *cancelled*);
+- answer on two devices at nearly the same instant → exactly one connects;
+- a busy device reports busy **without** ending the ring on its siblings;
+- caller cancels → every device stops, including one that is locked, Dozing, or was
+  process-killed after posting its ring;
+- no device rings after a prior terminal, and no duplicate missed-call chip appears.
+
+**GrapheneOS** (§10.4). Both configurations — no Play services with a UnifiedPush
+distributor, and sandboxed Play with FCM:
+
+- delivery mode resolves to **C+P** by itself where a wake transport exists, and to
+  **C** where none does (never P), with the health panel saying so honestly;
+- revoke Sona's **Network** permission → the panel says no network and names the
+  permission, rather than blaming delivery;
+- with a SOCKS/Tor proxy set, calls use the relay WebSocket media path — verify no UDP
+  leaves the device for a call;
+- hardware attestation `SelfSigned` with a locked bootloader must not gate calls;
+- force-stop and a paused profile: nothing arrives until the user reopens Sona — expected,
+  and the docs must not claim otherwise.
+
 ## adb crib
 
 ```sh
@@ -65,5 +120,12 @@ adb logcat -s SonaRust SonaDelivery SonaDrain
 - Message *content* above the user's chosen notification level in
   `dumpsys notification --noredact`.
 - An expired disappearing message still readable in the shade after its timer.
-- A wake payload with anything beyond `{"t":"m"}` / `{"t":"c"}` (check FCM
-  diagnostics / the relay logs).
+- A wake payload with anything beyond `{"t":"m"}` / `{"t":"c"}` / `{"t":"x"}` (check FCM
+  diagnostics / the relay logs), or a UnifiedPush body beyond the constant
+  `wake` / `wake-call` / `wake-call-control`.
+- A second ring for one call — a capsule ring and an encrypted-offer ring must converge
+  on one system call, one notification, and one ringtone.
+- A ring that outlives its call: after answer-elsewhere, decline, or caller cancel, the
+  phone must go quiet even if it is locked and was asleep.
+- A media room id (`call_id`) in the platform call log, a notification, or any push
+  payload — it is a capability, and the ring handle exists so it never leaks.

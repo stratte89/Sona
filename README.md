@@ -96,8 +96,8 @@ Double Ratchet), [ct-merkle](https://github.com/rozbb/ct-merkle) (RFC 6962, the
 construction behind Certificate Transparency), Argon2id + XChaCha20-Poly1305, Ed25519.
 One Rust crypto core, compiled directly into every client.
 
-**352 tests green** (176 backend + 147 client SDK + 29 app shell), clippy-clean,
-fmt-gated, fuzzed, security-audited with every finding remediated. A further 7 are
+**366 tests green** (177 backend + 147 client SDK + 42 app shell), clippy-clean,
+fmt-gated, fuzzed, security-audited with every finding remediated. A further 6 are
 `#[ignore]`d because they need real hardware — a GPU encoder, a microphone, a screen.
 
 ## The docs
@@ -111,6 +111,7 @@ fmt-gated, fuzzed, security-audited with every finding remediated. A further 7 a
 | [GROUPS.md](docs/GROUPS.md) | invisible groups: signed membership epochs + content quarantine |
 | [MULTI_DEVICE.md](docs/MULTI_DEVICE.md) | linking, device rosters in KT, revocation, history sync |
 | [NOTIFICATIONS.md](docs/NOTIFICATIONS.md) | the delivery engine, native ring, and content-free push |
+| [CALL_AUDIO.md](docs/CALL_AUDIO.md) | the voice/screen-share audio path, echo cancellation, and how to measure it locally |
 | [NOTIFICATIONS_TESTING.md](docs/NOTIFICATIONS_TESTING.md) | the on-device Doze/OEM-killer test protocol |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | self-hosting: Docker/systemd, the three secrets, access tiers, auditing |
 | [ANDROID_HARDENING.md](docs/ANDROID_HARDENING.md) | the mobile attack surface and what's done about it |

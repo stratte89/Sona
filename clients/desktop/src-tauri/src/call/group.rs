@@ -1,10 +1,11 @@
+use super::group_control::{
+    send_group_call_claim_to_coordinator, send_offers_for_group, spawn_group_no_answer_timeout,
+};
 use crate::*;
 
 /// Establish the pair leg toward `peer_key`, once we know they are in the call.
 ///
-/// Owner rule: the pair room is the one minted by the lexicographically smaller
-/// identity key — both sides compute this locally and converge on one room with no
-/// extra round trip; the loser's lonely room is reaped by the relay's GC.
+/// The lexicographically smaller identity key owns each pair room.
 ///
 /// A room key is used **once, ever** (`used_call_ids`): if we own the pair and our
 /// current ticket was already consumed (their leg died and they are rejoining), we
@@ -18,108 +19,59 @@ pub(crate) async fn establish_group_leg(
     username: String,
     their_ticket: Option<(String, String)>,
 ) {
-    // ── Decide the room under the session lock; send a fresh offer if we must mint. ──
-    let (call_id, key_b64, caller, leg_tx) = {
+    let (i_own, group_id, ring_id, coordinator, current_ticket, known_member) = {
+        let s = inner.lock().await;
+        let Some(gc) = s
+            .group_call
+            .as_ref()
+            .filter(|g| g.call_instance == call_instance)
+        else {
+            return;
+        };
+        if gc.legs_added.contains(&peer_key) {
+            return;
+        }
+        (
+            gc.my_key.as_str() < peer_key.as_str(),
+            gc.group_id.clone(),
+            gc.ring_id.clone(),
+            gc.coordinator.clone(),
+            gc.my_tickets
+                .get(&username)
+                .filter(|(id, _)| !gc.used_call_ids.contains(id))
+                .cloned(),
+            gc.my_tickets.contains_key(&username),
+        )
+    };
+    let ticket = if i_own {
+        match current_ticket {
+            Some(t) => Some(t),
+            // Our ticket was consumed — the peer's old leg died and they are
+            // rejoining. Mint a fresh room (a key is used once, ever) and offer it
+            // through the roster-resolved member (not the claimed username).
+            None if known_member => {
+                reoffer_group_leg(
+                    &inner,
+                    &client,
+                    &call_instance,
+                    &group_id,
+                    &ring_id,
+                    &coordinator,
+                    &username,
+                )
+                .await
+            }
+            None => return, // not a member we rang — refuse quietly
+        }
+    } else {
+        // They own the pair: join the room from THEIR offer (arrives with presence).
+        their_ticket
+    };
+    let Some((call_id, key_b64)) = ticket else {
+        return; // their offer hasn't arrived yet; it will
+    };
+    let (caller, leg_tx) = {
         let mut s = inner.lock().await;
-        // Snapshot what the decision needs, then release the ctl borrow.
-        let (i_own, group_id, current_ticket, known_member) = {
-            let Some(gc) = s
-                .group_call
-                .as_ref()
-                .filter(|g| g.call_instance == call_instance)
-            else {
-                return;
-            };
-            if gc.legs_added.contains(&peer_key) {
-                return;
-            }
-            (
-                gc.my_key.as_str() < peer_key.as_str(),
-                gc.group_id.clone(),
-                gc.my_tickets
-                    .get(&username)
-                    .filter(|(id, _)| !gc.used_call_ids.contains(id))
-                    .cloned(),
-                gc.my_tickets.contains_key(&username),
-            )
-        };
-        let ticket = if i_own {
-            match current_ticket {
-                Some(t) => Some(t),
-                // Our ticket was consumed — the peer's old leg died and they are
-                // rejoining. Mint a fresh room (a key is used once, ever) and offer it
-                // through the roster-resolved member (not the claimed username).
-                None if known_member => {
-                    let fresh = client_core::call::CallTicket::mint();
-                    let member = s
-                        .history
-                        .group(&group_id)
-                        .and_then(|g| g.members.iter().find(|m| m.username == username).cloned());
-                    let Some(member) = member else { return };
-                    let multi = s.multi_device;
-                    {
-                        let sess = &mut *s;
-                        let Some(account) = sess.account.as_mut() else {
-                            return;
-                        };
-                        let Ok(contact) = client.member_contact(account, &member).await else {
-                            return;
-                        };
-                        if client
-                            .send_group_call_offer(
-                                account,
-                                &contact,
-                                &group_id,
-                                &call_instance,
-                                &fresh.call_id,
-                                &fresh.key_b64,
-                            )
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if multi {
-                            if let Ok(extras) = client
-                                .extra_group_call_offer_envelopes(
-                                    account,
-                                    &mut sess.history,
-                                    &contact,
-                                    &group_id,
-                                    &call_instance,
-                                    &fresh.call_id,
-                                    &fresh.key_b64,
-                                )
-                                .await
-                            {
-                                for env in &extras {
-                                    let _ = client.post_envelope(env).await;
-                                }
-                            }
-                        }
-                    }
-                    let _ = s.persist();
-                    if let Some(gc) = s
-                        .group_call
-                        .as_mut()
-                        .filter(|g| g.call_instance == call_instance)
-                    {
-                        gc.my_tickets.insert(
-                            username.clone(),
-                            (fresh.call_id.clone(), fresh.key_b64.clone()),
-                        );
-                    }
-                    Some((fresh.call_id, fresh.key_b64))
-                }
-                None => return, // not a member we rang — refuse quietly
-            }
-        } else {
-            // They own the pair: join the room from THEIR offer (arrives with presence).
-            their_ticket
-        };
-        let Some((call_id, key_b64)) = ticket else {
-            return; // their offer hasn't arrived yet; it will
-        };
         let Some(gc) = s
             .group_call
             .as_mut()
@@ -131,7 +83,7 @@ pub(crate) async fn establish_group_leg(
             return; // raced another establish, or the key was already used once — never re-derive
         }
         gc.legs_added.insert(peer_key.clone());
-        (call_id, key_b64, i_own, gc.leg_tx.clone())
+        (i_own, gc.leg_tx.clone())
     };
 
     // ── Join the room off-lock and hand the leg to the engine. ──
@@ -161,47 +113,104 @@ pub(crate) async fn establish_group_leg(
     }
 }
 
-/// Send our leave/decline for `call_instance` to every other group member (and, on a
-/// multi-device relay, every device in their verified roster). Best-effort.
-pub(crate) async fn send_group_call_end_everywhere(
+/// Mint and offer a fresh pair room to one member whose leg died, with the session lock
+/// released across the relay post. `None` when the member is unreachable or the call
+/// ended meanwhile.
+async fn reoffer_group_leg(
+    inner: &Arc<Mutex<Session>>,
     client: &Arc<Client>,
-    s: &mut Session,
-    group_id: &str,
     call_instance: &str,
-) {
-    let Some(group) = s.history.group(group_id).cloned() else {
-        return;
-    };
-    let multi = s.multi_device;
-    let sess = &mut *s;
-    let Some(account) = sess.account.as_mut() else {
-        return;
-    };
-    let me = account.account_id().to_string();
-    for member in group.members.iter().filter(|m| m.username != me) {
-        let Ok(contact) = client.member_contact(account, member).await else {
-            continue;
-        };
-        let _ = client
-            .send_group_call_end(account, &contact, group_id, call_instance)
-            .await;
+    group_id: &str,
+    ring_id: &str,
+    coordinator: &GroupCoordinator,
+    username: &str,
+) -> Option<(String, String)> {
+    let fresh = client_core::call::CallTicket::mint();
+    let offer_id = client_core::callstate::random_call_id();
+    let created_at = now_secs();
+    let ring_expires_at = created_at.saturating_add(client_core::callstate::CALL_RING_TIMEOUT_SECS);
+    let expires_at = created_at.saturating_add(client_core::callstate::CALL_SIGNAL_TTL_SECS);
+    let offers = {
+        let mut s = inner.lock().await;
+        if !is_current(&s, client) {
+            return None;
+        }
+        let member = s
+            .history
+            .group(group_id)
+            .and_then(|g| g.members.iter().find(|m| m.username == username).cloned())?;
+        let caller_device_id = s.history.self_device_id();
+        let multi = s.multi_device;
+        let sess = &mut *s;
+        let account = sess.account.as_mut()?;
+        let contact = client.member_contact_pinned(account, &member)?;
+        let primary = client
+            .prepare_group_call_offer_v2(
+                account,
+                &contact,
+                group_id,
+                call_instance,
+                ring_id,
+                &offer_id,
+                &fresh.call_id,
+                &fresh.key_b64,
+                created_at,
+                ring_expires_at,
+                expires_at,
+                &caller_device_id,
+                &coordinator.username,
+                &coordinator.identity_key,
+                &coordinator.device_id,
+                &coordinator.reply_to_mailbox,
+                true,
+            )
+            .ok()?;
+        let mut offers = vec![primary];
         if multi {
-            if let Ok(extras) = client
-                .extra_group_call_end_envelopes(
-                    account,
-                    &mut sess.history,
-                    &contact,
-                    group_id,
-                    call_instance,
-                )
-                .await
-            {
-                for env in &extras {
-                    let _ = client.post_envelope(env).await;
-                }
+            if let Ok(mut extras) = client.extra_group_call_offer_envelopes_v2(
+                account,
+                &sess.history,
+                &contact,
+                group_id,
+                call_instance,
+                ring_id,
+                &offer_id,
+                &fresh.call_id,
+                &fresh.key_b64,
+                created_at,
+                ring_expires_at,
+                expires_at,
+                &caller_device_id,
+                &coordinator.username,
+                &coordinator.identity_key,
+                &coordinator.device_id,
+                &coordinator.reply_to_mailbox,
+                true,
+            ) {
+                offers.append(&mut extras);
             }
         }
+        let _ = s.persist();
+        offers
+    };
+    if !client
+        .post_envelopes_concurrent(&offers)
+        .await
+        .iter()
+        .any(Result::is_ok)
+    {
+        return None;
     }
+    let mut s = inner.lock().await;
+    let gc = s
+        .group_call
+        .as_mut()
+        .filter(|g| g.call_instance == call_instance)?;
+    gc.my_tickets.insert(
+        username.to_string(),
+        (fresh.call_id.clone(), fresh.key_b64.clone()),
+    );
+    Some((fresh.call_id, fresh.key_b64))
 }
 
 /// Start local audio + the mesh engine and install the [`GroupCallCtl`]. Legs are fed
@@ -210,10 +219,13 @@ pub(crate) async fn send_group_call_end_everywhere(
 pub(crate) async fn spawn_group_call(
     inner: &Arc<Mutex<Session>>,
     client: &Arc<Client>,
-    s: &mut Session,
     group_id: String,
     group_name: String,
     call_instance: String,
+    ring_id: String,
+    ring_handle: String,
+    coordinator: GroupCoordinator,
+    deadline: GroupRingDeadline,
     my_key: String,
     my_tickets: std::collections::HashMap<String, (String, String)>,
 ) -> Result<(), String> {
@@ -227,6 +239,12 @@ pub(crate) async fn spawn_group_call(
         .map_err(|e| e.to_string())??;
 
     let muted = Arc::new(AtomicBool::new(false));
+    // Per-listener volumes, shared with the mixing engine. Seeded per member as their
+    // leg connects (below) — that is the first moment the peer key can be resolved to a
+    // username, and it lands with the first frames.
+    let gains = client_core::groupcall::PeerGains::default();
+    // Mute and shared-audio level are per-call; the saved per-contact levels are not.
+    crate::call::volume::reset_for_new_call();
     let connected: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let connected_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -236,9 +254,11 @@ pub(crate) async fn spawn_group_call(
 
     {
         let muted = muted.clone();
+        let gains = gains.clone();
         eng().spawn(async move {
             let _ =
-                client_core::groupcall::run_group_call(leg_rx, audio, stop_rx, muted, ev_tx).await;
+                client_core::groupcall::run_group_call(leg_rx, audio, stop_rx, muted, gains, ev_tx)
+                    .await;
         });
     }
 
@@ -250,10 +270,40 @@ pub(crate) async fn spawn_group_call(
         let connected = connected.clone();
         let connected_at = connected_at.clone();
         let call_instance = call_instance.clone();
+        let ring_id = ring_id.clone();
+        let gains = gains.clone();
         eng().spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
                 match ev {
                     GroupCallEvent::PeerConnected { peer_key } => {
+                        {
+                            let mut s = inner.lock().await;
+                            let transition = s.calls().registry.transition(
+                                &call_instance,
+                                &ring_id,
+                                client_core::callstate::CallPhase::Active,
+                                now_secs(),
+                            );
+                            if !matches!(
+                                transition,
+                                client_core::callstate::TransitionDecision::Applied
+                                    | client_core::callstate::TransitionDecision::Duplicate
+                            ) {
+                                if let Some(gc) =
+                                    s.group_call.take_if(|g| g.call_instance == call_instance)
+                                {
+                                    let _ = gc.stop.send(true);
+                                }
+                                let _ = record_call_terminal(
+                                    &mut s,
+                                    &call_instance,
+                                    &ring_id,
+                                    client_core::callstate::CallTerminalReason::TransportError,
+                                );
+                                eng().emit("group_call", serde_json::json!({ "kind": "ended" }));
+                                break;
+                            }
+                        }
                         // First flowing leg = the call connected (history-chip duration).
                         let _ = connected_at.compare_exchange(
                             0,
@@ -277,6 +327,16 @@ pub(crate) async fn spawn_group_call(
                             }
                             name
                         };
+                        // Apply this member's remembered volume now that the leg has a
+                        // name to look it up by. Until this point they play as sent,
+                        // which is a frame or two — the event lands with their audio.
+                        {
+                            let s = inner.lock().await;
+                            let gain = s.history.voice_gain(&username);
+                            if gain != client_core::call::GAIN_UNITY {
+                                gains.set(&peer_key, gain);
+                            }
+                        }
                         connected
                             .lock()
                             .unwrap()
@@ -301,7 +361,7 @@ pub(crate) async fn spawn_group_call(
                             .filter(|g| g.call_instance == call_instance)
                         {
                             gc.legs_added.remove(&peer_key);
-                            // A leg that died WITHOUT a GroupCallEnd is a network drop,
+                            // A leg that died WITHOUT a group terminal is a network drop,
                             // not a leave: the pair's owner re-offers a fresh room (see
                             // establish_group_leg — a room key is never reused). The
                             // non-owner side just waits for that offer. Deliberate
@@ -326,7 +386,7 @@ pub(crate) async fn spawn_group_call(
                             let peer_key = peer_key.clone();
                             eng().spawn(async move {
                                 // Grace period: if the peer meant to leave, their
-                                // GroupCallEnd lands within it and marks them departed.
+                                // The terminal lands within it and marks them departed.
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     LEG_REOFFER_DELAY_MS,
                                 ))
@@ -383,17 +443,30 @@ pub(crate) async fn spawn_group_call(
         });
     }
 
+    let mut s = inner.lock().await;
+    // The lock was released across audio start-up: a coordinator cancellation or our own
+    // hangup may have ended this call in the meantime.
+    if let Err(error) = call_still_live(&s, client, &call_instance) {
+        let _ = stop_tx.send(true);
+        return Err(error);
+    }
     s.group_call = Some(GroupCallCtl {
         call_instance,
+        ring_id,
+        ring_handle,
         group_id,
         group_name,
+        coordinator,
+        deadline,
         my_key,
         muted,
+        gains: gains.clone(),
         legs_added: std::collections::HashSet::new(),
         my_tickets,
         used_call_ids: std::collections::HashSet::new(),
         departed: std::collections::HashSet::new(),
         reoffer_attempts: std::collections::HashMap::new(),
+        answer_arbiters: std::collections::HashMap::new(),
         connected,
         connected_at,
         leg_tx,
@@ -402,96 +475,39 @@ pub(crate) async fn spawn_group_call(
     Ok(())
 }
 
-/// Ring every member of the group: one fresh pair ticket per member, sent as an offer
-/// over their ratchet session plus multi-device fan copies. Shared by starting a call
-/// and accepting a ring — joining a group call IS this: tell every member "I'm in,
-/// here's our pair room".
-pub(crate) async fn send_offers_for_group(
-    client: &Arc<Client>,
-    s: &mut Session,
-    group_id: &str,
-    call_instance: &str,
-    members: &[client_core::GroupMember],
-) -> Result<std::collections::HashMap<String, (String, String)>, String> {
-    let multi = s.multi_device;
-    let mut my_tickets = std::collections::HashMap::new();
-    let sess = &mut *s;
-    let account = sess.account.as_mut().ok_or("locked")?;
-    for member in members {
-        let ticket = client_core::call::CallTicket::mint();
-        // One unreachable/unresolvable member must not kill the call for everyone —
-        // skip them (their pair simply never forms this call).
-        let Ok(contact) = client.member_contact(account, member).await else {
-            continue;
-        };
-        if client
-            .send_group_call_offer(
-                account,
-                &contact,
-                group_id,
-                call_instance,
-                &ticket.call_id,
-                &ticket.key_b64,
-            )
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        if multi {
-            if let Ok(extras) = client
-                .extra_group_call_offer_envelopes(
-                    account,
-                    &mut sess.history,
-                    &contact,
-                    group_id,
-                    call_instance,
-                    &ticket.call_id,
-                    &ticket.key_b64,
-                )
-                .await
-            {
-                for env in &extras {
-                    let _ = client.post_envelope(env).await;
-                }
-            }
-        }
-        my_tickets.insert(member.username.clone(), (ticket.call_id, ticket.key_b64));
-    }
-    if my_tickets.is_empty() {
-        return Err("no group member could be reached".into());
-    }
-    Ok(my_tickets)
-}
-
 /// Start a group call: ring every member and wait in the (per-pair) rooms we own.
+///
+/// Same lock discipline as [`call_start`]: member rosters are warmed, offers posted, and
+/// pair rooms joined with the session mutex released.
 #[tauri::command]
 pub async fn group_call_start(
     state: tauri::State<'_, AppState>,
     group_id: String,
 ) -> Result<(), String> {
-    let mut s = state.inner.lock().await;
-    if s.call.is_some()
-        || s.incoming.is_some()
-        || s.reconnect.is_some()
-        || s.group_call.is_some()
-        || s.group_incoming.is_some()
-    {
-        return Err("already in a call".into());
-    }
-    let client = s.client.clone().ok_or("not configured")?;
-    let account = s.account.as_ref().ok_or("locked")?;
-    let me = account.account_id().to_string();
-    let my_key = account.ratchet_ref().identity_key();
-    let group = s.history.group(&group_id).ok_or("unknown group")?;
-    crate::cmd::groups::ensure_in_group(group)?;
-    let group_name = group.name.clone();
-    let others: Vec<client_core::GroupMember> = group
-        .members
-        .iter()
-        .filter(|m| m.username != me)
-        .cloned()
-        .collect();
+    let inner = state.inner.clone();
+    let slot = CallSlot::reserve(&inner).await?;
+    let started = group_call_start_inner(&inner, &group_id).await;
+    slot.release().await;
+    started
+}
+
+async fn group_call_start_inner(inner: &Arc<Mutex<Session>>, group_id: &str) -> Result<(), String> {
+    let (client, me, my_key, group_name, others) = {
+        let s = inner.lock().await;
+        let client = s.client.clone().ok_or("not configured")?;
+        let account = s.account.as_ref().ok_or("locked")?;
+        let me = account.account_id().to_string();
+        let my_key = account.ratchet_ref().identity_key();
+        let group = s.history.group(group_id).ok_or("unknown group")?;
+        crate::cmd::groups::ensure_in_group(group)?;
+        let others: Vec<client_core::GroupMember> = group
+            .members
+            .iter()
+            .filter(|m| m.username != me)
+            .cloned()
+            .collect();
+        (client, me, my_key, group.name.clone(), others)
+    };
     if others.is_empty() {
         return Err("this group has no other members".into());
     }
@@ -500,57 +516,92 @@ pub async fn group_call_start(
             "group calls support up to {MAX_GROUP_CALL_MEMBERS} members"
         ));
     }
-    // The instance id is just 128 random bits, exactly like a room id.
-    let call_instance = client_core::call::CallTicket::mint().call_id;
+    // Off-lock: every member's verified roster (so their linked devices are rung) and our
+    // own (for the sibling terminal fan). Preparation below is then network-free.
+    for member in &others {
+        warm_call_routes(inner, &client, &member.username).await;
+    }
+    warm_call_routes(inner, &client, &me).await;
 
-    let my_tickets =
-        send_offers_for_group(&client, &mut s, &group_id, &call_instance, &others).await?;
-    s.persist()?;
+    let call_instance = client_core::call::CallTicket::mint().call_id;
+    let ring_id = client_core::callstate::random_call_id();
+    let created_at = now_secs();
+    let deadline = GroupRingDeadline {
+        created_at,
+        ring_expires_at: created_at.saturating_add(client_core::callstate::CALL_RING_TIMEOUT_SECS),
+        expires_at: created_at.saturating_add(client_core::callstate::CALL_SIGNAL_TTL_SECS),
+    };
+    let coordinator = {
+        let s = inner.lock().await;
+        if !is_current(&s, &client) {
+            return Err("not configured".into());
+        }
+        let coordinator_device_id = s.history.self_device_id();
+        GroupCoordinator {
+            username: me.clone(),
+            identity_key: my_key.clone(),
+            reply_to_mailbox: client
+                .device_mailbox(&me, &coordinator_device_id)
+                .map_err(|error| error.to_string())?,
+            device_id: coordinator_device_id,
+        }
+    };
+
+    let my_tickets = send_offers_for_group(
+        inner,
+        &client,
+        group_id,
+        &call_instance,
+        &ring_id,
+        &coordinator,
+        deadline,
+        &others,
+    )
+    .await?;
+    {
+        let mut s = inner.lock().await;
+        call_still_live(&s, &client, &call_instance)?;
+        let retention = call_retention_secs(&s); // before `s.calls()` borrows mutably
+        let _ = s.calls().registry.receive_offer(
+            &call_instance,
+            &ring_id,
+            deadline.created_at,
+            deadline.ring_expires_at,
+            created_at,
+            retention,
+        );
+        let _ = s.calls().registry.transition(
+            &call_instance,
+            &ring_id,
+            client_core::callstate::CallPhase::Winner,
+            created_at,
+        );
+        s.persist()?;
+    }
     eng().emit(
         "group_call",
         serde_json::json!({ "kind": "outgoing", "group_id": group_id, "name": group_name }),
     );
+    let ring_handle = client_core::callstate::random_call_id();
+    eng().start_system_call(&ring_handle, &group_name, false, false);
     spawn_group_call(
-        &state.inner,
+        inner,
         &client,
-        &mut s,
-        group_id.clone(),
+        group_id.to_string(),
         group_name,
         call_instance.clone(),
+        ring_id,
+        ring_handle,
+        coordinator,
+        deadline,
         my_key,
         my_tickets,
     )
     .await?;
 
     // Ring timeout: nobody joined → tear down and tell everyone we're gone.
-    spawn_group_no_answer_timeout(state.inner.clone(), client, call_instance);
+    spawn_group_no_answer_timeout(inner.clone(), client, call_instance);
     Ok(())
-}
-
-/// Tear the group call down if NOBODY's audio has connected within the ring window —
-/// used by both the starter (nobody answered) and the accepter (everyone was already
-/// gone by the time we joined), so neither side can sit on a spinner forever.
-pub(crate) fn spawn_group_no_answer_timeout(
-    inner: Arc<Mutex<Session>>,
-    client: Arc<Client>,
-    call_instance: String,
-) {
-    eng().spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(RING_TIMEOUT_SECS)).await;
-        let mut s = inner.lock().await;
-        let nobody = s.group_call.as_ref().is_some_and(|g| {
-            g.call_instance == call_instance && g.connected.lock().unwrap().is_empty()
-        });
-        if nobody {
-            if let Some(gc) = s.group_call.take() {
-                let _ = gc.stop.send(true);
-                send_group_call_end_everywhere(&client, &mut s, &gc.group_id, &gc.call_instance)
-                    .await;
-                log_group_call_event(&mut s, &gc.group_id, "📞 Unanswered group call");
-                eng().emit("group_call", serde_json::json!({ "kind": "no_answer" }));
-            }
-        }
-    });
 }
 
 /// Accept the pending group ring: announce ourselves to every member (fresh pair
@@ -564,38 +615,134 @@ pub async fn group_call_accept(state: tauri::State<'_, AppState>) -> Result<(), 
 pub(crate) async fn group_call_accept_inner(inner: &Arc<Mutex<Session>>) -> Result<(), String> {
     let mut s = inner.lock().await;
     let offer = s.group_incoming.take().ok_or("no incoming group call")?;
-    eng().cancel_ring(&offer.call_instance, "");
-    if s.call.is_some() || s.group_call.is_some() {
+    eng().accept_ring(&offer.ring_handle, false);
+    if s.call.is_some()
+        || s.group_call.is_some()
+        || s.claiming.is_some()
+        || s.group_claiming.is_some()
+        || s.call_setup
+    {
         return Err("already in a call".into());
     }
     let client = s.client.clone().ok_or("not configured")?;
-    let account = s.account.as_ref().ok_or("locked")?;
-    let me = account.account_id().to_string();
-    let my_key = account.ratchet_ref().identity_key();
-    let group = s.history.group(&offer.group_id).ok_or("unknown group")?;
-    let others: Vec<client_core::GroupMember> = group
-        .members
-        .iter()
-        .filter(|m| m.username != me)
-        .cloned()
-        .collect();
-
-    let my_tickets = send_offers_for_group(
+    let answering_device_id = s.history.self_device_id();
+    let my_username = s.account.as_ref().ok_or("locked")?.account_id().to_string();
+    let reply_to_mailbox = client
+        .device_mailbox(&my_username, &answering_device_id)
+        .map_err(|error| error.to_string())?;
+    let claim_nonce = client_core::callstate::random_call_id();
+    let expires_at = offer
+        .deadline
+        .expires_at
+        .min(now_secs().saturating_add(client_core::callstate::CALL_SIGNAL_TTL_SECS));
+    if expires_at <= now_secs() {
+        let _ = record_call_terminal(
+            &mut s,
+            &offer.call_instance,
+            &offer.ring_id,
+            client_core::callstate::CallTerminalReason::Expired,
+        );
+        return Err("group call expired".into());
+    }
+    let _ = s.calls().registry.transition(
+        &offer.call_instance,
+        &offer.ring_id,
+        client_core::callstate::CallPhase::Claiming,
+        now_secs(),
+    );
+    send_group_call_claim_to_coordinator(
         &client,
         &mut s,
+        &offer.coordinator,
         &offer.group_id,
         &offer.call_instance,
+        &offer.ring_id,
+        &claim_nonce,
+        &answering_device_id,
+        &reply_to_mailbox,
+        expires_at,
+    )?;
+    s.persist()?;
+    let timeout_claim_nonce = claim_nonce.clone();
+    let timeout_call_instance = offer.call_instance.clone();
+    s.group_claiming = Some(PendingGroupClaim {
+        offer,
+        claim_nonce,
+        answering_device_id,
+    });
+    eng().emit("group_call", serde_json::json!({ "kind": "claiming" }));
+    let inner = inner.clone();
+    eng().spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            expires_at.saturating_sub(now_secs()),
+        ))
+        .await;
+        let mut s = inner.lock().await;
+        if let Some(pending) = s.group_claiming.take_if(|pending| {
+            pending.claim_nonce == timeout_claim_nonce
+                && pending.offer.call_instance == timeout_call_instance
+        }) {
+            let _ = record_call_terminal(
+                &mut s,
+                &pending.offer.call_instance,
+                &pending.offer.ring_id,
+                client_core::callstate::CallTerminalReason::Expired,
+            );
+            log_group_call_event(&mut s, &pending.offer.group_id, "📞 Group call ended");
+            eng().emit("group_call", serde_json::json!({ "kind": "ended" }));
+        }
+    });
+    Ok(())
+}
+
+/// Complete a coordinator-approved group answer. Only the exact winning device reaches
+/// this path; media capabilities remain in the in-memory pending offer until now.
+pub(crate) async fn finish_group_call_accept(
+    inner: &Arc<Mutex<Session>>,
+    client: &Arc<Client>,
+    offer: PendingGroupOffer,
+) -> Result<(), String> {
+    let (me, my_key, others) = {
+        let s = inner.lock().await;
+        let account = s.account.as_ref().ok_or("locked")?;
+        let me = account.account_id().to_string();
+        let my_key = account.ratchet_ref().identity_key();
+        let group = s.history.group(&offer.group_id).ok_or("unknown group")?;
+        let others: Vec<client_core::GroupMember> = group
+            .members
+            .iter()
+            .filter(|member| member.username != me)
+            .cloned()
+            .collect();
+        (me, my_key, others)
+    };
+    // Announce ourselves to every member: warm their rosters off-lock first, exactly as
+    // the coordinator did when it rang.
+    for member in &others {
+        warm_call_routes(inner, client, &member.username).await;
+    }
+    warm_call_routes(inner, client, &me).await;
+    let my_tickets = send_offers_for_group(
+        inner,
+        client,
+        &offer.group_id,
+        &offer.call_instance,
+        &offer.ring_id,
+        &offer.coordinator,
+        offer.deadline,
         &others,
     )
     .await?;
-    s.persist()?;
     spawn_group_call(
         inner,
-        &client,
-        &mut s,
+        client,
         offer.group_id.clone(),
         offer.group_name.clone(),
         offer.call_instance.clone(),
+        offer.ring_id.clone(),
+        offer.ring_handle.clone(),
+        offer.coordinator.clone(),
+        offer.deadline,
         my_key,
         my_tickets,
     )
@@ -612,69 +759,15 @@ pub(crate) async fn group_call_accept_inner(inner: &Arc<Mutex<Session>>) -> Resu
             Some((call_id.clone(), key_b64.clone())),
         ));
     }
-    // Stop our own other devices' ringing (best-effort, after the joins are underway).
-    ring_handled_selfsync(&client, &mut s, &offer.call_instance).await;
-    // Everyone may have left between the ring and our accept: never sit on the
-    // connecting spinner past the ring window.
-    spawn_group_no_answer_timeout(inner.clone(), client, offer.call_instance.clone());
-    Ok(())
-}
-
-/// Decline the pending group ring: tell everyone already in the call (they offered us
-/// a leg) that we're not coming.
-#[tauri::command]
-pub async fn group_call_decline(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut s = state.inner.lock().await;
-    let offer = s.group_incoming.take().ok_or("no incoming group call")?;
-    eng().cancel_ring(&offer.call_instance, "");
-    let client = s.client.clone().ok_or("not configured")?;
-    {
-        let sess = &mut *s;
-        if let Some(account) = sess.account.as_mut() {
-            for (peer_key, (username, _, _)) in &offer.offers {
-                let contact = contact_for(username, peer_key);
-                let _ = client
-                    .send_group_call_end(account, &contact, &offer.group_id, &offer.call_instance)
-                    .await;
-            }
-        }
-    }
-    ring_handled_selfsync(&client, &mut s, &offer.call_instance).await;
-    log_group_call_event(&mut s, &offer.group_id, "📞 Declined group call");
-    s.persist()
-}
-
-/// Leave the live group call (the others keep talking).
-#[tauri::command]
-pub async fn group_call_hangup(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut s = state.inner.lock().await;
-    let Some(gc) = s.group_call.take() else {
-        return Ok(());
-    };
-    let _ = gc.stop.send(true);
-    let client = s.client.clone().ok_or("not configured")?;
-    send_group_call_end_everywhere(&client, &mut s, &gc.group_id, &gc.call_instance).await;
-    log_group_call_event(
-        &mut s,
-        &gc.group_id,
-        &call_end_label(
-            "Group call",
-            true,
-            gc.connected_at.load(std::sync::atomic::Ordering::Relaxed),
-        ),
+    // Redundant self-terminal survives a reordered or lost coordinator winner.
+    ring_terminal_selfsync(
+        client,
+        &mut *inner.lock().await,
+        &offer.call_instance,
+        &offer.ring_id,
+        client_core::callstate::CallTerminalReason::AnsweredElsewhere,
     );
-    s.persist()?;
-    Ok(())
-}
-
-/// Mute/unmute the group-call microphone (wire cadence unchanged, like 1:1).
-#[tauri::command]
-pub async fn group_call_set_muted(
-    state: tauri::State<'_, AppState>,
-    muted: bool,
-) -> Result<(), String> {
-    let s = state.inner.lock().await;
-    let gc = s.group_call.as_ref().ok_or("no active group call")?;
-    gc.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+    // Bound connecting if everyone left between the ring and our accept.
+    spawn_group_no_answer_timeout(inner.clone(), client.clone(), offer.call_instance.clone());
     Ok(())
 }

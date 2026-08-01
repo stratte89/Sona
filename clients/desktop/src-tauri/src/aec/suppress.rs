@@ -2,6 +2,7 @@
 //! overlap-add resynthesis. See the module docs on [`super`] for why it is built this
 //! way; this file is the arithmetic.
 
+use super::delay;
 use client_core::call::{SAMPLES_PER_FRAME, SAMPLE_RATE};
 use client_core::media::SCREEN_AUDIO_SAMPLES;
 
@@ -25,25 +26,34 @@ const OLA_NORM: f32 = 1.5;
 pub const LATENCY: usize = FFT_N;
 
 /// Longest echo delay searched: device output buffering + loopback capture buffering +
-/// the worker's own lag. Half a second is far past anything a sound server does.
+/// the worker's own lag.
+///
+/// Half a second, and it is tighter than it looks: a click played through the real
+/// playout and timed back off the real monitor on a PipeWire desktop takes 423-443 ms
+/// (see `media_shell::echo_loopback_test`). Widening it to a second was tried and
+/// reverted — it bought no lock in the harness and cost 1.9 dB in the drift test, because
+/// a larger search range is also more room for a spurious peak. Left where it is until
+/// something measured argues otherwise.
 const MAX_LAG_HOPS: usize = 384;
 pub(super) const MAX_LAG_SAMPLES: usize = MAX_LAG_HOPS * HOP;
-/// Correlation window for the delay estimate (~0.34 s of speech is plenty).
-const EST_HOPS: usize = 256;
-/// Envelope history: the whole search range plus the window laid against it.
-const ENV_HOPS: usize = MAX_LAG_HOPS + EST_HOPS + 4;
 /// Re-estimate the delay this often (~0.25 s) so drift is corrected long before it
 /// exceeds one hop.
 const EST_INTERVAL_HOPS: usize = 188;
-/// Window for refining the hop-resolution estimate to a single sample (~0.1 s).
-const FINE_WINDOW: usize = 4800;
 /// Sample history per signal. Must hold the deepest aligned read — the fine
 /// refinement's window laid `MAX_LAG` back — plus an analysis window.
 const HIST: usize = 1 << 16;
 const HIST_MASK: u64 = HIST as u64 - 1;
 
-/// Minimum normalized envelope correlation to believe a delay estimate.
-const LOCK_CORR: f32 = 0.35;
+/// Capture window handed to the delay estimator (~0.34 s), and the transform size that
+/// covers it plus the whole search range.
+const DELAY_WIN: usize = 16_384;
+const DELAY_FFT_N: usize = 65_536;
+/// How far the winning peak must stand above the best competing peak elsewhere in the
+/// search range before it is believed. A correlation surface with two comparable peaks is
+/// telling us it does not know, and acting on it is worse than passing the audio through:
+/// a wrong alignment is subtracted noise, and re-aligning discards everything learned
+/// about the echo path.
+const PEAK_DOMINANCE: f32 = 1.5;
 /// Reference power below which a bin says nothing about the echo path (−80 dBFS).
 const REF_POW_FLOOR: f32 = 1e-8;
 /// Forgetting factor of the per-bin echo-path regression. At 750 hops/s this is a
@@ -141,6 +151,26 @@ impl Chan {
     }
 }
 
+/// What the canceller is doing right now, for the diagnostic line in the capture loop.
+pub struct Report {
+    /// Echo delay in samples, if the estimator is locked on to one.
+    pub lag: Option<f64>,
+    /// How much the captured mix was reduced by (not ERLE — see [`EchoSuppressor::report`]).
+    pub db: f32,
+    /// RMS of the reference over the window, x1000. If this is ~0 the playout is not
+    /// reaching the canceller at all, which is a plumbing fault and not a DSP one — no
+    /// estimator can find an echo of a signal it was never given.
+    pub ref_rms: f32,
+    /// RMS of the capture over the same window, x1000. Both are here because "one of them
+    /// is silent" and "neither correlates" are completely different bugs.
+    pub cap_rms: f32,
+    /// Winning envelope correlation of the last search.
+    pub corr: f32,
+    /// How far that peak stood above the best competing one. Near 1 means the surface was
+    /// ambiguous and the estimate was refused.
+    pub dominance: f32,
+}
+
 /// Removes the call's own playout from a stereo system-audio capture stream.
 ///
 /// Feed it 20 ms frames of interleaved 48 kHz stereo together with the reference block
@@ -157,8 +187,6 @@ pub struct EchoSuppressor {
     pos: u64,
     /// How far the analysis has advanced; trails [`pos`] by less than one hop.
     hopped: u64,
-    cap_env: Box<[f32]>,
-    ref_env: Box<[f32]>,
     hops: u64,
     /// Echo delay in samples, once the estimator has locked on to one. Fractional and
     /// continuously corrected: see [`EchoSuppressor::track_delay`].
@@ -171,6 +199,30 @@ pub struct EchoSuppressor {
     gnum: [[(f32, f32); BINS]; 2],
     /// Running Σ λᵗ·|Reference|², its denominator (channel-independent).
     gden: [f32; BINS],
+    /// Transform for the delay search, built once — it is large and the search runs four
+    /// times a second.
+    delay_fft: delay::Fft,
+    /// Quality of the last correlation search, for the diagnostic line: how far the peak
+    /// rose above the surface, and how far it stood above the best competing peak.
+    last_corr: f32,
+    last_dominance: f32,
+    /// A candidate delay far from the tracked one, waiting for a second opinion. See
+    /// [`EchoSuppressor::estimate_lag`].
+    pending_jump: Option<f64>,
+    /// Reference and capture energy since the last report, for the plumbing check above.
+    ref_energy: f64,
+    cap_energy: f64,
+    meas_blocks: u64,
+    /// Energy in and out since the last [`EchoSuppressor::report`], for a live ERLE.
+    ///
+    /// The synthetic tests prove the algorithm cancels 20–35 dB; what they cannot prove
+    /// is that a *particular desktop* gave it a reference that corresponds to what the
+    /// monitor is capturing. When it did not, the failure is silent and total — no lock,
+    /// no estimate, audio straight through, echo intact — and indistinguishable from the
+    /// deliberate no-op it shares that path with. So the two numbers that separate those
+    /// cases get measured and reported rather than assumed.
+    seen_in: f64,
+    seen_out: f64,
 }
 
 impl Default for EchoSuppressor {
@@ -196,14 +248,62 @@ impl EchoSuppressor {
             // the front of the buffer and folding future samples into the first hops.
             pos: FFT_N as u64,
             hopped: FFT_N as u64,
-            cap_env: vec![0.0; ENV_HOPS].into_boxed_slice(),
-            ref_env: vec![0.0; ENV_HOPS].into_boxed_slice(),
             hops: 0,
             lag: None,
             drift: 0.0,
             since_est: 0,
             gnum: [[(0.0, 0.0); BINS]; 2],
             gden: [0.0; BINS],
+            delay_fft: delay::Fft::new(DELAY_FFT_N),
+            last_corr: 0.0,
+            last_dominance: 0.0,
+            pending_jump: None,
+            ref_energy: 0.0,
+            cap_energy: 0.0,
+            meas_blocks: 0,
+            seen_in: 0.0,
+            seen_out: 0.0,
+        }
+    }
+
+    /// What the canceller is actually doing, and reset the window.
+    ///
+    /// `(delay in samples if locked, dB the captured mix was reduced by)`.
+    ///
+    /// The **lock is the diagnosis**. `None` means the estimator found no correlation
+    /// between the playout it was handed and the audio being captured, which on a desktop
+    /// means they are not the same signal — the call plays out of one device and a
+    /// different one is being shared. Nothing downstream recovers from that and no amount
+    /// of tuning the estimator changes it.
+    ///
+    /// The dB figure is deliberately *not* ERLE, which cannot be computed live: ERLE is
+    /// echo against residual echo, and separating either from the audio genuinely being
+    /// shared needs a copy of the content nobody has at runtime. This is the plainer
+    /// thing — how much of the captured mix was removed — and it reads far lower than the
+    /// ERLE, because the shared audio dominates the mix and is (correctly) kept. A
+    /// 35 dB-effective canceller reports single digits here while the game is loud. Use it
+    /// as "something correlated with the far end is being taken out", not as a score.
+    pub fn report(&mut self) -> Report {
+        let db = if self.seen_in > 0.0 && self.seen_out > 0.0 {
+            10.0 * (self.seen_in / self.seen_out).log10() as f32
+        } else {
+            0.0
+        };
+        self.seen_in = 0.0;
+        self.seen_out = 0.0;
+        let blocks = self.meas_blocks.max(1) as f32;
+        let rep_ref = (self.ref_energy / blocks as f64).sqrt() as f32 * 1000.0;
+        let rep_cap = (self.cap_energy / blocks as f64).sqrt() as f32 * 1000.0;
+        self.ref_energy = 0.0;
+        self.cap_energy = 0.0;
+        self.meas_blocks = 0;
+        Report {
+            lag: self.lag,
+            db,
+            ref_rms: rep_ref,
+            cap_rms: rep_cap,
+            corr: self.last_corr,
+            dominance: self.last_dominance,
         }
     }
 
@@ -213,6 +313,7 @@ impl EchoSuppressor {
     pub fn reset_alignment(&mut self) {
         self.lag = None;
         self.drift = 0.0;
+        self.pending_jump = None;
         self.since_est = 0;
         self.gnum = [[(0.0, 0.0); BINS]; 2];
         self.gden = [0.0; BINS];
@@ -226,11 +327,44 @@ impl EchoSuppressor {
         frame: &mut [i16; SCREEN_AUDIO_SAMPLES],
         reference: &[f32; SAMPLES_PER_FRAME],
     ) {
+        // Gate the measurement per *frame*, and over the whole frame.
+        //
+        // Doing it per sample was a measurement bug that produced nonsense: input energy
+        // was summed only over samples where the reference was active while output energy
+        // was summed over every sample of the frame, so the ratio compared two different
+        // sample sets and read as much as -38 dB — "the canceller is amplifying" — on a
+        // canceller that was working. Both sides now cover the same samples, and the frame
+        // only counts at all when the far end was actually audible in it: with the far end
+        // silent, in and out are equal by construction and averaging those in would drag a
+        // working canceller's figure towards zero.
+        let mut ref_e = 0.0f64;
         for n in 0..SAMPLES_PER_FRAME {
             let i = ((self.pos + n as u64) & HIST_MASK) as usize;
             self.ch[0].hist[i] = frame[2 * n] as f32 / 32768.0;
             self.ch[1].hist[i] = frame[2 * n + 1] as f32 / 32768.0;
             self.refh[i] = reference[n];
+            ref_e += reference[n] as f64 * reference[n] as f64;
+        }
+        // Unconditional: the whole point is to see the levels even when nothing is loud
+        // enough to measure cancellation on.
+        self.ref_energy += ref_e / SAMPLES_PER_FRAME as f64;
+        let cap_e: f64 = (0..SAMPLES_PER_FRAME)
+            .map(|n| {
+                let i = ((self.pos + n as u64) & HIST_MASK) as usize;
+                let l = self.ch[0].hist[i] as f64;
+                l * l
+            })
+            .sum();
+        self.cap_energy += cap_e / SAMPLES_PER_FRAME as f64;
+        self.meas_blocks += 1;
+        let measuring = ref_e / SAMPLES_PER_FRAME as f64 > 1e-7;
+        if measuring {
+            for n in 0..SAMPLES_PER_FRAME {
+                let i = ((self.pos + n as u64) & HIST_MASK) as usize;
+                let l = self.ch[0].hist[i] as f64;
+                let r = self.ch[1].hist[i] as f64;
+                self.seen_in += l * l + r * r;
+            }
         }
         self.pos += SAMPLES_PER_FRAME as u64;
         // A frame is not a whole number of hops, so run whatever hops it completed and
@@ -242,32 +376,26 @@ impl EchoSuppressor {
         // Drain one frame back out. The queue is primed with a hop of silence at
         // construction, which is exactly the cushion that keeps this from running dry
         // on the frames that complete one hop fewer than they consumed.
+        let mut out_e = 0.0f64;
         for (i, s) in frame.iter_mut().enumerate() {
             let c = i & 1;
             let v = self.ch[c].out.pop_front().unwrap_or(0.0);
+            out_e += v as f64 * v as f64;
             *s = (v * 32768.0).clamp(-32768.0, 32767.0) as i16;
+        }
+        // Paired with the input energy above over the same samples of the same frames.
+        if measuring {
+            self.seen_out += out_e;
         }
     }
 
-    /// One analysis/synthesis hop: envelopes → delay tracking → per-bin echo path →
+    /// One analysis/synthesis hop: delay tracking → per-bin echo path →
     /// subtract → residual suppression → overlap-add.
     fn hop(&mut self) {
-        let slot = (self.hops % ENV_HOPS as u64) as usize;
-        // Envelopes are amplitudes, not powers: a delay estimator wants speech shape,
-        // and squaring exaggerates peaks into a near-impulse that correlates poorly.
-        let mut cap_e = 0.0f32;
-        let mut ref_e = 0.0f32;
-        for k in 0..HOP {
-            let i = ((self.hopped - HOP as u64 + k as u64) & HIST_MASK) as usize;
-            cap_e += (self.ch[0].hist[i] + self.ch[1].hist[i]).abs() * 0.5;
-            ref_e += self.refh[i].abs();
-        }
-        self.cap_env[slot] = cap_e / HOP as f32;
-        self.ref_env[slot] = ref_e / HOP as f32;
         self.hops += 1;
 
         self.since_est += 1;
-        if self.since_est >= EST_INTERVAL_HOPS && self.hops as usize >= ENV_HOPS {
+        if self.since_est >= EST_INTERVAL_HOPS {
             self.since_est = 0;
             self.estimate_lag();
         }
@@ -430,36 +558,69 @@ impl EchoSuppressor {
     /// out, so the peak marks the echo delay even when the share is much louder than
     /// the call.
     fn estimate_lag(&mut self) {
-        let cap: Vec<f32> = (0..EST_HOPS)
-            .map(|i| self.env_at(self.hops - EST_HOPS as u64 + i as u64, true))
+        // Correlate the raw waveforms over the whole search range (see `super::delay`).
+        // This replaced an envelope correlation that could not find a real echo at all
+        // once loud shared audio was in the capture — every field log showed a flat
+        // surface, the winning peak never more than ~1.3x its best rival.
+        let end = self.hopped;
+        if end < (DELAY_WIN + MAX_LAG_SAMPLES) as u64 {
+            return; // not enough history yet
+        }
+        let start = end - (DELAY_WIN + MAX_LAG_SAMPLES) as u64;
+        // Capture is the most recent window; the reference reaches `MAX_LAG_SAMPLES`
+        // further back, because that is the span being searched.
+        let cap: Vec<f32> = (0..DELAY_WIN)
+            .map(|i| {
+                let idx = ((end - DELAY_WIN as u64 + i as u64) & HIST_MASK) as usize;
+                0.5 * (self.ch[0].hist[idx] + self.ch[1].hist[idx])
+            })
             .collect();
-        let (cm, cvar) = mean_var(&cap);
-        if cvar <= 0.0 {
+        let refw: Vec<f32> = (0..DELAY_WIN + MAX_LAG_SAMPLES)
+            .map(|i| self.refh[((start + i as u64) & HIST_MASK) as usize])
+            .collect();
+        let Some(est) = delay::estimate(&self.delay_fft, &cap, &refw, MAX_LAG_SAMPLES) else {
+            self.last_corr = 0.0;
+            self.last_dominance = 0.0;
+            return;
+        };
+        self.last_corr = est.sharpness;
+        self.last_dominance = est.dominance;
+        // The peak has to be the only credible one. An ambiguous surface yields nothing,
+        // and yielding nothing is a pass-through — the honest answer when we cannot tell
+        // where the echo is, and far better than subtracting a wrong alignment.
+        if est.dominance < PEAK_DOMINANCE {
             return;
         }
-        let mut best = (0usize, 0.0f32);
-        let mut win = vec![0.0f32; EST_HOPS];
-        for lag in 0..MAX_LAG_HOPS {
-            for (i, w) in win.iter_mut().enumerate() {
-                *w = self.env_at(self.hops - EST_HOPS as u64 - lag as u64 + i as u64, false);
+        let meas = est.lag as f64;
+        // A big disagreement with the tracked delay has to happen twice before it is
+        // believed.
+        //
+        // The envelope correlation is over speech shape, and loud shared audio — a game, a
+        // video — puts plenty of structure into the capture that has nothing to do with the
+        // far end. That throws up peaks past `LOCK_CORR` at delays that are simply wrong,
+        // and field logs showed the lock hopping between 4 ms and 504 ms every few seconds.
+        // Every hop discards the per-bin echo path (it was measured against an alignment
+        // that no longer holds) so the regression never gets the second or so of stable
+        // alignment it needs to converge, and the canceller spends the whole share
+        // re-learning instead of cancelling. Ordinary clock drift is a ramp of tens of
+        // samples a second, which `track_delay` follows without ever coming near this
+        // threshold; only a genuine re-route jumps, and a genuine re-route persists.
+        const JUMP: f64 = 0.02 * SAMPLE_RATE as f64; // 20 ms
+        if let Some(lag) = self.lag {
+            if (meas - lag).abs() > JUMP {
+                match self.pending_jump {
+                    Some(prev) if (meas - prev).abs() <= JUMP => {
+                        self.pending_jump = None;
+                        self.reset_alignment();
+                        self.track_delay(meas);
+                    }
+                    _ => self.pending_jump = Some(meas),
+                }
+                return;
             }
-            let (rm, rvar) = mean_var(&win);
-            if rvar <= 0.0 {
-                continue;
-            }
-            let mut num = 0.0f32;
-            for i in 0..EST_HOPS {
-                num += (cap[i] - cm) * (win[i] - rm);
-            }
-            let corr = num / (cvar * rvar).sqrt();
-            if corr > best.1 {
-                best = (lag, corr);
-            }
+            self.pending_jump = None;
         }
-        if best.1 < LOCK_CORR {
-            return;
-        }
-        self.track_delay(self.refine_lag(best.0 * HOP) as f64);
+        self.track_delay(meas);
     }
 
     /// Fold a fresh delay measurement into the tracked position and rate.
@@ -503,65 +664,13 @@ impl EchoSuppressor {
         self.drift =
             (self.drift + BETA * err / EST_INTERVAL_HOPS as f64).clamp(-MAX_DRIFT, MAX_DRIFT);
     }
-
-    /// Refine a hop-resolution delay to the sample, by cross-correlating the raw
-    /// signals over ±1 hop around it.
-    ///
-    /// Worth the arithmetic: the linear subtraction models the echo path as one complex
-    /// gain per bin, which is exactly right for a delay-and-gain path *once the delay is
-    /// out of the way*. Left 60-odd samples off inside a 256-sample window, the same
-    /// model has to describe a fractional-bin shift instead, and cancels far less.
-    fn refine_lag(&self, coarse: usize) -> usize {
-        let lo = coarse.saturating_sub(HOP);
-        let hi = (coarse + HOP).min(MAX_LAG_SAMPLES);
-        let n = FINE_WINDOW.min((self.hopped - FFT_N as u64) as usize);
-        if n < HOP * 4 {
-            return coarse.clamp(0, MAX_LAG_SAMPLES);
-        }
-        let cap: Vec<f32> = (0..n)
-            .map(|i| self.ch[0].hist[((self.hopped - n as u64 + i as u64) & HIST_MASK) as usize])
-            .collect();
-        let mut best = (coarse.clamp(lo, hi), f32::NEG_INFINITY);
-        for lag in lo..=hi {
-            let start = self.hopped - n as u64 - lag as u64;
-            let (mut num, mut den) = (0.0f32, 0.0f32);
-            for (i, c) in cap.iter().enumerate() {
-                let r = self.refh[((start + i as u64) & HIST_MASK) as usize];
-                num += c * r;
-                den += r * r;
-            }
-            // Normalised by the reference alone: the capture's own energy is the same
-            // for every candidate, so this ranks lags without a square root per lag.
-            let score = if den > 0.0 { num * num / den } else { 0.0 };
-            if score > best.1 {
-                best = (lag, score);
-            }
-        }
-        best.0
-    }
-
-    /// Envelope sample by absolute hop index (the ring holds the last [`ENV_HOPS`]).
-    fn env_at(&self, hop: u64, capture: bool) -> f32 {
-        let src = if capture {
-            &self.cap_env
-        } else {
-            &self.ref_env
-        };
-        src[(hop % ENV_HOPS as u64) as usize]
-    }
-}
-
-/// Mean and (unnormalized) variance — the denominator halves of a Pearson correlation.
-fn mean_var(v: &[f32]) -> (f32, f32) {
-    let m = v.iter().sum::<f32>() / v.len() as f32;
-    let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f32>();
-    (m, var)
 }
 
 /// Sanity check kept next to the constants it constrains: the deepest aligned read must
 /// stay inside the sample history, and a frame must be a whole number of hops.
 const _: () = {
-    assert!(MAX_LAG_SAMPLES + FFT_N + FINE_WINDOW <= HIST);
+    assert!(MAX_LAG_SAMPLES + DELAY_WIN + FFT_N <= HIST);
+    assert!(DELAY_WIN + MAX_LAG_SAMPLES <= DELAY_FFT_N);
     // The output queue is primed with one hop, which only covers the shortfall of a
     // frame that completes one hop fewer than it consumed.
     assert!(HOP < SAMPLES_PER_FRAME);
@@ -570,222 +679,4 @@ const _: () = {
 };
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fill(frame: &mut [i16; SCREEN_AUDIO_SAMPLES], l: &[f32], r: &[f32]) {
-        for i in 0..SAMPLES_PER_FRAME {
-            frame[2 * i] = (l[i].clamp(-1.0, 1.0) * 32767.0) as i16;
-            frame[2 * i + 1] = (r[i].clamp(-1.0, 1.0) * 32767.0) as i16;
-        }
-    }
-
-    /// Cheap deterministic pseudo-noise; no rand dependency in this crate.
-    struct Noise(u32);
-    impl Noise {
-        fn next(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (self.0 >> 8) as f32 / 8_388_608.0 - 1.0
-        }
-    }
-
-    #[test]
-
-    fn fft_round_trips() {
-        let fft = Fft::new();
-        let mut noise = Noise(7);
-        let orig: Vec<f32> = (0..FFT_N).map(|_| noise.next()).collect();
-        let mut re = [0.0f32; FFT_N];
-        let mut im = [0.0f32; FFT_N];
-        re.copy_from_slice(&orig);
-        fft.run(&mut re, &mut im, false);
-        fft.run(&mut re, &mut im, true);
-        for i in 0..FFT_N {
-            assert!((re[i] - orig[i]).abs() < 1e-4, "{i}: {} {}", re[i], orig[i]);
-            assert!(im[i].abs() < 1e-4);
-        }
-    }
-
-    /// The Hann/Hann pair at hop N/4 must be constant-overlap-add, or "no suppression"
-    /// would still colour the shared audio.
-    #[test]
-
-    fn analysis_synthesis_windows_are_cola() {
-        let s = EchoSuppressor::new();
-        for n in 0..HOP {
-            let sum: f32 = (0..FFT_N / HOP)
-                .map(|m| {
-                    let w = s.win[n + m * HOP];
-                    w * w
-                })
-                .sum();
-            assert!((sum - OLA_NORM).abs() < 1e-5, "{n}: {sum}");
-        }
-    }
-
-    /// With no reference at all the suppressor is a 4 ms delay line and nothing else.
-    #[test]
-
-    fn passes_audio_through_when_there_is_no_echo() {
-        let mut s = EchoSuppressor::new();
-        let mut noise = Noise(11);
-        let quiet = [0.0f32; SAMPLES_PER_FRAME];
-        let mut sent = Vec::new();
-        let mut got = Vec::new();
-        for _ in 0..8 {
-            let a: Vec<f32> = (0..SAMPLES_PER_FRAME).map(|_| noise.next() * 0.4).collect();
-            let mut frame = [0i16; SCREEN_AUDIO_SAMPLES];
-            fill(&mut frame, &a, &a);
-            sent.extend_from_slice(&a);
-            s.process(&mut frame, &quiet);
-            got.extend((0..SAMPLES_PER_FRAME).map(|i| frame[2 * i] as f32 / 32768.0));
-        }
-        let lat = LATENCY;
-        let n = sent.len() - lat;
-        let err: f32 = (0..n).map(|i| (got[i + lat] - sent[i]).powi(2)).sum();
-        let sig: f32 = (0..n).map(|i| sent[i] * sent[i]).sum();
-        assert!(err / sig < 1e-3, "reconstruction error {}", err / sig);
-    }
-
-    /// The real case: the loopback carries the shared content *plus* a delayed copy of
-    /// the call playout. The playout must come out attenuated and the content must not.
-    #[test]
-
-    fn suppresses_the_playout_and_keeps_the_shared_audio() {
-        const LAG: usize = 3_000; // 62 ms of device buffering
-        const GAIN: f32 = 0.9;
-        const CONTENT: f32 = 0.25;
-        let mut s = EchoSuppressor::new();
-        let mut voice = Noise(3);
-        let mut game = Noise(29);
-
-        // Band-limited "voice" (a slow AR process) is far more representative than white
-        // noise: it gives the envelope estimator something with speech-like structure.
-        let mut lp = 0.0f32;
-        let total = 48_000 * 6;
-        let playout: Vec<f32> = (0..total + LAG)
-            .map(|_| {
-                lp = 0.97 * lp + 0.03 * voice.next();
-                (lp * 8.0).clamp(-1.0, 1.0) * 0.5
-            })
-            .collect();
-        let content: Vec<f32> = (0..total).map(|_| game.next() * CONTENT).collect();
-
-        let mut r = 0.0f32;
-        let mut e = 0.0f32;
-        let frames = total / SAMPLES_PER_FRAME;
-        let mut out = Vec::with_capacity(total);
-        for f in 0..frames {
-            let off = f * SAMPLES_PER_FRAME;
-            let mut refblk = [0.0f32; SAMPLES_PER_FRAME];
-            let mut mix = [0.0f32; SAMPLES_PER_FRAME];
-            for i in 0..SAMPLES_PER_FRAME {
-                refblk[i] = playout[off + i + LAG];
-                mix[i] = content[off + i] + GAIN * playout[off + i];
-            }
-            let mut frame = [0i16; SCREEN_AUDIO_SAMPLES];
-            fill(&mut frame, &mix, &mix);
-            s.process(&mut frame, &refblk);
-            out.extend((0..SAMPLES_PER_FRAME).map(|i| frame[2 * i] as f32 / 32768.0));
-        }
-        let lag = s.lag.expect("no delay lock");
-        assert!(
-            (lag - LAG as f64).abs() < 1.0,
-            "delay estimate {lag}, want {LAG}"
-        );
-
-        // Measure over the last two seconds, once the estimates have settled (the
-        // window stops short of the synthesis latency, which has no output yet).
-        let lat = LATENCY;
-        let measure = total - 48_000 * 2..total - lat;
-        for i in measure.clone() {
-            let echo = GAIN * playout[i];
-            let residual = out[i + lat] - content[i];
-            r += echo * echo;
-            e += residual * residual;
-        }
-        let erle = 10.0 * (r / e).log10();
-        eprintln!("static ERLE {erle:.1} dB");
-        assert!(erle > 25.0, "only {erle:.1} dB of echo cancellation");
-
-        // …and the shared audio itself survives: correlation with the original content
-        // stays high (some ducking in the bins the echo owns is the price).
-        let (mut num, mut da, mut db) = (0.0f32, 0.0f32, 0.0f32);
-        for i in measure {
-            let (a, b) = (content[i], out[i + lat]);
-            num += a * b;
-            da += a * a;
-            db += b * b;
-        }
-        let corr = num / (da * db).sqrt();
-        eprintln!("static corr {corr:.3}");
-        assert!(corr > 0.99, "shared audio mangled (corr {corr:.2})");
-    }
-
-    /// The same scene, but with the capture clock running slightly fast against the
-    /// reference — which is what every real machine does. A sound server resampling
-    /// 44.1 kHz, or two devices on separate crystals, walks the echo delay by tens of
-    /// samples a second; the canceller has to track that without losing what it learned.
-    #[test]
-
-    fn cancels_through_clock_drift() {
-        const LAG: usize = 3_000;
-        const GAIN: f32 = 0.9;
-        // 1000 ppm ≈ 48 samples/s — the order a fractional-carry-dropping resampler
-        // produces, and far past the point where re-locking the delay is rare.
-        const PPM: f64 = 1000e-6;
-        let mut s = EchoSuppressor::new();
-        let mut voice = Noise(3);
-        let mut game = Noise(29);
-        let mut lp = 0.0f32;
-        let total = 48_000 * 8;
-        let playout: Vec<f32> = (0..total + LAG * 2)
-            .map(|_| {
-                lp = 0.97 * lp + 0.03 * voice.next();
-                (lp * 8.0).clamp(-1.0, 1.0) * 0.5
-            })
-            .collect();
-        let content: Vec<f32> = (0..total).map(|_| game.next() * 0.25).collect();
-        // The echo the machine actually plays back, read at a drifting rate.
-        let at = |t: f64| -> f32 {
-            let i = t.floor() as usize;
-            let f = (t - i as f64) as f32;
-            let (a, b) = (
-                playout[i.min(playout.len() - 1)],
-                playout[(i + 1).min(playout.len() - 1)],
-            );
-            a + (b - a) * f
-        };
-        let mut echo = vec![0.0f32; total];
-        for (i, e) in echo.iter_mut().enumerate() {
-            *e = GAIN * at(i as f64 * (1.0 - PPM));
-        }
-
-        let frames = total / SAMPLES_PER_FRAME;
-        let mut out = Vec::with_capacity(total);
-        for f in 0..frames {
-            let off = f * SAMPLES_PER_FRAME;
-            let mut refblk = [0.0f32; SAMPLES_PER_FRAME];
-            let mut mix = [0.0f32; SAMPLES_PER_FRAME];
-            for i in 0..SAMPLES_PER_FRAME {
-                refblk[i] = playout[off + i + LAG];
-                mix[i] = content[off + i] + echo[off + i];
-            }
-            let mut frame = [0i16; SCREEN_AUDIO_SAMPLES];
-            fill(&mut frame, &mix, &mix);
-            s.process(&mut frame, &refblk);
-            out.extend((0..SAMPLES_PER_FRAME).map(|i| frame[2 * i] as f32 / 32768.0));
-        }
-
-        let lat = LATENCY;
-        let (mut r, mut e) = (0.0f32, 0.0f32);
-        for i in total - 48_000 * 3..total - lat {
-            r += echo[i] * echo[i];
-            let residual = out[i + lat] - content[i];
-            e += residual * residual;
-        }
-        let erle = 10.0 * (r / e).log10();
-        eprintln!("drift ERLE {erle:.1} dB");
-        assert!(erle > 20.0, "only {erle:.1} dB with a drifting clock");
-    }
-}
+mod tests;

@@ -37,7 +37,18 @@ use std::time::{Duration, Instant};
 
 use client_core::media::{video, MediaSink, Track, VideoSource, SCREEN_AUDIO_SAMPLES};
 
+// Which sink our playout uses, PulseAudio only (see the module docs).
+#[cfg(target_os = "linux")]
+mod appaudio;
 mod camera;
+// A local harness for the screen-share echo canceller: real playout, real monitor
+// capture, real suppressor, on whatever machine runs the tests.
+#[cfg(all(test, target_os = "linux"))]
+mod echo_loopback_test;
+// Is the captured timeline the same timeline the reference describes? Splits "these two
+// signals do not correlate" into its two possible causes.
+#[cfg(all(test, target_os = "linux"))]
+mod echo_timebase_test;
 mod pixels;
 mod screen;
 mod sysaudio;
@@ -73,6 +84,11 @@ const SELF_TRACK_BASE: u8 = 100;
 /// Preview cadence (10 fps) and width cap — it's a thumbnail, not the encode path.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(100);
 const PREVIEW_MAX_W: usize = 480;
+
+/// Width cap for the peer's frames on their way to the webview. Not an encode setting —
+/// the wire still carries whatever the sender chose — only a bound on what the display
+/// path has to move, which is the thing that could not keep up. See [`ShellSink::video`].
+const PEER_MAX_W: usize = 1280;
 
 // ── Lazy capture sources ────────────────────────────────────────────────────────────
 
@@ -187,7 +203,7 @@ impl VideoSource for SlotSource {
                         CaptureKind::Screen => capture_screen(&shared, width),
                     };
                     if let Err(e) = r {
-                        eprintln!("[media] capture ended: {e}");
+                        crate::diag!("[media] capture ended: {e}");
                     }
                     shared.running.store(false, Ordering::Relaxed);
                 })
@@ -225,6 +241,92 @@ fn ui_frame(track: u8, frame: Option<&video::Frame>) -> Vec<u8> {
     msg
 }
 
+/// Flow control for peer frames on their way to the webview.
+///
+/// The webview acknowledges each frame once it has painted it ([`crate::call::cmd`]'s
+/// `call_frame_ack`), which is the only signal available that it has actually consumed
+/// one — Tauri's channel is fire-and-forget and its pending-payload map is unbounded.
+pub mod frames {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Frames allowed in flight *per track*. Two: one being painted, one already on its
+    /// way, which keeps the pipe busy without letting a backlog form. At 1080p this caps
+    /// what the delivery path can be holding at ~6 MB per track.
+    ///
+    /// Per track, not per call, because camera and screen can both be live and a shared
+    /// budget would make each starve the other — two tracks against two credits is one
+    /// each, and a frame that loses the race is simply dropped.
+    const MAX_IN_FLIGHT: u32 = 2;
+    /// After this long an unacknowledged frame is written off. Acks can genuinely go
+    /// missing — a webview reload drops whatever it had in hand — and without this the
+    /// counter would never come back down and video would stop for the rest of the call.
+    const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Indexed by [`super::Track`] id; only camera (1) and screen (2) are ever used.
+    const TRACKS: usize = 4;
+    static IN_FLIGHT: [AtomicU32; TRACKS] = [
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+    ];
+    /// Millis since the epoch of the oldest unacknowledged send, per track.
+    static SINCE: [AtomicU64; TRACKS] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn slot(track: u8) -> usize {
+        (track as usize).min(TRACKS - 1)
+    }
+
+    /// Claim a slot for one frame of `track`, or refuse. `false` = drop the frame.
+    pub fn reserve(track: u8) -> bool {
+        let i = slot(track);
+        if IN_FLIGHT[i].load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
+            let waited = now_ms().saturating_sub(SINCE[i].load(Ordering::Relaxed));
+            if waited < ACK_TIMEOUT.as_millis() as u64 {
+                return false;
+            }
+            // Stuck: the acks are not coming. Forget them and start again rather than
+            // leave the tile frozen.
+            IN_FLIGHT[i].store(0, Ordering::Relaxed);
+        }
+        if IN_FLIGHT[i].fetch_add(1, Ordering::Relaxed) == 0 {
+            SINCE[i].store(now_ms(), Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// One frame painted (or a send that never happened).
+    pub fn release(track: u8) {
+        let i = slot(track);
+        let _ = IN_FLIGHT[i].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+        SINCE[i].store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Forget everything outstanding — the webview just (re)bound its channel, so nothing
+    /// sent before this point is ever going to be acknowledged.
+    pub fn reset() {
+        for i in 0..TRACKS {
+            IN_FLIGHT[i].store(0, Ordering::Relaxed);
+            SINCE[i].store(now_ms(), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Live handle the UI (re)binds its IPC channel to; survives webview reloads.
 pub type UiChannel = Arc<Mutex<Option<tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>>>>;
 
@@ -237,14 +339,48 @@ pub struct ShellSink {
 
 impl MediaSink for ShellSink {
     fn video(&mut self, track: Track, frame: video::Frame) {
+        // Do not hand the webview a frame while it still owes us for the last ones.
+        //
+        // A 1080p I420 frame is 3.1 MB, and Tauri delivers a payload this size by parking
+        // it in a process-wide map and asking the webview to come and fetch it. That map
+        // is unbounded. Sending unconditionally at 20 fps therefore does not "run slowly"
+        // when the webview cannot keep up — it accumulates 62 MB a second of frames nobody
+        // has collected, until the UI stops responding and the process dies. Both ends of
+        // a call saw exactly that, and only once a hardware encoder started delivering a
+        // real 20 fps: the software encoder had been rate-limiting this path by accident.
+        //
+        // The self-view beside this has always been throttled and shrunk; peer frames were
+        // the one video path with no limit of any kind on them.
+        if !frames::reserve(track as u8) {
+            return; // webview is behind — drop this frame, keep the newest
+        }
+        // Shrink before crossing to the webview. The credit above stops a slow webview
+        // from being buried, but dropping frames is how it pays for that, and the reported
+        // result was exactly what that trades for: no more freezing, plenty of choppiness.
+        // Every megabyte here costs the delivery path twice — once to hand over, once to
+        // fetch — so a 1080p frame at 3.1 MB is most of the reason the webview cannot keep
+        // up in the first place. At [`PEER_MAX_W`] it is 1.4 MB and the same webview paints
+        // more than twice as many of them.
+        //
+        // The cost is sharpness on a full-screen share of small text, which is real; the
+        // benefit is a share that moves. A frozen sharp frame is worth less than a soft
+        // moving one, and the encoder still sends full resolution — this is only what the
+        // *display* path carries.
+        let frame = if frame.width > PEER_MAX_W {
+            shrink_i420(&frame, PEER_MAX_W)
+        } else {
+            frame
+        };
         if let Ok(ch) = self.ui.lock() {
             if let Some(ch) = ch.as_ref() {
                 let _ = ch.send(tauri::ipc::InvokeResponseBody::Raw(ui_frame(
                     track as u8,
                     Some(&frame),
                 )));
+                return;
             }
         }
+        frames::release(track as u8); // no channel bound; reservation unspent
     }
     fn video_off(&mut self, track: Track) {
         if let Ok(ch) = self.ui.lock() {

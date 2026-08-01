@@ -356,6 +356,16 @@ pub struct ContactPin {
     /// Drop everything this contact sends (no record, no receipts) and refuse sends.
     #[serde(default)]
     pub blocked: bool,
+    /// How loud to play this contact's voice, in percent
+    /// ([`crate::call::GAIN_UNITY`] = as sent). `None` — the default every existing
+    /// vault deserializes to — means untouched.
+    ///
+    /// Persisted, unlike every other call control: a voice that is too quiet is a
+    /// property of a person's microphone and room, not of one call, so being made to
+    /// fix it again every time you ring them is the bug. Purely local — it is applied
+    /// after decode and never reaches the wire, so the other side cannot tell.
+    #[serde(default)]
+    pub voice_gain: Option<u32>,
     /// Hidden behind the collapsed "Archived" row at the bottom of the chat list. Cleared
     /// automatically when the chat is opened. Local-only, never transmitted.
     #[serde(default)]
@@ -418,11 +428,31 @@ pub struct PendingPromotion {
     pub demoted: DeviceRecord,
 }
 
+/// The call-control key this device last published, and when. The `created_at` is kept
+/// so the next publication can be minted strictly newer than the live one — the relay's
+/// shelf refuses anything that does not supersede what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallKeyPublication {
+    pub public_key: String,
+    pub created_at: u64,
+    /// The device id the binding was minted for. A primary transfer re-ids this device,
+    /// and a binding for the old id verifies against nothing — so the id is part of
+    /// "already published".
+    #[serde(default)]
+    pub device_id: String,
+}
+
 /// One device of some account, as learned from a KT-verified roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterDevice {
     pub device_id: String,
     pub identity_key: String,
+    /// The device's Ed25519 roster key. Pinned alongside the identity key because it is
+    /// what verifies material the *device itself* signs — today its call-control key
+    /// binding. Empty on a pin written before this field existed; the next roster
+    /// resolve fills it in, and until then device-signed material simply does not verify.
+    #[serde(default)]
+    pub signing_key: String,
 }
 
 /// Product limit: at most this many username changes per rolling week (client-enforced
@@ -514,4 +544,13 @@ pub struct GroupAdmin {
 pub struct OutboxItem {
     pub envelope: protocol_types::Envelope,
     pub due_at: u64,
+}
+
+/// One short-lived call-control delivery attempt. Unlike the general history outbox,
+/// these entries have a strict retry budget and inherit the envelope's call-scale TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallOutboxItem {
+    pub envelope: protocol_types::Envelope,
+    pub due_at: u64,
+    pub attempts: u8,
 }

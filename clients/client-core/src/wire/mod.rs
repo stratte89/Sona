@@ -60,10 +60,7 @@ pub(crate) enum ChatPayload {
     /// recipient's request gate surfaces a pending-request row exactly as if a first
     /// message had arrived — without the sender having to compose one. A knock to an
     /// already-accepted contact is a no-op. Old clients fail-soft decode → acked away.
-    Knock {
-        #[serde(default)]
-        from: String,
-    },
+    Knock { from: String },
     /// A delivery receipt for one or more of the peer's messages. `seen == false` means
     /// "delivered to my device"; `seen == true` means "I opened the conversation". Travels
     /// inside the ratchet, so the server never learns read state.
@@ -152,45 +149,64 @@ pub(crate) enum ChatPayload {
         group_id: String,
         avatar: Option<String>,
     },
-    /// Invite the recipient to a voice call: the relay-room capability (`call_id`) and
-    /// the root call key. Both are random per call, travel only inside the ratchet, and
-    /// die with the call — see [`call`]. `from` as in [`ChatPayload::Text`].
-    CallOffer {
+    /// Protocol-v2 voice-call offer. `call_instance_id` is stable for the logical call;
+    /// `offer_id` identifies this offer; `call_id` remains a separate, secret media-room
+    /// capability. The absolute deadline is authenticated and bounds both relay storage
+    /// and recipient ringing.
+    CallOfferV2 {
+        call_instance_id: String,
+        offer_id: String,
         call_id: String,
         key_b64: String,
-        ts: u64,
-        #[serde(default)]
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
         from: String,
-        /// Media capabilities of the offering client (e.g. [`media::MEDIA2_CAP`]).
-        /// Absent from old clients ⇒ voice-only; unknown strings are ignored.
-        #[serde(default)]
+        caller_device_id: String,
+        reply_to_mailbox: String,
         caps: Vec<String>,
-        /// Non-empty ⇒ this offer resumes the call whose id it names after a network
-        /// drop: a **fresh** room + key (a call key is never reused), sent by the
-        /// pair's owner (lexicographically smaller identity key). The device that was
-        /// in the dropped call auto-accepts silently; every other recipient ignores it
-        /// — a reconnect must never ring. Old clients don't know the field and treat
-        /// the offer as a normal ring (degrades, doesn't break).
-        #[serde(default)]
-        reconnect_of: String,
+        /// Non-empty means a fresh media capability silently resumes this old media
+        /// room. It keeps the logical call ID and never rings.
+        resume_of: String,
     },
-    /// Accept/decline a pending call offer. `caps` as in [`ChatPayload::CallOffer`].
-    /// `busy` marks an *automatic* decline (device already in a call / already ringing):
-    /// with ring-all-devices the caller must not end the ring while the callee's other
-    /// devices can still answer, so only the last busy decline — or any explicit
-    /// (`busy == false`) decline — ends it. Old clients omit the field (⇒ `false`),
-    /// keeping their declines explicit, exactly as today.
-    CallAnswer {
-        call_id: String,
-        accept: bool,
-        #[serde(default)]
+    /// Authenticated answer attempt. Media must not start on the answering device until
+    /// it receives a matching [`ChatPayload::CallWinnerV2`].
+    CallAnswerClaimV2 {
+        call_instance_id: String,
+        offer_id: String,
+        claim_nonce: String,
+        answering_device_id: String,
+        reply_to_mailbox: String,
         caps: Vec<String>,
-        #[serde(default)]
-        busy: bool,
+        expires_at: u64,
     },
-    /// Hang up / cancel a call (also sent when a ring times out).
-    CallEnd { call_id: String },
-    /// Invite the recipient to **one pair leg** of a group call. Group calls are a full
+    /// Caller-issued acknowledgement of the one winning answer claim. All callee
+    /// devices may receive it; only the named device/nonce may start media.
+    CallWinnerV2 {
+        call_instance_id: String,
+        offer_id: String,
+        claim_nonce: String,
+        winner_device_id: String,
+        expires_at: u64,
+    },
+    /// One occupied device cannot cancel rings on its siblings.
+    CallBusyV2 {
+        call_instance_id: String,
+        offer_id: String,
+        device_id: String,
+        expires_at: u64,
+    },
+    /// Final call outcome. Terminal controls are monotonic and may arrive before the
+    /// corresponding offer, in which case recipients retain a bounded tombstone.
+    CallTerminalV2 {
+        call_instance_id: String,
+        offer_id: String,
+        reason: callstate::CallTerminalReason,
+        from: String,
+        actor_device_id: String,
+        expires_at: u64,
+    },
+    /// Protocol-v2 invite to **one pair leg** of a group call. Group calls are a full
     /// mesh of the existing two-member blind relay rooms: every participant pair gets its
     /// own random room id + 32-byte key, minted fresh and carried only inside that pair's
     /// Double Ratchet session — so each leg has *exactly* the 1:1 call's security
@@ -201,22 +217,59 @@ pub(crate) enum ChatPayload {
     /// **smaller** identity key wins; the other side's ticket is ignored (its lonely room
     /// is reaped by the relay's GC). Both sides apply the rule locally, so every pair
     /// deterministically converges on one room with no extra round trip.
-    GroupCallOffer {
+    GroupCallOfferV2 {
         group_id: String,
-        call_instance: String,
+        call_instance_id: String,
+        /// Stable across every participant/device offer for this logical group ring.
+        ring_id: String,
+        offer_id: String,
         call_id: String,
         key_b64: String,
-        ts: u64,
-        #[serde(default)]
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
         from: String,
+        caller_device_id: String,
+        coordinator_username: String,
+        coordinator_identity_key: String,
+        coordinator_device_id: String,
+        coordinator_reply_to_mailbox: String,
+        /// Fresh pair capability for members already active in this logical group call.
+        /// It is an urgent silent control and must never create a ring.
+        resume: bool,
     },
-    /// The sender is not (or no longer) in group call `call_instance`: sent on decline,
-    /// on hangup, and on ring timeout. Recipients drop the sender's leg and stop ringing
-    /// if nobody remains. One message covers all three cases — the wire never
-    /// distinguishes "declined" from "left", which is also the right privacy default.
-    GroupCallEnd {
+    /// One device attempts to claim this account's group-call answer. The stable
+    /// coordinator selects one winner before that account emits/join pair legs.
+    GroupCallAnswerClaimV2 {
         group_id: String,
-        call_instance: String,
+        call_instance_id: String,
+        ring_id: String,
+        claim_nonce: String,
+        answering_device_id: String,
+        reply_to_mailbox: String,
+        expires_at: u64,
+    },
+    /// Coordinator acknowledgement naming the only device of one participant account
+    /// allowed to join this group call.
+    GroupCallWinnerV2 {
+        group_id: String,
+        call_instance_id: String,
+        ring_id: String,
+        claim_nonce: String,
+        winner_device_id: String,
+        expires_at: u64,
+    },
+    /// Explicit group-call terminal/leave outcome for one logical instance.
+    GroupCallTerminalV2 {
+        group_id: String,
+        call_instance_id: String,
+        ring_id: String,
+        reason: callstate::CallTerminalReason,
+        actor_device_id: String,
+        coordinator_username: String,
+        coordinator_identity_key: String,
+        coordinator_device_id: String,
+        expires_at: u64,
     },
     /// **Multi-device self-sync.** A copy, sent to the account's *own other devices*, of a
     /// text message this account sent to `peer_key`. The receiving own-device records it as
@@ -256,10 +309,16 @@ pub(crate) enum ChatPayload {
     /// Multi-device self-sync of a read (`seen`) marker: another of our devices opened the
     /// `peer_key` conversation, so this device marks those incoming messages read too.
     SelfSeen { peer_key: String, ids: Vec<String> },
-    /// Multi-device self-sync: another of our own devices answered or declined the ring
-    /// for `call_id`, so this device stops ringing. Ephemeral (never enters history) and
-    /// honored only from a verified own device. Carries no call key.
-    SelfCallHandled { call_id: String },
+    /// Explicit multi-device terminal state. Replaces the ambiguous v1 "handled"
+    /// message so sibling devices converge on the same final outcome even when this
+    /// control arrives before their offer.
+    SelfCallTerminalV2 {
+        call_instance_id: String,
+        offer_id: String,
+        reason: callstate::CallTerminalReason,
+        actor_device_id: String,
+        expires_at: u64,
+    },
     /// **History re-export request.** A linked device whose synced history blob expired
     /// asks its primary to re-seal + re-upload history. Carries a fresh capability id and a
     /// fresh link secret (E2E-encrypted, so the relay never sees the link secret). Honored
@@ -382,14 +441,10 @@ pub(crate) fn build_envelope(
 /// The sender-declared wake class for a payload (see [`protocol_types::WakeClass`]):
 /// the ONE coarse routing bit the relay may read. Content-bearing traffic (texts,
 /// attachments, group messages/invites, primary→linked forwards) earns a debounced
-/// `Normal` wake; call and group-call offers earn an immediate `Call` wake — except
-/// silent reconnect offers, which must never ring a locked device and ride `Normal`.
-/// Everything else (receipts, typing, reactions, edits, timers, gossip, self-sync,
-/// call answer/end signaling) is `None`: an offline device has nothing user-visible
-/// to show for it, so the relay must not burn a wake — it all drains with the next
-/// real wake or app open. Stale-offer rings are prevented downstream by
-/// `used_call_ids` + offer expiry; a `CallEnded` needing to cancel a ring is handled
-/// by the FCM TTL + the drain.
+/// `Normal` wake; fresh call and group-call offers earn an immediate `Call` ring wake.
+/// Silent resumes and every winner/terminal control use urgent `CallControl`: wake the
+/// recipient immediately but never synthesize a generic incoming ring. Everything else
+/// (receipts, typing, reactions, edits, timers, gossip, unrelated self-sync) is `None`.
 pub(crate) fn wake_class_for(payload: &ChatPayload) -> WakeClass {
     match payload {
         ChatPayload::Text { .. }
@@ -399,15 +454,43 @@ pub(crate) fn wake_class_for(payload: &ChatPayload) -> WakeClass {
         | ChatPayload::GroupRoster { .. }
         | ChatPayload::Knock { .. }
         | ChatPayload::ForwardIncoming { .. } => WakeClass::Normal,
-        ChatPayload::CallOffer { reconnect_of, .. } => {
-            if reconnect_of.is_empty() {
+        ChatPayload::CallOfferV2 { resume_of, .. } => {
+            if resume_of.is_empty() {
                 WakeClass::Call
             } else {
-                WakeClass::Normal
+                WakeClass::CallControl
             }
         }
-        ChatPayload::GroupCallOffer { .. } => WakeClass::Call,
+        ChatPayload::GroupCallOfferV2 { resume: false, .. } => WakeClass::Call,
+        ChatPayload::GroupCallOfferV2 { resume: true, .. } => WakeClass::CallControl,
+        ChatPayload::CallAnswerClaimV2 { .. }
+        | ChatPayload::CallWinnerV2 { .. }
+        | ChatPayload::CallBusyV2 { .. }
+        | ChatPayload::CallTerminalV2 { .. }
+        | ChatPayload::SelfCallTerminalV2 { .. }
+        | ChatPayload::GroupCallAnswerClaimV2 { .. }
+        | ChatPayload::GroupCallWinnerV2 { .. }
+        | ChatPayload::GroupCallTerminalV2 { .. } => WakeClass::CallControl,
         _ => WakeClass::None,
+    }
+}
+
+/// Calls never inherit the relay's generic message lifetime. The authenticated payload
+/// and outer envelope carry the same absolute deadline so the relay discards stale
+/// offers/controls before a sleeping recipient can drain them.
+pub(crate) fn envelope_expiry_for(payload: &ChatPayload) -> Option<u64> {
+    match payload {
+        ChatPayload::CallOfferV2 { expires_at, .. }
+        | ChatPayload::CallAnswerClaimV2 { expires_at, .. }
+        | ChatPayload::CallWinnerV2 { expires_at, .. }
+        | ChatPayload::CallBusyV2 { expires_at, .. }
+        | ChatPayload::CallTerminalV2 { expires_at, .. }
+        | ChatPayload::GroupCallOfferV2 { expires_at, .. }
+        | ChatPayload::GroupCallAnswerClaimV2 { expires_at, .. }
+        | ChatPayload::GroupCallWinnerV2 { expires_at, .. }
+        | ChatPayload::GroupCallTerminalV2 { expires_at, .. }
+        | ChatPayload::SelfCallTerminalV2 { expires_at, .. } => Some(*expires_at),
+        _ => None,
     }
 }
 

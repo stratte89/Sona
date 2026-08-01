@@ -5,7 +5,7 @@
 //! * **Zero relay changes, zero new crypto.** Every participant pair runs one ordinary
 //!   two-member blind room ([`crate::call`]) with its own random id + key, minted by the
 //!   pair's *owner* (the lexicographically smaller identity key — see
-//!   `ChatPayload::GroupCallOffer`) and carried only inside that pair's Double Ratchet
+//!   the v2 group-call offer) and carried only inside that pair's Double Ratchet
 //!   session. Each leg therefore inherits the 1:1 call's security wholesale: E2E
 //!   XChaCha20-Poly1305 under per-direction HKDF keys, strictly-increasing AEAD-bound
 //!   sequence numbers, constant-size CBR frames at constant cadence, and a relay that
@@ -112,6 +112,39 @@ fn spawn_leg_pump(
     });
 }
 
+/// Per-peer playout gain for a group call, in percent, keyed by peer identity key.
+///
+/// Shared with the shell, which owns the durable copy (a listener's volume for someone
+/// is remembered between calls) and writes through to this while a call is running. A
+/// peer with no entry plays at [`crate::call::GAIN_UNITY`], so an empty map is exactly
+/// "everyone as sent" and the common case allocates nothing.
+///
+/// Keyed by identity key rather than username: a leg exists before its username has
+/// been resolved out of history, and the key is what both ends of that lookup agree on.
+#[derive(Clone, Default)]
+pub struct PeerGains(std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>);
+
+impl PeerGains {
+    /// Gain for one peer, defaulting to unity. Never panics on a poisoned lock — a
+    /// volume control is not worth taking a call down for.
+    pub fn get(&self, peer_key: &str) -> u32 {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|m| m.get(peer_key).copied())
+            .unwrap_or(crate::call::GAIN_UNITY)
+    }
+
+    /// Set one peer's gain. Unity is stored rather than removed: the map is tiny, and a
+    /// present-and-unity entry is how "this was explicitly set back to normal" stays
+    /// distinguishable from "never touched" for anything that later iterates it.
+    pub fn set(&self, peer_key: &str, percent: u32) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(peer_key.to_string(), percent.min(crate::call::GAIN_MAX));
+        }
+    }
+}
+
 /// Run a group call until hangup: encode local audio once per tick, seal + send per
 /// leg, decode + mix inbound legs. Legs arrive dynamically on `legs_rx` (people join
 /// mid-call); the channel closing does **not** end the call — only `stop` (local
@@ -121,6 +154,7 @@ pub async fn run_group_call(
     mut audio: impl AudioIo,
     mut stop: tokio::sync::watch::Receiver<bool>,
     muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gains: PeerGains,
     events: UnboundedSender<GroupCallEvent>,
 ) -> Result<()> {
     let mut enc =
@@ -213,7 +247,10 @@ pub async fn run_group_call(
                 let mut mix = [0i32; SAMPLES_PER_FRAME];
                 let mut any = false;
                 for leg in legs.values_mut() {
-                    if let Some(frame) = leg.playout.pop_front() {
+                    if let Some(mut frame) = leg.playout.pop_front() {
+                        // Per-peer volume *before* the sum, which is the only place it
+                        // can go: once legs are mixed there is no separating them again.
+                        crate::call::apply_gain(&mut frame, gains.get(&leg.peer_key));
                         any = true;
                         for (m, s) in mix.iter_mut().zip(frame.iter()) {
                             *m += *s as i32;
@@ -258,6 +295,40 @@ mod tests {
             .map(|m| (*m).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
             .collect();
         assert_eq!(out, vec![i16::MAX; 4]); // saturated, no wraparound
+    }
+
+    /// One peer turned down does not touch anybody else in the mix.
+    #[test]
+    fn per_peer_gain_applies_only_to_that_peer() {
+        let gains = PeerGains::default();
+        gains.set("loud-peer", 50);
+        assert_eq!(gains.get("loud-peer"), 50);
+        assert_eq!(gains.get("someone-else"), crate::call::GAIN_UNITY);
+
+        // The mix, as the engine does it: gain per leg, then sum.
+        let mut mix = [0i32; SAMPLES_PER_FRAME];
+        for (key, level) in [("loud-peer", 1000i16), ("someone-else", 1000i16)] {
+            let mut frame = [level; SAMPLES_PER_FRAME];
+            crate::call::apply_gain(&mut frame, gains.get(key));
+            for (m, s) in mix.iter_mut().zip(frame.iter()) {
+                *m += *s as i32;
+            }
+        }
+        assert_eq!(
+            mix[0],
+            250 + 1000,
+            "turning one peer down must not move the other"
+        );
+    }
+
+    /// A muted peer contributes nothing, and the rest of the call carries on.
+    #[test]
+    fn a_muted_peer_leaves_the_mix_untouched() {
+        let gains = PeerGains::default();
+        gains.set("muted", 0);
+        let mut frame = [12_345i16; SAMPLES_PER_FRAME];
+        crate::call::apply_gain(&mut frame, gains.get("muted"));
+        assert!(frame.iter().all(|&s| s == 0));
     }
 
     /// Every pair leg is keyed independently: a frame sealed for one leg neither opens

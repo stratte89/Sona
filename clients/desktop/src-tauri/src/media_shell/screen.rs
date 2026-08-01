@@ -280,7 +280,7 @@ pub(super) fn capture_screen(
         if let Some(a) = area.as_ref().filter(|a| a.track_geometry) {
             let id = a.drawable;
             area = x11::geometry_of(&g, id).or_else(|| {
-                eprintln!(
+                crate::diag!(
                     "[media] shared window {id} is gone — falling back to the primary screen"
                 );
                 set_screen_target(ScreenTarget::Primary);
@@ -304,10 +304,10 @@ pub(super) fn capture_screen(
             Err(e) => {
                 failures += 1;
                 if window && failures >= GIVE_UP_AFTER {
-                    eprintln!("[media] shared window is unreadable ({e}) — falling back to the primary screen");
+                    crate::diag!("[media] shared window is unreadable ({e}) — falling back to the primary screen");
                     set_screen_target(ScreenTarget::Primary);
                 } else if failures == 1 {
-                    eprintln!("[media] screen grab: {e}");
+                    crate::diag!("[media] screen grab: {e}");
                 }
                 area = None; // re-resolve on the next tick
             }
@@ -392,7 +392,7 @@ pub(super) fn capture_screen(
                 .and_then(|w| w.into_iter().find(|w| w.id().is_ok_and(|i| i == id)))
                 .map(Src::Win)
                 .or_else(|| {
-                    eprintln!(
+                    crate::diag!(
                         "[media] shared window {id} is gone — falling back to the primary screen"
                     );
                     set_screen_target(ScreenTarget::Primary);
@@ -475,10 +475,10 @@ pub(super) fn capture_screen(
                 // clear the target is really gone.
                 failures += 1;
                 if failures == 1 {
-                    eprintln!("[media] screen grab: {e}");
+                    crate::diag!("[media] screen grab: {e}");
                 }
                 if failures >= GIVE_UP_AFTER {
-                    eprintln!(
+                    crate::diag!(
                         "[media] shared source is unreadable — falling back to the primary screen"
                     );
                     set_screen_target(ScreenTarget::Primary);
@@ -511,7 +511,7 @@ mod tests {
         assert!(screens > 0, "no monitors found");
         for s in &sources {
             assert!(!s.name.is_empty(), "unnamed {} source", s.kind);
-            eprintln!(
+            crate::diag!(
                 "{} {} — {} ({}, {} B preview)",
                 s.kind,
                 s.id,

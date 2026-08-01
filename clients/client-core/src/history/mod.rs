@@ -122,6 +122,17 @@ pub struct History {
     /// is exactly how cross-device history drifts apart.
     #[serde(default)]
     outbox: Vec<OutboxItem>,
+    /// What this device last published as its call-control key, so a later unlock can
+    /// tell "already published" from "must publish", and so a fresh publication always
+    /// carries a `created_at` the relay will accept as newer (its shelf is monotonic).
+    /// Lives in the sealed history because publishing only ever happens while unlocked —
+    /// the locked call subsystem needs the secret, not this bookkeeping.
+    #[serde(default)]
+    call_key_published: Option<CallKeyPublication>,
+    /// Short-lived winner/terminal/control envelopes. Separate from general deferred
+    /// history traffic so retry count, TTL cleanup, and capacity are strictly bounded.
+    #[serde(default)]
+    call_outbox: Vec<CallOutboxItem>,
     /// This account's own profile picture (a `data:image/…;base64,…` URI, [`valid_avatar`]),
     /// shown in our own settings and broadcast to contacts via [`ChatPayload::Profile`]. Lives
     /// only inside the sealed history. `None` = no picture.
@@ -156,6 +167,11 @@ const DEAD_SESSION_RETRY_SECS: u64 = 3600;
 /// Outbox depth cap: beyond this the OLDEST entries drop first. Bounds vault growth if
 /// the relay is unreachable for a long time; 512 sealed copies is days of traffic.
 const MAX_OUTBOX: usize = 512;
+/// A burst may contain one control per verified device. Keep enough room for several
+/// simultaneous 1:1/group outcomes without letting an unreachable relay grow the vault.
+const MAX_CALL_OUTBOX: usize = 128;
+/// Initial post plus five retries at 1/2/4/8/16 seconds.
+const MAX_CALL_OUTBOX_ATTEMPTS: u8 = 6;
 
 /// How many of our former usernames' mailboxes we keep draining after renames.
 const MAX_PREVIOUS_USERNAMES: usize = 5;
@@ -1757,12 +1773,16 @@ impl History {
             // key material must never be written into the (persisted) history. The shell
             // handles ringing/answering directly off the inbound event. A history re-export
             // request is likewise handled by the shell, not the timeline.
-            InboundEvent::CallOffered { .. }
-            | InboundEvent::CallAnswered { .. }
-            | InboundEvent::CallEnded { .. }
-            | InboundEvent::GroupCallOffered { .. }
-            | InboundEvent::GroupCallEnded { .. }
-            | InboundEvent::SelfCallHandled { .. }
+            InboundEvent::CallOfferedV2 { .. }
+            | InboundEvent::CallAnswerClaimedV2 { .. }
+            | InboundEvent::CallWinnerV2 { .. }
+            | InboundEvent::CallBusyV2 { .. }
+            | InboundEvent::CallTerminalV2 { .. }
+            | InboundEvent::GroupCallOfferedV2 { .. }
+            | InboundEvent::GroupCallAnswerClaimedV2 { .. }
+            | InboundEvent::GroupCallWinnerV2 { .. }
+            | InboundEvent::GroupCallTerminalV2 { .. }
+            | InboundEvent::SelfCallTerminalV2 { .. }
             | InboundEvent::SyncRequested { .. }
             | InboundEvent::PrimaryTransferOffered { .. } => {}
         }
@@ -2471,6 +2491,27 @@ impl History {
     }
 
     /// Mutate a contact's local preferences. Returns false if the contact is unknown.
+    /// This contact's saved voice volume in percent, or [`crate::call::GAIN_UNITY`] if
+    /// they have never been adjusted.
+    pub fn voice_gain(&self, username: &str) -> u32 {
+        self.contacts
+            .get(username)
+            .and_then(|c| c.voice_gain)
+            .unwrap_or(crate::call::GAIN_UNITY)
+    }
+
+    /// Remember how loud to play this contact. Clamped, because the value arrives from
+    /// a UI slider and the vault should not be able to hold one nothing can produce.
+    ///
+    /// Returns false for an unknown contact — a volume set for somebody who is not a
+    /// pinned contact has nowhere to live, and silently doing nothing would leave the
+    /// UI showing a setting that will not survive the call.
+    pub fn set_voice_gain(&mut self, username: &str, percent: u32) -> bool {
+        self.with_contact_mut(username, |c| {
+            c.voice_gain = Some(percent.min(crate::call::GAIN_MAX));
+        })
+    }
+
     pub fn with_contact_mut(&mut self, username: &str, f: impl FnOnce(&mut ContactPin)) -> bool {
         match self.contacts.get_mut(username) {
             Some(pin) => {
@@ -2610,6 +2651,25 @@ impl History {
         self.pending_promotion = None;
     }
 
+    /// What this device last published on its call-control shelf, if anything.
+    pub fn call_key_published(&self) -> Option<&CallKeyPublication> {
+        self.call_key_published.as_ref()
+    }
+
+    /// Record a successful call-key publication.
+    pub fn set_call_key_published(&mut self, public_key: &str, created_at: u64, device_id: &str) {
+        self.call_key_published = Some(CallKeyPublication {
+            public_key: public_key.to_string(),
+            created_at,
+            device_id: device_id.to_string(),
+        });
+    }
+
+    /// Forget the published call key (local wipe, revocation, or a fresh identity).
+    pub fn clear_call_key_published(&mut self) {
+        self.call_key_published = None;
+    }
+
     /// Whether the relay has told this device it was revoked from the account roster.
     pub fn revoked(&self) -> bool {
         self.revoked
@@ -2653,6 +2713,105 @@ impl History {
     /// Whether anything is waiting in the outbox (due or not).
     pub fn outbox_is_empty(&self) -> bool {
         self.outbox.is_empty()
+    }
+
+    /// Durably queue urgent call-control envelopes before their first post. Only
+    /// short-lived `CallControl` traffic is admitted; duplicate recipient/message pairs
+    /// are idempotent.
+    pub fn call_outbox_push(
+        &mut self,
+        envelopes: &[protocol_types::Envelope],
+        now: u64,
+    ) -> Vec<bool> {
+        for envelope in envelopes {
+            if !matches!(envelope.wake, protocol_types::WakeClass::CallControl)
+                || envelope
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at <= now)
+                || self.call_outbox.iter().any(|item| {
+                    item.envelope.msg_id == envelope.msg_id && item.envelope.to == envelope.to
+                })
+            {
+                continue;
+            }
+            self.call_outbox.push(CallOutboxItem {
+                envelope: envelope.clone(),
+                due_at: now,
+                attempts: 0,
+            });
+        }
+        if self.call_outbox.len() > MAX_CALL_OUTBOX {
+            let excess = self.call_outbox.len() - MAX_CALL_OUTBOX;
+            self.call_outbox.drain(..excess);
+        }
+        envelopes
+            .iter()
+            .map(|envelope| {
+                self.call_outbox.iter().any(|item| {
+                    item.envelope.msg_id == envelope.msg_id && item.envelope.to == envelope.to
+                })
+            })
+            .collect()
+    }
+
+    /// Remove locally expired controls; the relay would reject them too, but retaining
+    /// ciphertext after its useful lifetime only wastes encrypted-vault space.
+    pub fn call_outbox_reap(&mut self, now: u64) -> usize {
+        let before = self.call_outbox.len();
+        self.call_outbox
+            .retain(|item| item.envelope.expires_at.is_some_and(|expiry| expiry > now));
+        before - self.call_outbox.len()
+    }
+
+    /// Every call control whose bounded retry deadline has arrived.
+    pub fn call_outbox_due(&self, now: u64) -> Vec<protocol_types::Envelope> {
+        self.call_outbox
+            .iter()
+            .filter(|item| {
+                item.due_at <= now && item.envelope.expires_at.is_some_and(|expiry| expiry > now)
+            })
+            .map(|item| item.envelope.clone())
+            .collect()
+    }
+
+    /// Apply one batch's relay results. Accepted entries disappear; failures back off
+    /// 1/2/4/8/16 seconds and disappear after the sixth total attempt or envelope expiry.
+    pub fn call_outbox_settle(&mut self, attempted: &[(protocol_types::Envelope, bool)], now: u64) {
+        for (envelope, accepted) in attempted {
+            let Some(index) = self.call_outbox.iter().position(|item| {
+                item.envelope.msg_id == envelope.msg_id && item.envelope.to == envelope.to
+            }) else {
+                continue;
+            };
+            if *accepted {
+                self.call_outbox.remove(index);
+                continue;
+            }
+            let item = &mut self.call_outbox[index];
+            item.attempts = item.attempts.saturating_add(1);
+            if item.attempts >= MAX_CALL_OUTBOX_ATTEMPTS
+                || item.envelope.expires_at.is_none_or(|expiry| expiry <= now)
+            {
+                self.call_outbox.remove(index);
+                continue;
+            }
+            let shift = item.attempts.saturating_sub(1).min(4);
+            item.due_at = now.saturating_add(1u64 << shift);
+        }
+        self.call_outbox_reap(now);
+    }
+
+    /// Earliest pending retry, excluding already-expired entries.
+    pub fn call_outbox_next_due(&self, now: u64) -> Option<u64> {
+        self.call_outbox
+            .iter()
+            .filter(|item| item.envelope.expires_at.is_some_and(|expiry| expiry > now))
+            .map(|item| item.due_at)
+            .min()
+    }
+
+    pub fn call_outbox_is_empty(&self) -> bool {
+        self.call_outbox.is_empty()
     }
 
     /// The pinned roster for a contact (`None` = single-device / never fetched).
@@ -2732,10 +2891,10 @@ impl History {
     }
 
     /// A silent drop that a KT roster refresh could repair: `sender_key` is completely
-    /// unattributed (no roster maps it, no contact pins it) while `claimed` IS a pinned
-    /// contact — either that contact linked a device we haven't resolved yet, or their
-    /// key rotated. Without a refresh, [`screen_inbound`](Self::screen_inbound)'s spoof
-    /// rule drops this sender's content without a trace (the name-collision branch).
+    /// unattributed (no roster maps it, no contact pins it) while `claimed` is a pinned
+    /// contact or known group member — they may have linked a device we have not resolved
+    /// yet, or rotated their key. Without a refresh,
+    /// [`screen_inbound`](Self::screen_inbound)'s spoof rule drops the content.
     /// Returns the username whose roster should be re-resolved.
     pub fn device_resolution_candidate(&self, sender_key: &str, claimed: &str) -> Option<String> {
         if claimed.is_empty()
@@ -2744,9 +2903,15 @@ impl History {
         {
             return None;
         }
-        self.contacts
-            .contains_key(claimed)
-            .then(|| claimed.to_string())
+        let known_account = self.contacts.contains_key(claimed)
+            || self.groups.values().any(|group| {
+                !group.left
+                    && group
+                        .members
+                        .iter()
+                        .any(|member| member.username == claimed)
+            });
+        known_account.then(|| claimed.to_string())
     }
 
     /// Resolve a sending device key to the conversation key to file it under: the owning
@@ -2828,6 +2993,80 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call_control_envelope(msg_id: &str, expires_at: u64) -> protocol_types::Envelope {
+        protocol_types::Envelope {
+            to: protocol_types::IdentityHash::from_identifier("call-outbox-target"),
+            ciphertext: "sealed".into(),
+            kind: protocol_types::PayloadKind::Message,
+            msg_id: msg_id.into(),
+            expires_at: Some(expires_at),
+            wake: protocol_types::WakeClass::CallControl,
+            raw_identifier: None,
+        }
+    }
+
+    #[test]
+    fn call_outbox_is_ttl_attempt_and_capacity_bounded() {
+        let mut history = History::new();
+        let envelope = call_control_envelope("control", 200);
+        assert_eq!(
+            history.call_outbox_push(std::slice::from_ref(&envelope), 100),
+            vec![true]
+        );
+        assert_eq!(
+            history.call_outbox_push(std::slice::from_ref(&envelope), 100),
+            vec![true]
+        );
+        assert_eq!(history.call_outbox_due(100).len(), 1);
+        let restored = History::open(&[9u8; 32], &history.seal(&[9u8; 32]));
+        assert_eq!(
+            restored.call_outbox_due(100).len(),
+            1,
+            "pending controls survive process restart"
+        );
+
+        let mut normal = envelope.clone();
+        normal.msg_id = "not-a-control".into();
+        normal.wake = protocol_types::WakeClass::Normal;
+        assert_eq!(history.call_outbox_push(&[normal], 100), vec![false]);
+        assert_eq!(history.call_outbox_due(100).len(), 1);
+
+        let expected_due = [101, 103, 107, 115, 131];
+        let mut attempt_at = 100;
+        for next_due in expected_due {
+            history.call_outbox_settle(&[(envelope.clone(), false)], attempt_at);
+            assert!(history.call_outbox_due(next_due - 1).is_empty());
+            assert_eq!(history.call_outbox_next_due(next_due - 1), Some(next_due));
+            attempt_at = next_due;
+        }
+        history.call_outbox_settle(&[(envelope.clone(), false)], attempt_at);
+        assert!(history.call_outbox_is_empty());
+
+        let mut accepted = History::new();
+        let _ = accepted.call_outbox_push(std::slice::from_ref(&envelope), 100);
+        accepted.call_outbox_settle(&[(envelope.clone(), true)], 100);
+        assert!(accepted.call_outbox_is_empty());
+
+        let mut expired = History::new();
+        let _ = expired.call_outbox_push(&[call_control_envelope("expired", 101)], 100);
+        assert_eq!(expired.call_outbox_reap(101), 1);
+        assert!(expired.call_outbox_is_empty());
+
+        let many: Vec<_> = (0..MAX_CALL_OUTBOX + 7)
+            .map(|index| call_control_envelope(&format!("control-{index}"), 200))
+            .collect();
+        let mut bounded = History::new();
+        let admitted = bounded.call_outbox_push(&many, 100);
+        assert!(admitted[..7].iter().all(|admitted| !admitted));
+        assert!(admitted[7..].iter().all(|admitted| *admitted));
+        assert_eq!(bounded.call_outbox_due(100).len(), MAX_CALL_OUTBOX);
+        assert_eq!(
+            bounded.call_outbox_due(100)[0].msg_id,
+            "control-7",
+            "oldest entries drop first"
+        );
+    }
 
     // Build an admin-model group "g1" with the given members (the FIRST member is the
     // admin, with a fresh signing key). Every group is admin-model now; the egalitarian-op
@@ -3956,12 +4195,29 @@ mod tests {
         // Not repairable: unknown name (plain stranger request path handles it)…
         assert_eq!(h.device_resolution_candidate("mystery-key", "bob"), None);
         assert_eq!(h.device_resolution_candidate("mystery-key", ""), None);
+        // A current group member is safe to resolve even when they are not a direct
+        // contact; otherwise calls from their newly linked devices would be dropped.
+        h.groups.insert(
+            "group".into(),
+            GroupRecord {
+                members: vec![GroupMember {
+                    username: "bob".into(),
+                    identity_key: "bob-key".into(),
+                }],
+                ..GroupRecord::default()
+            },
+        );
+        assert_eq!(
+            h.device_resolution_candidate("mystery-key", "bob"),
+            Some("bob".to_string())
+        );
         // …the pinned key itself…
         assert_eq!(h.device_resolution_candidate("alice-key", "alice"), None);
         // …or a key a verified roster already attributes.
         let devs = vec![RosterDevice {
             device_id: "aa".repeat(16),
             identity_key: "mystery-key".into(),
+            signing_key: String::new(),
         }];
         h.pin_roster("alice", 0, 0, "alice-key", devs).unwrap();
         assert_eq!(h.device_resolution_candidate("mystery-key", "alice"), None);
@@ -3974,10 +4230,12 @@ mod tests {
             RosterDevice {
                 device_id: "0".into(),
                 identity_key: "primary".into(),
+                signing_key: String::new(),
             },
             RosterDevice {
                 device_id: "aa".repeat(16),
                 identity_key: "linked".into(),
+                signing_key: String::new(),
             },
         ];
         h.pin_roster("alice", 0, 0, "primary", devs.clone())
@@ -4002,6 +4260,7 @@ mod tests {
         let new_owner = vec![RosterDevice {
             device_id: "0".into(),
             identity_key: "new-primary".into(),
+            signing_key: String::new(),
         }];
         assert!(h
             .pin_roster("alice", 0, 0, "new-primary", new_owner.clone())
@@ -4022,10 +4281,12 @@ mod tests {
             RosterDevice {
                 device_id: "0".into(),
                 identity_key: "primary".into(),
+                signing_key: String::new(),
             },
             RosterDevice {
                 device_id: "bb".repeat(16),
                 identity_key: "linked".into(),
+                signing_key: String::new(),
             },
         ];
         h.pin_roster("alice", 0, 0, "primary", with_linked).unwrap();
@@ -4034,6 +4295,7 @@ mod tests {
         let only_primary = vec![RosterDevice {
             device_id: "0".into(),
             identity_key: "primary".into(),
+            signing_key: String::new(),
         }];
         h.pin_roster("alice", 0, 1, "primary", only_primary)
             .unwrap();
@@ -4055,10 +4317,12 @@ mod tests {
                 RosterDevice {
                     device_id: "0".into(),
                     identity_key: "myprimary".into(),
+                    signing_key: String::new(),
                 },
                 RosterDevice {
                     device_id: "cc".repeat(16),
                     identity_key: "mydevice2".into(),
+                    signing_key: String::new(),
                 },
             ],
         )
@@ -4113,10 +4377,12 @@ mod tests {
                 RosterDevice {
                     device_id: "0".into(),
                     identity_key: "myprimary".into(),
+                    signing_key: String::new(),
                 },
                 RosterDevice {
                     device_id: "cc".repeat(16),
                     identity_key: "mydevice2".into(),
+                    signing_key: String::new(),
                 },
             ],
         )
@@ -4157,10 +4423,12 @@ mod tests {
                 RosterDevice {
                     device_id: "0".into(),
                     identity_key: "myprimary".into(),
+                    signing_key: String::new(),
                 },
                 RosterDevice {
                     device_id: "cc".repeat(16),
                     identity_key: "mydevice2".into(),
+                    signing_key: String::new(),
                 },
             ],
         )
@@ -4387,10 +4655,12 @@ mod tests {
                 RosterDevice {
                     device_id: "0".into(),
                     identity_key: "bob-primary".into(),
+                    signing_key: String::new(),
                 },
                 RosterDevice {
                     device_id: "dd".repeat(16),
                     identity_key: "bob-phone".into(),
+                    signing_key: String::new(),
                 },
             ],
         )
@@ -4428,6 +4698,7 @@ mod tests {
             vec![RosterDevice {
                 device_id: "0".into(),
                 identity_key: "bob-primary".into(),
+                signing_key: String::new(),
             }],
         )
         .unwrap();
@@ -4821,10 +5092,12 @@ mod tests {
                 RosterDevice {
                     device_id: "0".into(),
                     identity_key: "myprimary".into(),
+                    signing_key: String::new(),
                 },
                 RosterDevice {
                     device_id: "cc".repeat(16),
                     identity_key: "mydevice2".into(),
+                    signing_key: String::new(),
                 },
             ],
         )

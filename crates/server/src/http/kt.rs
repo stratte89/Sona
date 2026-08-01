@@ -148,6 +148,7 @@ pub(crate) async fn publish_roster(
         db,
         push,
         live,
+        call_keys,
         ..
     } = &mut *inner;
     for d in &accepted.devices {
@@ -198,9 +199,22 @@ pub(crate) async fn publish_roster(
             let mailbox = mailbox.as_str().to_string();
             directory.remove(&mailbox);
             push.remove(&mailbox);
+            // A revoked device's call-control key goes with it: no capsule may be sealed
+            // to a device the account no longer recognizes, and its call-control mailbox
+            // stops authenticating.
+            call_keys.remove(&mailbox);
+            let call_mailbox =
+                protocol_types::call_mailbox_hash(&hash, dropped).map(|h| h.as_str().to_string());
+            if let Some(call_mailbox) = &call_mailbox {
+                directory.remove(call_mailbox);
+            }
             if let Some(db) = db {
                 let _ = db.delete_directory(&mailbox);
                 let _ = db.delete_push(&mailbox);
+                let _ = db.delete_call_key(&mailbox);
+                if let Some(call_mailbox) = &call_mailbox {
+                    let _ = db.delete_directory(call_mailbox);
+                }
             }
             // Drop the mailbox's live channels — the forward task ends, which closes
             // the socket. A truly revoked device is told why first; reconnects land on

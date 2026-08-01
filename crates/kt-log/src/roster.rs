@@ -262,7 +262,7 @@ impl KtRosterEntry {
 }
 
 /// Length-prefixed field append (same convention as `entry.rs`).
-fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
+pub(crate) fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(&(field.len() as u64).to_be_bytes());
     buf.extend_from_slice(field);
 }

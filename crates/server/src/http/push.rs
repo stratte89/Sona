@@ -18,6 +18,9 @@ pub struct PushUnregisterRequest {
     pub signature: String,
 }
 
+/// Clock skew tolerated on a published call-key mint time.
+const CALL_KEY_SKEW_SECS: u64 = 300;
+
 /// Shared HTTP client for wake POSTs: no redirects (a push endpoint has no business
 /// redirecting, and following one widens SSRF), tight timeout.
 pub(crate) fn push_client() -> &'static reqwest::Client {
@@ -245,6 +248,118 @@ pub(crate) async fn push_unregister(
     StatusCode::OK.into_response()
 }
 
+// ─────────────────────── Call-control key bindings ───────────────────────
+// A device publishes the Curve25519 key that incoming-call capsules are sealed to, so a
+// locked phone can be rung without opening its chat vault. The relay is a dumb, bounded
+// shelf here: the binding is signed by the device's own roster key and every fetcher
+// re-verifies it against the KT roster, so the relay can neither mint a key nor point a
+// caller at one of its own. All it enforces is *who may write this shelf*.
+
+#[derive(Deserialize)]
+pub struct CallKeyPublishRequest {
+    /// Mailbox hash of the publishing device (the account hash for the primary).
+    pub hash: String,
+    /// The account's username hash. Checked against `hash` + the binding's device id, so
+    /// it cannot name an account this device does not belong to — and it is what the
+    /// call-control mailbox is derived from.
+    pub account_hash: String,
+    /// Single-use nonce from `GET /v1/challenge`.
+    pub nonce: String,
+    /// Ed25519 over [`protocol_types::call_key_publish_signing_message`], by the same
+    /// device key the directory holds for `hash`.
+    pub signature: String,
+    pub binding: kt_log::CallKeyBinding,
+}
+
+pub(crate) async fn publish_call_key(
+    State(state): State<AppState>,
+    Json(req): Json<CallKeyPublishRequest>,
+) -> Response {
+    if IdentityHash::from_hex(&req.hash).is_none() {
+        return (StatusCode::BAD_REQUEST, "malformed hash").into_response();
+    }
+    if !req.binding.well_formed() {
+        return (StatusCode::BAD_REQUEST, "malformed binding").into_response();
+    }
+    // The publisher's mailbox must really be this account's mailbox for this device.
+    let derived = protocol_types::device_mailbox_hash(&req.account_hash, &req.binding.device_id);
+    if derived.map(|h| h.as_str().to_string()).as_deref() != Some(req.hash.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "mailbox does not match the account",
+        )
+            .into_response();
+    }
+    let Some(call_mailbox) =
+        protocol_types::call_mailbox_hash(&req.account_hash, &req.binding.device_id)
+    else {
+        return (StatusCode::BAD_REQUEST, "malformed account hash").into_response();
+    };
+    let call_mailbox = call_mailbox.as_str().to_string();
+    // A key minted far in the future would out-rank every later honest publication for
+    // that device (`supersedes` is time-ordered), so refuse one outright.
+    let t = now();
+    if req.binding.created_at > t.saturating_add(CALL_KEY_SKEW_SECS) {
+        return (StatusCode::BAD_REQUEST, "binding is from the future").into_response();
+    }
+    let msg = protocol_types::call_key_publish_signing_message(
+        &req.hash,
+        &req.binding.call_key,
+        req.binding.created_at,
+        &req.nonce,
+    );
+    let mut inner = state.inner.lock().unwrap();
+    if let Err(err) = consume_and_verify(&mut inner, &req.hash, &req.nonce, &msg, &req.signature, t)
+    {
+        return err.into_response();
+    }
+    // Monotonic per mailbox: a replayed older publication must not displace the key the
+    // device is actually listening with.
+    if inner
+        .call_keys
+        .get(&req.hash)
+        .is_some_and(|current| !req.binding.supersedes(current) && *current != req.binding)
+    {
+        return (StatusCode::CONFLICT, "a newer call key is published").into_response();
+    }
+    // Give the device's call-control mailbox a directory record of its own, keyed by the
+    // published Ed25519 half. That is what lets a **locked** device authenticate a
+    // subscription to it: its account signing key is sealed in the vault, and the whole
+    // point of the capsule path is that it works without opening it. The record carries
+    // no one-time keys — nothing establishes a ratchet session there.
+    let entry = DirectoryEntry {
+        identity_key: req.binding.call_key.clone(),
+        signing_key: req.binding.call_signing_key.clone(),
+        one_time_keys: Default::default(),
+        fallback_key: None,
+    };
+    if let Some(db) = &inner.db {
+        if let Ok(json) = serde_json::to_string(&req.binding) {
+            let _ = db.upsert_call_key(&req.hash, &json);
+        }
+        let _ = db.upsert_directory(&call_mailbox, &entry);
+    }
+    inner.directory.insert(call_mailbox, entry);
+    inner.call_keys.insert(req.hash.clone(), req.binding);
+    StatusCode::OK.into_response()
+}
+
+/// Serve a device's published call-control binding. Public, like a prekey bundle — the
+/// fetcher's KT-roster verification is what makes it trustworthy.
+pub(crate) async fn fetch_call_key(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Response {
+    if IdentityHash::from_hex(&hash).is_none() {
+        return (StatusCode::BAD_REQUEST, "malformed hash").into_response();
+    }
+    let inner = state.inner.lock().unwrap();
+    match inner.call_keys.get(&hash) {
+        Some(binding) => Json(binding.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, "no call key published").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::acceptable_push_endpoint as accept_full;
@@ -290,6 +405,7 @@ mod tests {
         let config = Config {
             wake_debounce_secs: 30,
             call_wake_min_secs: 2,
+            control_wake_min_secs: 1,
             ..Config::default()
         };
         let mut sub = PushSub {
@@ -311,6 +427,18 @@ mod tests {
         // …but has its own 2 s anti-flood interval.
         assert!(claim_wake(&mut sub, WakeClass::Call, 1032, &config).is_none());
         assert!(claim_wake(&mut sub, WakeClass::Call, 1033, &config).is_some());
+        // Terminal controls use a bucket of their own, so a ring-offer debounce can never
+        // swallow the one instruction capable of stopping an already-presented Android
+        // ring, and one call's worth of controls all get through together.
+        for _ in 0..crate::http::msg::CONTROL_WAKE_BURST {
+            assert!(claim_wake(&mut sub, WakeClass::CallControl, 1033, &config).is_some());
+        }
+        // …but the bucket is bounded, or one sender could drive an unbounded stream of
+        // silent high-priority wakes at a device whose user sees only battery drain (A-15).
+        assert!(claim_wake(&mut sub, WakeClass::CallControl, 1033, &config).is_none());
+        // It refills at the configured rate rather than staying shut.
+        assert!(claim_wake(&mut sub, WakeClass::CallControl, 1034, &config).is_some());
+        assert!(claim_wake(&mut sub, WakeClass::CallControl, 1034, &config).is_none());
         // And a call wake does not consume the normal debounce slot.
         assert!(claim_wake(&mut sub, WakeClass::Normal, 1060, &config).is_some());
     }

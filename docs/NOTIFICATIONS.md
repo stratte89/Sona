@@ -67,13 +67,25 @@ start-before-unregister — never a gap with neither transport live.
 
 | Mode | What runs | Latency | Battery | Third parties |
 |---|---|---|---|---|
-| **Connection** (default) | foreground service + persistent WebSocket | sub-second | highest | none |
-| **Connection + push fallback** | both: socket while alive, push when the OS kills it | sub-second, self-healing | medium | broker sees wakes only when the socket is dead |
+| **Connection** | foreground service + persistent WebSocket | sub-second | highest | none |
+| **Connection + push fallback** (default) | both: socket while alive, push when the OS kills it | sub-second, self-healing | medium | broker sees wakes only when the socket is dead |
 | **Push only** | no persistent service; relay wakes the device per message | seconds (deep Doze: tens) | ≈ idle | broker sees every wake |
 
 The relay only fires a wake when it has **no live subscriber** for the mailbox, so in
 C+P pushes fire exactly when the socket is dead (OEM kill, Doze park, crash) — the
 system self-heals without double delivery.
+
+**The default is resolved, not fixed** (`push.rs::auto_delivery_target`). Until the
+user picks a mode in settings (`Prefs.delivery_mode_set`), the stored value is a
+default re-resolved after every unlock and whenever a push transport appears or
+disappears: **C+P** where a wake transport is actually usable — a transport on the
+phone *and* a relay that can drive it — and **C** everywhere else. Never P: push-only
+is an explicit choice, because a best-effort wake is not something an incoming call
+can be relied on to survive. Both targets keep the connection, so
+a push token appearing never takes a healthy connection down, and a distributor being
+uninstalled leaves the connection carrying everything. With no usable wake path the
+health panel says **"Push fallback not configured"** rather than implying coverage
+that does not exist.
 
 **Transport policy (capability-adaptive UI).** Two audiences, one backend:
 
@@ -190,7 +202,20 @@ can never lie:
 - `onTaskRemoved` is a no-op; Doze-exemption status is surfaced live in the health
   panel instead of fire-and-forgotten.
 
-## 5. Calls — the native ring
+## 5. Calls — Core-Telecom and the native ring
+
+**Core-Telecom owns the call.** Sona registers with `CallsManager` in
+`Application.onCreate` (before any component can ring) and adds every incoming and
+outgoing call to the platform, so ringing, answered, active, held and disconnected are
+system states rather than a private state machine. That is what makes a call visible to
+a watch, a headset, and a car head unit, what survives an Activity or WebView being
+destroyed, and what owns the audio route (§5.1). Hold and streaming are deliberately
+**not** advertised: a capability Sona cannot honor is how a car ends up holding a call
+that never comes back. Every ring carries an opaque single-use `ring_handle` that keys
+the system call, the notification, and every cancellation — never the media room id,
+which is a capability and must not reach the platform call log.
+
+The notification below is Core-Telecom's *presentation*, not a second lifecycle.
 
 `showCall` (bridge): API 31+ `Notification.CallStyle.forIncomingCall`; API 26–30
 equivalent high-priority actions. Both: `CATEGORY_CALL`, ongoing, full-screen intent
@@ -200,13 +225,14 @@ ringtone until the notification is cancelled — no MediaPlayer to babysit),
 `notif_level` (generic level rings as "Sona — Incoming call"). Group calls take the
 identical path with the group name.
 
-**Answer** — the notification's Answer action (and the full-screen intent) opens
-`MainActivity` with `call=<id>&call_action=answer`. The webview arms a 60-second
-auto-answer flag and **redeems it wherever the incoming-call state materializes**:
-the live `call`/group-call event (warm app) or the `call_status` resync after unlock
-(cold/locked start). Net effect: tap Answer → (unlock if needed) → the call connects
-without touching in-app buttons. The flag is time-scoped, not id-matched — a tap can
-only refer to the one live ring, and a stale tap must not answer a later call.
+**Answer** — the notification's Answer action goes to Rust, which is the single answer
+path Core-Telecom, a headset, a watch and the lock screen all share. Rust decides
+whether this device may answer now or must open the vault first;
+when it must, it brings the app forward itself and holds the answer against the exact
+`call_instance_id` + `ring_handle` until the unlock completes, bounded at 45 s
+(§8). The superseded design — a 60-second WebView flag redeemed by whatever rang next
+— is gone: it answered later calls as readily as the right one, and answered before
+anything checked who was holding the phone.
 
 **Decline** — `NotifActionReceiver` (exported=false) cancels the notification and
 sends `decline_call{call_id}` through the engine, validated against the live offer —
@@ -214,8 +240,9 @@ works without ever opening the UI. Declining the *generic* locked ring (below) j
 dismisses it: there is no decryptable offer to decline yet.
 
 **Cancel paths** (engine-driven): caller hung up → cancel + "Missed call" (status
-channel); answered/declined on another device (`SelfCallHandled` — ring-all is live)
-→ silent cancel; ring timeout → cancel + missed. In-app accept/decline cancels the
+channel); answered or declined on another device (a `CallTerminalV2` naming
+`answered_elsewhere` / `declined_elsewhere`, plus its capsule copy for a locked or
+sleeping phone — ring-all is live) → silent cancel; ring timeout → cancel + missed. In-app accept/decline cancels the
 native ring for that call id. **Every successful unlock also clears the locked-state
 generics** (`clearGenerics`): the generic ring is superseded the moment real,
 decrypted call state exists — it must never keep "ringing" beside the real call UI.
@@ -224,13 +251,12 @@ Foreground suppression: when the activity is resumed *and* unlocked, the engine
 skips the native ring — the in-app ring UI handles it (no double audio). Any other
 state rings natively.
 
-**Headset-button answer.** For the ring window (and only it), the bridge holds an
-active `MediaSession`: a tap on the earbuds/headset button (HEADSETHOOK,
-play/pause, CALL) answers; stop/end keys decline. This works without a Telecom
-`ConnectionService` because virtually every headset's tap arrives as a media-button
-KeyEvent when an active session claims it; the true HFP call button stays a Telecom
-follow-up. The session starts for **every** ring — native or in-app — and is
-released with it, so music apps get their buttons back the moment the ring ends.
+**Headset / watch / car answer.** Core-Telecom delivers these directly: a registered
+call receives the real HFP call button and every remote surface's answer and hangup.
+The ring-window `MediaSession` that used to approximate this — it claimed media-button
+KeyEvents because an unregistered app never receives the HFP button — is deleted along
+with the parallel accept path it fed. Platform callbacks report to Rust and return
+immediately; nothing waits inside one for a relay round trip or a human unlock.
 The accept runs the exact same path as the UI button (`call_accept_inner`), fully
 native audio, so answering with the app closed still produces a working call.
 
@@ -309,8 +335,9 @@ off in the UI with an explanation; the webhook path remains.
 Push registration is **per mailbox** (`register_push_as`, same auth path as
 `subscribe_as`): a linked device registers its device mailbox, the primary the
 account mailbox; unlink/revoke unregisters. Ring-all-devices already fans call
-offers per device mailbox — each offline device gets its own `Call`-class wake, and
-`SelfCallHandled` cancels the losers' rings after their drains. Former-username
+offers per device mailbox — each offline device gets its own `Call`-class wake, and the
+`answered_elsewhere` terminal (urgent-silent `CallControl` wake, so a sleeping phone
+wakes to stop ringing) cancels the losers' rings after their drains. Former-username
 mailboxes are not push-registered (their backlog surfaces on next open).
 
 ### 6.7 UnifiedPush — the Google-free push transport
@@ -433,12 +460,12 @@ auto-unlock; it is never enabled silently.
 | 8 | Reboot | boot receiver (C, after first unlock); FCM works from boot (P); before first unlock → generics only (OS design) |
 | 9 | Force-stop from app settings | Android contract: nothing runs until the user opens the app (unfixable, Signal included); health panel reports it |
 | 10 | Call, screen locked | CallStyle + FSI + insistent ringtone over the lock screen |
-| 11 | Call while vault locked (P/C+P) | generic insistent ring → unlock → real call, auto-answered if Answer was tapped |
+| 11 | Call while vault locked (P/C+P) | call-control capsule decides: live ring → generic insistent ring; terminal → the ring is cancelled. Answer → unlock → the held claim is submitted for that exact call |
 | 12 | Caller hangs up pre-answer | ring cancelled + "Missed call"; FCM TTL 60 s kills stale call wakes in transit |
 | 13 | Answered on another device | silent cancel (ring-all preserved) |
 | 14 | Offer expires (45 s) | notification timeout + engine timer both cancel; missed-call posted |
 | 15 | FCM token rotates / reinstall | `onNewToken` re-registers; relay purges dead tokens |
-| 16 | Play Services absent | FCM mode hidden; webhook/UnifiedPush shape remains; C default unaffected |
+| 16 | Play Services absent | no Firebase class is loaded at all (`SonaApp` gates init on the `com.google.android.gms` package being installed); FCM modes hidden; webhook/UnifiedPush shape remains; the default resolves to C |
 | 17 | Relay restart | jittered backoff reconnects; wakes fire for envelopes queued while down |
 | 18 | Poison envelope in a drain | poison-ack invariant keeps the loop alive; later messages still notify |
 | 19 | Disappearing message expires in the shade | reaper cancels the chat notification |
@@ -454,13 +481,15 @@ auto-unlock; it is never enabled silently.
 ## 10. Future work
 
 - Server ping-interval battery tuning (server config, `http/`).
-- Telecom/`ConnectionService` integration (in-car UI, the true HFP call button) —
-  CallStyle + FSI covers ring correctness and the MediaSession path (§5) covers
-  headset-button answer without it.
+- On-device certification of the Core-Telecom lifecycle, the locked call-control layer
+  and the resolved delivery default: they build and are covered host-side, but nothing
+  runtime is proven until the `NOTIFICATIONS_TESTING.md` matrix runs on real phones.
 
 (UnifiedPush (§6.7), the mark-read / inline-reply shade actions (§3), and the live
-health panel with OEM dontkillmyapp guidance (§7.1) shipped 2026-07-12. A metrics
-debug screen was considered and dropped — not needed.)
+health panel with OEM dontkillmyapp guidance (§7.1) shipped 2026-07-12. Core-Telecom —
+which was this section's open item, listed as "in-car UI and the true HFP call button" —
+landed with the call-reliability work and is now §5. A metrics debug screen was
+considered and dropped — not needed.)
 
 ## 11. Testing
 

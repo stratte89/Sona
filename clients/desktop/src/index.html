@@ -120,6 +120,11 @@
         <div class="self-tile" id="self-scr" hidden>
           <canvas id="cv-self-scr"></canvas>
           <span class="self-note"><span class="spinner-sm"></span>starting share…</span>
+          <!-- Your own share: nothing to turn down (it is not played back to you), so
+               this menu is stop + fullscreen and nothing else. -->
+          <button class="cv-ctl selfscr-menu" id="selfscr-menu" data-icon="dots"
+                  aria-label="Your screen share options" aria-haspopup="menu"
+                  aria-expanded="false"></button>
         </div>
         <span class="self-tag">You</span>
       </div>
@@ -130,13 +135,35 @@
         <div class="call-video" id="call-video" hidden>
           <canvas class="cv-tile cv-screen" id="cv-screen" hidden></canvas>
           <canvas class="cv-tile cv-camera" id="cv-camera" hidden></canvas>
+          <!-- Overlay controls for the stream you are WATCHING. Fade in on hover (and
+               stay put on touch); the same menu opens on right-click anywhere on the
+               picture, which is where people reach for it. -->
+          <div class="cv-ctls" id="cv-ctls" hidden>
+            <button class="cv-ctl" id="cv-menu" data-icon="dots" aria-label="Stream options"
+                    aria-haspopup="menu" aria-expanded="false"></button>
+            <button class="cv-ctl" id="cv-full" data-icon="full" aria-label="Fullscreen"></button>
+          </div>
         </div>
         <div class="call-idle" id="call-idle">
-          <div class="avatar call-avatar" id="call-avatar">?</div>
+          <div class="call-avwrap">
+            <div class="avatar call-avatar" id="call-avatar">?</div>
+            <button class="cv-ctl av-menu" id="call-voicemenu" data-icon="dots"
+                    aria-label="Voice options" aria-haspopup="menu"
+                    aria-expanded="false" hidden></button>
+          </div>
           <p class="call-hint">End-to-end encrypted · routed through your relay · no IP shared</p>
         </div>
       </div>
       <div class="call-bar">
+        <!-- The peer, in the control bar. The big avatar on the idle card is covered
+             the moment any video starts, and with it went the only way to reach their
+             voice controls mid-share — so it also lives here, where nothing covers it.
+             Click or right-click opens the same menu. -->
+        <button class="barav" id="call-barav" aria-label="Voice options"
+                aria-haspopup="menu" aria-expanded="false" hidden>
+          <span class="avatar" id="call-baravatar">?</span>
+          <span class="barav-dots" aria-hidden="true"></span>
+        </button>
         <div class="call-barid">
           <span class="call-barname" id="call-barname">—</span>
           <span class="call-barstate" id="call-barstate">calling…</span>
@@ -153,6 +180,10 @@
         </div>
       </div>
     </div>
+
+    <!-- Volume/stream popover: one node, contents rebuilt per open. Lives outside the
+         call UI so it can sit above a fullscreen stage. -->
+    <div class="volmenu" id="volmenu" hidden role="menu"></div>
 
     <!-- ── Minimised call bubble ───────────────────────────────────────────────────
          Where the call goes when collapsed, so the chat list and every conversation
@@ -825,6 +856,8 @@
             <button class="rowbtn" id="se-typing"><span class="rowico" data-icon="edit"></span>Send typing indicators<em id="se-typing-state"></em></button>
             <button class="rowbtn" id="se-receipts"><span class="rowico" data-icon="check"></span>Send read receipts<em id="se-receipts-state"></em></button>
             <button class="rowbtn" id="se-notif"><span class="rowico" data-icon="bell"></span>Notification content<em id="se-notif-state"></em></button>
+            <button class="rowbtn" id="se-callunlock" hidden><span class="rowico" data-icon="lock"></span>Unlock to answer calls<em id="se-callunlock-state"></em></button>
+            <button class="rowbtn" id="se-callret" hidden><span class="rowico" data-icon="phone"></span>Keep call records<em id="se-callret-state"></em></button>
             <button class="rowbtn" id="se-proxy"><span class="rowico" data-icon="shield"></span>Tor / SOCKS proxy<em id="se-proxy-state"></em></button>
           </div>
           <p class="hint">With message requests on, someone new has to knock first — you decide
@@ -902,10 +935,16 @@
     <script src="js/50-media.js"></script>
     <script src="js/60-settings.js"></script>
     <script src="js/61-updates.js"></script>
+    <script src="js/62-callsettings.js"></script>
+    <script src="js/63-delivery.js"></script>
     <script src="js/70-applock.js"></script>
+    <script src="js/79-callvideo.js"></script>
     <script src="js/80-calls.js"></script>
     <script src="js/81-callmini.js"></script>
     <script src="js/82-sharepick.js"></script>
+    <script src="js/83-callmenus.js"></script>
+    <script src="js/84-callunlock.js"></script>
+    <script src="js/85-callhandled.js"></script>
     <script src="js/99-boot.js"></script>
   </body>
 </html>

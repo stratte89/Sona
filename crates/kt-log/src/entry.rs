@@ -179,7 +179,11 @@ fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
 }
 
 /// Verify an Ed25519 signature (all base64). Returns `false` on any malformed input.
-pub(crate) fn verify_ed25519(verifying_key_b64: &str, message: &[u8], signature_b64: &str) -> bool {
+///
+/// Public because device-signed material lives outside this crate too — a call-control
+/// capsule is verified against the same roster signing keys, with the same base64
+/// conventions and the same fail-closed behavior.
+pub fn verify_ed25519(verifying_key_b64: &str, message: &[u8], signature_b64: &str) -> bool {
     let verify = || -> Option<()> {
         let vk_bytes: [u8; 32] = b64d(verifying_key_b64)?.try_into().ok()?;
         let sig_bytes: [u8; 64] = b64d(signature_b64)?.try_into().ok()?;

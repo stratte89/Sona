@@ -64,10 +64,33 @@ object UnifiedPushMgr {
 
   /// Called at every process start (SonaApp): distributors expect re-registration
   /// after boot/app update, and it is an idempotent upsert on their side.
+  ///
+  /// **Does nothing until the user has unlocked the device once (E-15).** These
+  /// preferences live in credential-encrypted storage, and reading them before the first
+  /// unlock does not return a default — it *throws*
+  /// `IllegalStateException: SharedPreferences in credential encrypted storage are not
+  /// available until after user (id 0) is unlocked`. Thrown out of `Application.onCreate`
+  /// that took the whole process down every time anything started Sona after a reboot,
+  /// which is a crash loop on the one path where the app most needs to come up quietly.
+  ///
+  /// Nothing is lost by skipping it: a distributor registration is an idempotent upsert,
+  /// and the next process start after the unlock re-runs this.
   @JvmStatic
   fun reRegister(ctx: Context) {
+    if (!userUnlocked(ctx)) return
     prefs(ctx).getString("distributor", null)?.let { register(ctx, it) }
   }
+
+  /// Has the user unlocked the device since boot? Credential-encrypted storage — which is
+  /// where this object's preferences and the whole Sona data directory live — is simply
+  /// not readable before that.
+  private fun userUnlocked(ctx: Context): Boolean =
+    try {
+      val um = ctx.getSystemService(Context.USER_SERVICE) as? android.os.UserManager
+      um?.isUserUnlocked ?: false
+    } catch (_: Throwable) {
+      false // unanswerable ⇒ treat as locked; the cost is one skipped idempotent upsert
+    }
 
   /// Drop the distributor registration and tell Rust the endpoint is gone (Rust then
   /// falls back to the system push token, or unregisters from the relay).
@@ -121,7 +144,7 @@ object UnifiedPushMgr {
 // SonaFirebaseService. Exported (the distributor is another app), so every broadcast
 // is validated against our stored random token — a spoofed MESSAGE can at worst drain
 // an empty mailbox, and even that only with the unguessable token. The payload is the
-// relay's constant wake body ("wake"/"wake-call"): content-free by construction,
+// relay's constant wake body ("wake"/"wake-call"/"wake-call-control"): content-free,
 // display happens locally after the authenticated drain decrypts.
 class UnifiedPushReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
@@ -132,7 +155,12 @@ class UnifiedPushReceiver : BroadcastReceiver() {
         val body = intent.getStringExtra("message")
           ?: intent.getByteArrayExtra("bytesMessage")?.toString(Charsets.UTF_8)
           ?: ""
-        DrainService.start(context.applicationContext, body.trim() == "wake-call")
+        val wakeClass = when (body.trim()) {
+          "wake-call" -> 1
+          "wake-call-control" -> 2
+          else -> 0
+        }
+        DrainService.start(context.applicationContext, wakeClass)
       }
       "org.unifiedpush.android.connector.NEW_ENDPOINT" ->
         UnifiedPushMgr.onNewEndpoint(context, token, intent.getStringExtra("endpoint"))

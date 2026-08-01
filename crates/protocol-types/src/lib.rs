@@ -94,6 +94,23 @@ pub fn device_mailbox_hash(username_hash: &str, device_id: &str) -> Option<Ident
     Some(IdentityHash(hex::encode(h.finalize())))
 }
 
+/// The **call-control mailbox** of one device: where minimal incoming-call capsules are
+/// delivered, kept separate from the device's message mailbox on purpose.
+///
+/// A locked device drains this one with its call-control key alone, so it must not be the
+/// mailbox that carries chat ciphertext — and the primary gets a derived hash too (unlike
+/// [`device_mailbox_hash`], which maps the primary back to the account mailbox), because
+/// the account mailbox is exactly the one it must not be.
+pub fn call_mailbox_hash(username_hash: &str, device_id: &str) -> Option<IdentityHash> {
+    let base = IdentityHash::from_hex(username_hash)?;
+    let mut h = Sha256::new();
+    h.update(b"sona-call-mailbox-v1|");
+    h.update(base.as_str().as_bytes());
+    h.update(b"|");
+    h.update(device_id.as_bytes());
+    Some(IdentityHash(hex::encode(h.finalize())))
+}
+
 /// Canonical bytes a client signs (Ed25519, with its identity signing key) to authorize
 /// adding one-time keys to its own directory record. Domain-separated and binds the hash
 /// to the exact key list, so a signature can't be replayed for a different set.
@@ -122,6 +139,28 @@ pub fn push_register_signing_message(
     v.extend_from_slice(identity_hash.as_bytes());
     v.push(b'|');
     v.extend_from_slice(endpoint.as_bytes());
+    v.push(b'|');
+    v.extend_from_slice(nonce_b64.as_bytes());
+    v
+}
+
+/// Canonical bytes a device signs to publish its call-control key. Bound to the exact
+/// mailbox, the key being published, its mint time, and a single-use server nonce — so a
+/// publication cannot be replayed, moved to another mailbox, or rolled back to an older
+/// key by a relay that recorded an earlier request.
+pub fn call_key_publish_signing_message(
+    mailbox_hash: &str,
+    call_key: &str,
+    created_at: u64,
+    nonce_b64: &str,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"sona-call-key-publish-v1|");
+    v.extend_from_slice(mailbox_hash.as_bytes());
+    v.push(b'|');
+    v.extend_from_slice(call_key.as_bytes());
+    v.push(b'|');
+    v.extend_from_slice(created_at.to_string().as_bytes());
     v.push(b'|');
     v.extend_from_slice(nonce_b64.as_bytes());
     v
@@ -195,15 +234,20 @@ pub enum PayloadKind {
     ContactRequest,
     /// A key-change / verification notice between a user's own devices.
     DeviceSync,
+    /// A minimal incoming-call capsule, sealed to a device's call-control key and
+    /// addressed to its call-control mailbox. Never a ratchet ciphertext: a locked
+    /// device opens it without touching the account vault.
+    CallCapsule,
 }
 
 /// Sender-declared wake class. Read by the relay ONLY to decide whether/how to fire a
 /// content-free push wake for an offline recipient — it is never stored beyond routing
 /// and carries no identifier. `None` = never wake (receipts, typing, self-sync);
-/// `Normal` = debounced wake (chat messages); `Call` = immediate, call-priority wake
-/// (call offers only). Absent on the wire (old clients) decodes as `Normal`, which is
-/// exactly today's behavior. Metadata cost is one coarse bit of traffic class — strictly
-/// less than Signal's per-envelope `urgent` flag + push payload (see THREAT_MODEL.md).
+/// `Normal` = debounced wake (chat messages); `Call` = immediate ring wake (fresh call
+/// offers only); `CallControl` = urgent but silent wake (winner/cancel/terminal controls).
+/// Absent on the wire decodes as `Normal`. The two call classes are intentionally
+/// separate: an asleep device must wake to stop an existing ring without presenting a
+/// new generic ring while its vault is locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WakeClass {
@@ -211,6 +255,32 @@ pub enum WakeClass {
     #[default]
     Normal,
     Call,
+    CallControl,
+}
+
+impl WakeClass {
+    /// The constant webhook body the relay POSTs for this class — identical for every
+    /// user and every message, and the ONLY thing a UnifiedPush distributor (or any
+    /// webhook broker) ever carries. It is the wire between the relay and the Android
+    /// receiver that turns it back into a wake class, so both sides read it from here.
+    pub const fn wake_body(self) -> &'static str {
+        match self {
+            Self::Call => "wake-call",
+            Self::CallControl => "wake-call-control",
+            Self::None | Self::Normal => "wake",
+        }
+    }
+
+    /// The class tag inside an FCM data-only wake (`{"t": …}`) — the same contract as
+    /// [`wake_body`](Self::wake_body) for the Google transport, parsed back by the
+    /// Android messaging service. Short because it rides in every wake.
+    pub const fn fcm_tag(self) -> &'static str {
+        match self {
+            Self::Call => "c",
+            Self::CallControl => "x",
+            Self::None | Self::Normal => "m",
+        }
+    }
 }
 
 /// One unit of traffic between two clients, relayed blindly by the server.
@@ -278,6 +348,27 @@ mod tests {
     }
 
     #[test]
+    fn call_mailboxes_are_distinct_from_every_message_mailbox() {
+        let account = IdentityHash::from_identifier("alice");
+        let device = "a".repeat(32);
+        let call = call_mailbox_hash(account.as_str(), &device).unwrap();
+        // Never the account mailbox, never the device's message mailbox — including for
+        // the primary, whose message mailbox IS the account mailbox.
+        assert_ne!(call, account);
+        assert_ne!(
+            call,
+            device_mailbox_hash(account.as_str(), &device).unwrap()
+        );
+        let primary_call = call_mailbox_hash(account.as_str(), PRIMARY_DEVICE_ID).unwrap();
+        assert_ne!(primary_call, account);
+        assert_ne!(primary_call, call);
+        // Deterministic and well-formed.
+        assert_eq!(call, call_mailbox_hash(account.as_str(), &device).unwrap());
+        assert!(IdentityHash::from_hex(call.as_str()).is_some());
+        assert!(call_mailbox_hash("not-a-hash", &device).is_none());
+    }
+
+    #[test]
     fn device_mailbox_hashes_are_derived_and_distinct() {
         let account = IdentityHash::from_identifier("alice");
         // Primary keeps the legacy account mailbox.
@@ -327,11 +418,53 @@ mod tests {
             (WakeClass::None, "\"none\""),
             (WakeClass::Normal, "\"normal\""),
             (WakeClass::Call, "\"call\""),
+            (WakeClass::CallControl, "\"call_control\""),
         ] {
             let json = serde_json::to_string(&class).unwrap();
             assert_eq!(json, name);
             assert_eq!(serde_json::from_str::<WakeClass>(&json).unwrap(), class);
         }
+    }
+
+    /// Both wake transports carry the class as a STRING that Kotlin parses back into the
+    /// JNI wake class, and neither side would fail loudly if the two drifted: a renamed
+    /// tag downgrades every call wake to a debounced message wake — no ring, no
+    /// cancellation, just a phone that rings late or not at all, which is precisely the
+    /// bug this work exists to remove. The mapping is four lines in one `when` on each
+    /// side, and this is the only place they can be compared at all.
+    #[test]
+    fn the_android_receivers_parse_exactly_these_wake_tags() {
+        let kotlin = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/../../clients/desktop/scripts/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap_or_else(|e| panic!("{name} receives these wakes: {e}"))
+        };
+        let up = kotlin("UnifiedPush.kt");
+        let fcm = kotlin("SonaFirebaseService.kt");
+        // The receivers' own wake-class numbering (push.rs `PushWakeClass::from_jni`).
+        for (class, jni) in [
+            (WakeClass::Call, "1"),
+            (WakeClass::CallControl, "2"),
+            (WakeClass::Normal, "0"),
+        ] {
+            // `Normal` is each `when`'s else arm — the safe default for an unknown tag.
+            let fallback = format!("else -> {jni}");
+            for (src, name, tag) in [
+                (&up, "UnifiedPush.kt", class.wake_body()),
+                (&fcm, "SonaFirebaseService.kt", class.fcm_tag()),
+            ] {
+                let arm = format!("\"{tag}\" -> {jni}");
+                assert!(
+                    src.contains(&arm) || (class == WakeClass::Normal && src.contains(&fallback)),
+                    "{name} must map {arm}"
+                );
+            }
+        }
+        // A silent class never reaches a transport, so it must not need a tag of its own.
+        assert_eq!(WakeClass::None.wake_body(), WakeClass::Normal.wake_body());
+        assert_eq!(WakeClass::None.fcm_tag(), WakeClass::Normal.fcm_tag());
     }
 }
 

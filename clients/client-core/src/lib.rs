@@ -27,11 +27,14 @@ use kt_log::{
 
 pub use kt_log::KtEntry as KtBindingEntry;
 pub use kt_log::{
-    DeviceRecord, GossipVerdict, GroupEpoch as GroupMembershipEpoch, GroupEpochError,
-    GroupMemberEntry, SignedTreeHead as TreeHead, MAX_GROUP_MEMBERS, PRIMARY_DEVICE_ID,
+    CallKeyBinding, DeviceRecord, GossipVerdict, GroupEpoch as GroupMembershipEpoch,
+    GroupEpochError, GroupMemberEntry, SignedTreeHead as TreeHead, MAX_GROUP_MEMBERS,
+    PRIMARY_DEVICE_ID,
 };
-use protocol_types::{CiphertextMessage, Envelope, IdentityHash, PayloadKind, PreKeyBundle};
-pub use protocol_types::{WakeClass, CAP_INVITE_REGISTER, CAP_PUSH_FCM, CAP_PUSH_WEBHOOK};
+use protocol_types::{CiphertextMessage, IdentityHash, PayloadKind, PreKeyBundle};
+pub use protocol_types::{
+    Envelope, WakeClass, CAP_INVITE_REGISTER, CAP_PUSH_FCM, CAP_PUSH_WEBHOOK,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,6 +43,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 mod api;
 pub mod attest;
 pub mod call;
+pub mod callcapsule;
+mod callmedia;
+pub mod callscreen;
+pub mod callstate;
+pub mod callstore;
 pub mod devicekey;
 mod events;
 pub mod groupcall;
@@ -51,6 +59,9 @@ mod quicmedia;
 mod subscribe;
 mod types;
 mod wire;
+pub use api::callkey::{
+    call_mailbox_for, verified_call_key_binding, CapsuleDelivery, CapsuleDrainStats,
+};
 pub use events::InboundEvent;
 pub use history::{
     ContactPin, Conversation, DeliveryStatus, Direction, GroupAdmin, GroupEpochOutcome,
@@ -59,7 +70,9 @@ pub use history::{
 pub use subscribe::{Subscription, KEEPALIVE_IDLE_SECS, WATCHDOG_IDLE_SECS};
 pub(crate) use types::KtProofResponse;
 pub use types::*;
-pub(crate) use wire::{ack_frame, build_envelope, wake_class_for, ChatPayload};
+pub(crate) use wire::{
+    ack_frame, build_envelope, envelope_expiry_for, wake_class_for, ChatPayload,
+};
 pub use wire::{decode_frame, Decoded};
 
 #[derive(Debug, thiserror::Error)]
@@ -452,7 +465,7 @@ pub(crate) fn seal_payload_to(
             .map_err(|e| ClientError::Protocol(e.to_string()))?,
         kind: PayloadKind::Message,
         msg_id: msg_id.to_string(),
-        expires_at: None,
+        expires_at: envelope_expiry_for(payload),
         wake: wake_class_for(payload),
         raw_identifier: None,
     })

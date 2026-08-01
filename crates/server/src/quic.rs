@@ -270,14 +270,34 @@ async fn handle_connection(conn: quinn::Connection, state: AppState) {
         return;
     };
 
-    // ── Media pumps: datagrams (lossy) + uni streams (reliable groups). One shared
-    //    byte budget, exactly like the WS leg. ──
-    let mut budget = RateBudget::default();
-    loop {
-        tokio::select! {
-            dgram = conn.read_datagram() => {
-                let Ok(b) = dgram else { break }; // connection closed/lost
-                if b.len() > MAX_FRAME_BYTES || !budget.spend(b.len()) {
+    // ── Media pumps: datagrams (lossy) + uni streams (reliable groups). ──
+    //
+    // Two independent tasks, not two arms of one `select!`, and that is the whole point.
+    // Draining a video frame's stream means awaiting the *rest of its bytes*, which on a
+    // congested or lossy uplink is a retransmit away — tens to hundreds of milliseconds.
+    // Sharing a task with `read_datagram` made that wait a wait for voice too: the
+    // sender's audio sat in the kernel while the relay was parked mid-video-frame, so a
+    // screen share made both directions of the call break up. Voice is loss-tolerant and
+    // never waits for anything; video is reliable and may. They must not share a task.
+    //
+    // The stream loop stays sequential, so frames are forwarded in the order they were
+    // sent (a decoder handed frames out of order loses its reference chain — worse than a
+    // late frame). The byte budget is shared, since it is a property of the connection.
+    let budget = Arc::new(std::sync::Mutex::new(RateBudget::default()));
+    let spend = {
+        let budget = budget.clone();
+        move |n: usize| budget.lock().map(|mut b| b.spend(n)).unwrap_or(false)
+    };
+
+    let mut datagrams = {
+        let (conn, state, call_id, spend) =
+            (conn.clone(), state.clone(), call_id.clone(), spend.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok(b) = conn.read_datagram().await else {
+                    break;
+                }; // closed/lost
+                if b.len() > MAX_FRAME_BYTES || !spend(b.len()) {
                     break; // protocol violation / bulk abuse
                 }
                 // Only loss-tolerant frames belong in datagrams; anything else is a
@@ -289,12 +309,20 @@ async fn handle_connection(conn: quinn::Connection, state: AppState) {
                     peer.forward_frame(b.to_vec());
                 }
             }
-            stream = conn.accept_uni() => {
-                let Ok(mut s) = stream else { break };
+        })
+    };
+
+    let mut streams = {
+        let (conn, state, call_id) = (conn.clone(), state.clone(), call_id.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok(mut s) = conn.accept_uni().await else {
+                    break;
+                };
                 let Ok(group) = s.read_to_end(MAX_STREAM_GROUP_BYTES).await else {
                     break; // oversized group — protocol violation
                 };
-                if !budget.spend(group.len()) {
+                if !spend(group.len()) {
                     break;
                 }
                 let Some(cells) = parse_cells(&group) else {
@@ -307,8 +335,18 @@ async fn handle_connection(conn: quinn::Connection, state: AppState) {
                     peer.forward_cells(cells);
                 }
             }
-        }
+        })
+    };
+
+    // Either pump ending means this member is done (connection gone, or it broke the
+    // protocol on one of the two paths) — the room must not keep a half-live member, and
+    // the surviving pump must not outlive the room entry it forwards into.
+    tokio::select! {
+        _ = &mut datagrams => {}
+        _ = &mut streams => {}
     }
+    datagrams.abort();
+    streams.abort();
 
     writer.abort();
     leave_room(&state, &call_id, my_id);

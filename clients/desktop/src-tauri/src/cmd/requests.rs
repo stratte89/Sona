@@ -128,6 +128,8 @@ pub async fn accept_msg_request(
         .map(str::to_string)
         .unwrap_or_default();
     s.persist()?;
+    // An accepted requester may now ring this device while it is locked.
+    refresh_call_screen(&mut s);
     drop(s);
     // Accepting made them a full contact — they messaged us, so a session exists: send
     // them our profile picture right away (they never saw our pre-existing one).
@@ -147,7 +149,9 @@ pub async fn decline_msg_request(
     if !s.history.decline_request(username.trim(), block) {
         return Err("no such request".into());
     }
-    s.persist()
+    s.persist()?;
+    refresh_call_screen(&mut s);
+    Ok(())
 }
 
 /// The user opened the requests list — clear the red dot (rows stay pending).

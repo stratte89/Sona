@@ -74,6 +74,10 @@ impl Db {
                  data BLOB NOT NULL,
                  expires_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS call_keys (
+                 hash TEXT PRIMARY KEY,
+                 binding_json TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS used_invites (
                  code_hash TEXT PRIMARY KEY
              );",
@@ -368,6 +372,35 @@ impl Db {
             [],
             |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
         )
+    }
+
+    // ── Call-control key bindings ─────────────────────────────────────────────
+    // Public, self-authenticating material (each binding is signed by the device's own
+    // roster key and verified by fetchers against the KT roster), so it is stored in the
+    // clear like the directory — encrypting it would protect nothing.
+
+    pub fn upsert_call_key(&self, hash: &str, binding_json: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO call_keys (hash, binding_json) VALUES (?1, ?2)
+             ON CONFLICT(hash) DO UPDATE SET binding_json = excluded.binding_json",
+            params![hash, binding_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_call_key(&self, hash: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM call_keys WHERE hash = ?1", params![hash])?;
+        Ok(())
+    }
+
+    pub fn load_call_keys(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hash, binding_json FROM call_keys")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
     }
 
     // ── Registration invite codes (hex SHA-256 of consumed codes — never the codes) ──

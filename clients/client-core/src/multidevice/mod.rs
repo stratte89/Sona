@@ -161,4 +161,7 @@ fn random_hex_id() -> String {
 mod link;
 mod revoke;
 mod roster;
+mod routes;
 mod selfsync;
+
+pub use routes::{DeviceRoute, RosterUpdate};

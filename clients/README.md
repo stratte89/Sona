@@ -90,3 +90,83 @@ No iOS target — by design.
 2. In the app: set the relay base URL and paste the pinned KT key (confirm it via a
    second channel — see `../docs/KEY_TRANSPARENCY.md`).
 3. Create an account (username + password) and start messaging.
+
+## Checking UI in the right engine
+
+The shell is a Tauri webview, and that is **three different browsers**: WebKitGTK on
+Linux, WebView2 (Chromium) on Windows, Android WebView (Chromium) on Android. Checking a
+change in Chrome checks two of them and misses the one most desktop users run.
+
+```sh
+python3 clients/desktop/scripts/wk-screenshot.py clients/desktop/src/index.html out.png 1200 800
+```
+
+Renders offscreen in WebKitGTK and writes a PNG. Needs `gir1.2-webkit2-4.1` and
+`python3-gi`, which a machine that can build the app already has.
+
+Worth the habit: the call volume slider was a 4 px rail with a gradient fill, verified in
+headless Chrome, and shipped. WebKitGTK ignores `height` on a range input and paints the
+background across its full natural height, so it arrived as a fat green bar with the knob
+floating inside it. The rule that came out of it — **do not style native form controls
+and expect them to survive the engine change**; draw the parts you care about and keep
+the native input as an invisible hit target, which is what `.volrail` does.
+
+## Diagnostics
+
+The desktop app keeps its own log, because on Windows a release build has no console
+(`windows_subsystem = "windows"`) and asking someone to run a redirect incantation failed
+twice in the field. It is **off unless asked for** — these lines name devices, sinks and
+call state, and nobody should accumulate a file of them without opting in.
+
+```sh
+sona --debug            # or: SONA_DEBUG=1 sona
+```
+
+That turns on stderr *and* a `sona-diag.log` next to the vault, which a user can be asked
+for by name and paste back. Without it, no file is created at all.
+
+The lines worth knowing:
+
+| Line | Says |
+|---|---|
+| `[media] call playout device: … @ … Hz` | which device the call plays into |
+| `[media] share-audio capture source: …` | which device the share captures from — **these two must match**, or there is no echo to find |
+| `[media] share-audio echo: locked at N ms, removed X dB (corr …, peak …, reseat aN/bN)` | the echo canceller found the delay and is cancelling |
+| `[media] share-audio echo: NOT LOCKED …` | it did not, and the peer may hear themselves |
+| `[media] audio frames lost in the last 5 s: …` | a frame path is shedding audio |
+
+`removed X dB` is reduction of the *whole* captured mix, not ERLE. Most of that mix is the
+audio being shared, which is supposed to survive, so it reads far below the real
+cancellation — single digits at 35 dB of actual removal is normal. `locked at N ms` with a
+high `corr` and `peak`, and `reseat a0/b0`, is the healthy signature.
+
+### Measuring the call audio path locally
+
+Six releases of echo-cancellation work were done by shipping a build to someone else and
+reading their log — hours per round, one number per round. Don't. The whole path is
+testable on any Linux desktop with a sound server, using production code end to end:
+
+```sh
+cd clients/desktop/src-tauri
+SONA_AUDIO_LOOPBACK=1 SONA_DEBUG=1 \
+  cargo test --release --lib -- --ignored --nocapture echo_loopback
+```
+
+**These tests play audible noise through the speakers.** That is why they need
+`SONA_AUDIO_LOOPBACK=1` on top of `#[ignore]`: an earlier version ran at a third of full
+scale and physically hurt someone wearing headphones. Take them off, and check nothing else
+is playing — other audio makes the numbers meaningless.
+
+| Test | Question |
+|---|---|
+| `echo_loopback_against_the_real_audio_stack` | does the canceller actually cancel? |
+| `where_do_the_frames_go` | is any frame path losing audio? (prints every counter) |
+| `where_does_each_captured_frame_come_from` | is the capture a faithful, in-order copy of the playout? |
+| `measure_the_real_loopback_delay` | how long is the loopback, by clicks? |
+| `capture_actually_contains_our_playout` | is our audio in the capture at all, by tone? |
+
+The last three need `SONA_AEC_BYPASS=1` as well — they measure what the canceller is
+*handed*, and without the bypass the echo has already been subtracted from it.
+
+See [docs/CALL_AUDIO.md](../docs/CALL_AUDIO.md) for how the path fits together and the
+traps that have already cost releases.

@@ -46,7 +46,7 @@ pub(crate) async fn ws_upgrade(
 }
 
 /// Upgrade a call-relay socket. Join is by capability token only (the random call id
-/// from the E2E `CallOffer`) — deliberately unauthenticated so the relay cannot link a
+/// from the E2E call offer) — deliberately unauthenticated so the relay cannot link a
 /// call to the identities in it. Same origin policy as the delivery socket; joins are
 /// rate-limited per pseudonymized client.
 pub(crate) async fn call_upgrade(

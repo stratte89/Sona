@@ -5,7 +5,7 @@
 //!
 //! * **No identities.** Joining takes only the 128-bit random `call_id` — a capability
 //!   token that travels exclusively inside the two parties' Double-Ratchet session
-//!   (`CallOffer`). The relay never learns *who* is in a call, and cannot join a call to
+//!   (`CallOfferV2`). The relay never learns *who* is in a call, and cannot join a call to
 //!   the mailboxes involved. (An authenticated join would tie both identity hashes to
 //!   one room — strictly worse metadata.)
 //! * **No content.** Frames are XChaCha20-Poly1305 ciphertext under a per-call key the
@@ -32,6 +32,25 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::state::{now, AppState};
+
+/// Is call-room logging switched on? (`CALL_LOG=1`)
+///
+/// Opt-in for the same reason `WAKE_LOG` is: a blind relay has no business keeping a record
+/// of who called when by default, and room ids are the capability tokens that pair two
+/// parties. Off, this costs a `OnceLock` read per join and writes nothing.
+pub(crate) fn call_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CALL_LOG").is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
+/// How much of a room id may appear in a log line.
+///
+/// Enough to follow one call across a few lines during a debugging session, far too little to
+/// reconstruct the 128-bit capability it comes from — and the room id is the only thing here
+/// that could pair two parties.
+pub(crate) fn room_tag(call_id: &str) -> &str {
+    &call_id[..call_id.len().min(8)]
+}
 
 /// Hard cap per media frame: the largest media-v2 wire cell,
 /// `track(1) || seq(8) || ciphertext(16 KiB plaintext + 16 tag)` (see the client's
@@ -186,6 +205,12 @@ pub fn join_room(state: &AppState, call_id: &str, member: Member) -> Option<u64>
     let t = now();
     calls.gc(t);
     if calls.rooms.len() >= state.config.max_rooms && !calls.rooms.contains_key(call_id) {
+        if call_log_enabled() {
+            eprintln!(
+                "[room] {} join REFUSED: relay at max_rooms",
+                room_tag(call_id)
+            );
+        }
         return None; // relay full — caller retries or gives up
     }
     let room = calls
@@ -195,9 +220,36 @@ pub fn join_room(state: &AppState, call_id: &str, member: Member) -> Option<u64>
             created_at: t,
             members: Vec::new(),
         });
+    let before = room.members.len();
     room.members.retain(|m| !m.closed());
+    // The pruning above is the suspect in a call that connects and never gets audio: a member
+    // that reads as closed is dropped, and then the newcomer is told the count **after** the
+    // prune — so it is told it is alone — while the pruned peer, already in, is never sent a
+    // `peer_joined` because there is nobody in the list to notify. Both ends then sit in the
+    // same room believing the other is not there. Reported repeatedly 2026-08-01; this is what
+    // makes it visible from the relay's side rather than inferred from the client's.
+    if call_log_enabled() && before != room.members.len() {
+        eprintln!(
+            "[room] {} pruned {} closed member(s) on join ({} -> {})",
+            room_tag(call_id),
+            before - room.members.len(),
+            before,
+            room.members.len()
+        );
+    }
     if room.members.len() >= 2 {
+        if call_log_enabled() {
+            eprintln!("[room] {} join REFUSED: already full", room_tag(call_id));
+        }
         return None; // full: the two legitimate parties are already here
+    }
+    if call_log_enabled() {
+        eprintln!(
+            "[room] {} join: telling {} existing member(s), newcomer sees peers={}",
+            room_tag(call_id),
+            room.members.len(),
+            room.members.len() + 1
+        );
     }
     for m in &room.members {
         m.send_text(r#"{"type":"peer_joined"}"#);
@@ -234,6 +286,15 @@ pub fn leave_room(state: &AppState, call_id: &str, my_id: u64) {
         calls.rooms.remove(call_id);
         peer
     };
+    // The other side of the join line: a room dissolving early is what would leave the next
+    // joiner alone, so the two together say whether the peer left before or after it arrived.
+    if call_log_enabled() {
+        eprintln!(
+            "[room] {} dissolved by a member leaving (peer present: {})",
+            room_tag(call_id),
+            peer.is_some()
+        );
+    }
     if let Some(peer) = peer {
         peer.send_text(r#"{"type":"peer_left"}"#);
         peer.close();
@@ -279,7 +340,19 @@ pub(crate) fn valid_call_id(id: &str) -> bool {
 /// relay join/leave notices, tear down on close. (The QUIC twin lives in
 /// [`crate::quic`]; both share the room/join/leave/budget logic above.)
 pub async fn handle_call_socket(socket: WebSocket, state: AppState, call_id: String) {
+    // Both refusals below drop a socket that has **already upgraded**, so the client's
+    // `join_call` has returned Ok and it believes it is in the room. It then waits for a peer
+    // who, from the relay's side, is sharing a room with nobody. That is the fault the
+    // 2026-08-01 round chased for hours: the caller logged "room joined" and the relay logged
+    // no join at all for that room, and neither end could see the other's half of it.
     if !valid_call_id(&call_id) {
+        if call_log_enabled() {
+            eprintln!(
+                "[room] {} REFUSED after upgrade: malformed call id — the client believes it \
+                 joined",
+                room_tag(&call_id)
+            );
+        }
         return;
     }
     let (mut sink, mut stream) = socket.split();
@@ -287,6 +360,13 @@ pub async fn handle_call_socket(socket: WebSocket, state: AppState, call_id: Str
 
     // ── Join ──
     let Some(my_id) = join_room(&state, &call_id, Member::new(MemberTx::Ws(tx))) else {
+        if call_log_enabled() {
+            eprintln!(
+                "[room] {} REFUSED after upgrade: join_room declined — the client believes it \
+                 joined",
+                room_tag(&call_id)
+            );
+        }
         return;
     };
 

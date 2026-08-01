@@ -175,7 +175,10 @@ pub async fn set_blocked(
     username: String,
     blocked: bool,
 ) -> Result<(), String> {
-    edit_contact(&state, &username, |c| c.blocked = blocked).await
+    edit_contact(&state, &username, |c| c.blocked = blocked).await?;
+    // A blocked caller must not be able to ring this device while it is locked either.
+    refresh_call_screen(&mut *state.inner.lock().await);
+    Ok(())
 }
 
 /// Delete a conversation. `for_both` additionally sends an end-to-end delete request the

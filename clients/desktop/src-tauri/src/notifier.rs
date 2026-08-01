@@ -17,6 +17,12 @@ pub enum ConnState {
     Reconnecting,
     /// Vault locked, no auto-unlock: delivery is paused and the user must know.
     Locked,
+    /// Vault locked, **but a wake transport is registered and the process hold is kept**
+    /// (E-2): messages wait for the unlock, and an incoming call can still reach this
+    /// device. A state of its own rather than a nicer string for [`ConnState::Locked`],
+    /// because the difference is exactly what §4.5 forbids being vague about — one of
+    /// these two rings for an incoming call and the other does not.
+    LockedWakeable,
     /// No delivery expected (mode P, or logged out) — no persistent notification.
     Off,
 }
@@ -30,6 +36,7 @@ impl ConnState {
             ConnState::Reconnecting => 1,
             ConnState::Locked => 2,
             ConnState::Off => 3,
+            ConnState::LockedWakeable => 4,
         }
     }
 }
@@ -44,13 +51,30 @@ pub struct NotifLine {
     pub when: u64,
 }
 
+/// The call id the locked-vault generic ring is posted under (`showGeneric(1)` posts a
+/// `CallStyle` notification for this id). Cancelling it is how the call-only subsystem
+/// takes that ring down when a capsule says the call is already over.
+pub const LOCKED_CALL_RING: &str = "locked-call";
+
 /// Generic (content-free) notification kinds for the locked-vault degradation path.
 #[derive(Debug, Clone, Copy)]
 pub enum Generic {
     /// `"t":"m"` wake with no way to decrypt: "You may have new messages".
     MaybeMessages,
     /// `"t":"c"` wake with no way to decrypt: insistent generic ring.
+    ///
+    /// Only legitimate with a pending ring in the call-control store behind it, so that
+    /// Answer and Decline both resolve to something (`internal/CALL_PLAN.md` §3.1). Where there is
+    /// no such state, [`Generic::UnactionableCall`] is the honest surface.
     LockedCall,
+    /// A call is happening and this device cannot act on it: no capsule survived the
+    /// drain, there is no call-control identity, or the mailbox could not be screened.
+    ///
+    /// Deliberately **not** a ring. The user still has to learn a call is happening —
+    /// L-11 settled that, and silence would be worse — but an `INSISTENT|NO_DISMISS`
+    /// ringtone whose Answer and Decline buttons resolve to nothing is not how that
+    /// requirement is met. This is dismissible, silent, and only opens the app.
+    UnactionableCall,
 }
 
 #[cfg(target_os = "android")]
@@ -110,8 +134,49 @@ mod android {
 
     fn log_err(what: &str, r: Result<(), String>) {
         if let Err(e) = r {
-            eprintln!("[notifier] {what}: {e}");
+            crate::diag!("[notifier] {what}: {e}");
         }
+    }
+
+    /// Bring the app forward so the user can unlock and finish answering a call.
+    pub fn open_app_for_unlock() {
+        log_err(
+            "openAppForUnlock",
+            with_bridge(|env, class| {
+                env.call_static_method(class, "openAppForUnlock", "()V", &[])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }),
+        );
+    }
+
+    /// Is the OS keyguard up? See `NotificationBridge.deviceLocked` for why this, and not
+    /// the vault, is what "require unlock to answer" has to read. A probe that cannot be
+    /// made at all counts as locked — the cost is a human check, never a call answered
+    /// without one.
+    pub fn device_locked() -> bool {
+        let mut out = true;
+        let r = with_bridge(|env, class| {
+            out = env
+                .call_static_method(class, "deviceLocked", "()Z", &[])
+                .and_then(|v| v.z())
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        log_err("deviceLocked", r);
+        out
+    }
+
+    /// The unlock attempt resolved: take its prompt down.
+    pub fn clear_unlock_prompt() {
+        log_err(
+            "clearUnlockPrompt",
+            with_bridge(|env, class| {
+                env.call_static_method(class, "clearUnlockPrompt", "()V", &[])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }),
+        );
     }
 
     /// Post/refresh a chat's MessagingStyle notification with the buffered lines.
@@ -179,6 +244,38 @@ mod android {
 
     /// Stop the ring. `missed_title` non-empty ⇒ also post a "Missed call" entry on
     /// the status channel (privacy-leveled by the engine).
+    /// The ring was **answered** here: stop the ringtone and the call screen, but hand the
+    /// foreground-service process hold to the unlock window rather than ending it (E-5).
+    pub fn accept_call(call_id: &str) {
+        log_err(
+            "acceptCall",
+            with_bridge(|env, class| {
+                let id = env.new_string(call_id).map_err(|e| e.to_string())?;
+                env.call_static_method(
+                    class,
+                    "acceptCall",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&id)],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }),
+        );
+    }
+
+    /// Give back a process hold taken by an answer (E-5). No-op unless one is held, so
+    /// every path that ends an answer's waiting period can call it blindly.
+    pub fn release_call_hold() {
+        log_err(
+            "releaseCallHold",
+            with_bridge(|env, class| {
+                env.call_static_method(class, "releaseCallHold", "()V", &[])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }),
+        );
+    }
+
     pub fn cancel_call(call_id: &str, missed_title: &str) {
         log_err(
             "cancelCall",
@@ -216,40 +313,12 @@ mod android {
         out
     }
 
-    /// Headset-button MediaSession for the ring window (tap = answer, stop = decline).
-    pub fn call_buttons_start(call_id: &str) {
-        log_err(
-            "callButtonsStart",
-            with_bridge(|env, class| {
-                let id = env.new_string(call_id).map_err(|e| e.to_string())?;
-                env.call_static_method(
-                    class,
-                    "callButtonsStart",
-                    "(Ljava/lang/String;)V",
-                    &[JValue::Object(&id)],
-                )
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-            }),
-        );
-    }
-
-    pub fn call_buttons_stop() {
-        log_err(
-            "callButtonsStop",
-            with_bridge(|env, class| {
-                env.call_static_method(class, "callButtonsStop", "()V", &[])
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }),
-        );
-    }
-
     /// Locked-vault degradation (§7.4): content-free generic per wake class.
     pub fn show_generic(kind: Generic) {
         let code = match kind {
             Generic::MaybeMessages => 0,
             Generic::LockedCall => 1,
+            Generic::UnactionableCall => 2,
         };
         log_err(
             "showGeneric",
@@ -450,7 +519,7 @@ mod desktop {
                             .show()
                         {
                             Ok(h) => live.push((Instant::now(), h)),
-                            Err(e) => eprintln!("[notify] {e}"),
+                            Err(e) => crate::diag!("[notify] {e}"),
                         }
                     }
                 });
@@ -464,6 +533,12 @@ mod desktop {
     }
 
     fn plugin_show(title: &str, body: &str) {
+        // Never from a test run. The call paths post rings and generics as part of their
+        // ordinary work, and on Linux this reaches the session bus directly — so
+        // `cargo test` would put real notifications on the developer's own desktop.
+        if cfg!(test) {
+            return;
+        }
         #[cfg(target_os = "linux")]
         {
             linux_notify::post(title, body);
@@ -475,7 +550,7 @@ mod desktop {
             };
             use tauri_plugin_notification::NotificationExt as _;
             if let Err(e) = app.notification().builder().title(title).body(body).show() {
-                eprintln!("[notify] {e}");
+                crate::diag!("[notify] {e}");
             }
         }
     }
@@ -502,9 +577,79 @@ mod desktop {
         );
     }
 
-    pub fn cancel_call(_call_id: &str, missed_title: &str) {
+    /// No foreground service and no keyguard here, so accepting is exactly cancelling the
+    /// presentation — recorded the same way, because A-18's assertion is about the ring
+    /// stopping and that is equally true on this path.
+    pub fn accept_call(call_id: &str) {
+        #[cfg(test)]
+        cancelled::record(call_id);
+        let _ = call_id;
+    }
+
+    /// Nothing holds a desktop process up for a call, so there is nothing to give back.
+    pub fn release_call_hold() {}
+
+    pub fn cancel_call(call_id: &str, missed_title: &str) {
+        #[cfg(test)]
+        cancelled::record(call_id);
+        let _ = call_id;
         if !missed_title.is_empty() {
             plugin_show(missed_title, "Missed call");
+        }
+    }
+
+    /// Test-only record of the ids [`cancel_call`] was asked to take down.
+    ///
+    /// The ring that keeps sounding is a *notification*, and the platform owns it — so
+    /// A-18 (a cancel skipped because the engine's in-memory ring was lost with the
+    /// process) was a bug no host assertion could see. This makes the presentation half
+    /// assertable the way A-2 made the system-call half assertable.
+    #[cfg(test)]
+    pub mod cancelled {
+        use std::sync::Mutex;
+
+        static IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        pub fn record(id: &str) {
+            IDS.lock().unwrap().push(id.to_string());
+        }
+
+        pub fn contains(id: &str) -> bool {
+            IDS.lock().unwrap().iter().any(|i| i == id)
+        }
+    }
+
+    /// No lock screen to answer from: the desktop shell is unlocked whenever it is usable.
+    pub fn open_app_for_unlock() {}
+    /// No lock screen, so no prompt to revoke either.
+    pub fn clear_unlock_prompt() {}
+
+    /// There is no keyguard between the user and a desktop that is showing them a ring, so
+    /// "require unlock to answer" stays Android-specific (§8) and the ordinary answer is
+    /// untouched here.
+    pub fn device_locked() -> bool {
+        #[cfg(test)]
+        let locked = keyguard::locked();
+        #[cfg(not(test))]
+        let locked = false;
+        locked
+    }
+
+    /// Test-only keyguard, so the answer gate A-19 added is reachable from the host suites.
+    /// The state it turns on is a *device* state, not something a session can hold, and it
+    /// is the one no host test could describe before.
+    #[cfg(test)]
+    pub mod keyguard {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static LOCKED: AtomicBool = AtomicBool::new(false);
+
+        pub fn locked() -> bool {
+            LOCKED.load(Ordering::SeqCst)
+        }
+
+        pub fn set(locked: bool) {
+            LOCKED.store(locked, Ordering::SeqCst);
         }
     }
 
@@ -512,6 +657,7 @@ mod desktop {
         match kind {
             Generic::MaybeMessages => plugin_show("Sona", "You may have new messages"),
             Generic::LockedCall => plugin_show("Sona", "Incoming call — unlock to answer"),
+            Generic::UnactionableCall => plugin_show("Sona", "Incoming call — open Sona to answer"),
         }
     }
 
@@ -527,8 +673,6 @@ mod desktop {
     pub fn up_register(_pkg: &str) {}
     pub fn up_unregister() {}
     /// Headset-button answer is Android-only (desktop has real keyboards).
-    pub fn call_buttons_start(_call_id: &str) {}
-    pub fn call_buttons_stop() {}
     /// Desktop webviews expose clipboard files to JS directly; no native fallback.
     pub fn clipboard_image() -> Option<String> {
         None

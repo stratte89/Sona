@@ -256,12 +256,39 @@ async function pinUnlockNow() {
 }
 
 $('#un-bio-btn').onclick = bioUnlock;
+// One prompt at a time: the OS dialog is modal, and asking again while it is up either
+// throws or stacks a second one.
+let bioPromptUp = false;
 async function bioUnlock() {
+  if (bioPromptUp) return;
+  bioPromptUp = true;
   try {
     await invoke('unlock_bio');
     afterUnlock();
   } catch (_) { /* cancelled or invalidated — PIN/password remain on screen */ }
+  finally { bioPromptUp = false; }
 }
+
+// E-11 — coming back to a locked app offers the fingerprint, instead of leaving a button
+// to find.
+//
+// Only `boot()` did this, so it fired exactly once, on a cold start. Every other way of
+// arriving at the lock screen — the app was already running and the user brought it
+// forward, the idle timer locked it while it was in the background, or (the case that
+// matters) an answered call brought the app forward to open the vault — left the user
+// looking at a screen that could have asked and did not.
+//
+// `visibilitychange` is the right hook rather than `doLock`, and the distinction is
+// deliberate: a *manual* lock does not change visibility, so tapping Lock is never
+// answered by an instant "please authenticate", which would be the app arguing with a
+// decision the user just made. Returning to the app is a different act, and that is what
+// this listens for.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (current !== 'unlock') return;
+  if (!(sec && sec.bio_enabled)) return;
+  bioUnlock();
+});
 
 // ── Link this install to an existing account (new device) ────────────────────────
 // Flow: enter username+password → link_start returns the code → shown as a QR the

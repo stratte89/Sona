@@ -17,6 +17,19 @@ impl Client {
         account: &Account,
         hash: &str,
     ) -> Result<WsStream> {
+        self.open_authed_socket_signed(hash, |nonce| account.ratchet_ref().sign(nonce))
+            .await
+    }
+
+    /// [`open_authed_socket_as`](Self::open_authed_socket_as) with the signer supplied,
+    /// so a mailbox whose directory record is keyed by something other than the account
+    /// key can be authenticated — today the call-control mailbox, which a **locked**
+    /// device drains with its call-control key while the account key stays sealed.
+    pub(crate) async fn open_authed_socket_signed(
+        &self,
+        hash: &str,
+        sign: impl Fn(&[u8]) -> String,
+    ) -> Result<WsStream> {
         // A 401/404 HERE is the relay's ACCESS GATE, not account auth: `/v1/challenge`
         // itself never returns either (bad input is 400, pressure is 429), and mailbox
         // auth failures arrive as in-band `auth_failed`/`revoked` frames after the
@@ -42,7 +55,7 @@ impl Client {
         let nonce_bytes = STANDARD_NO_PAD
             .decode(nonce)
             .map_err(|e| ClientError::Protocol(format!("bad nonce: {e}")))?;
-        let signature = account.ratchet_ref().sign(&nonce_bytes);
+        let signature = sign(&nonce_bytes);
 
         let mut ws = self
             .ws_connect(self.ws_request(&self.ws_url)?)

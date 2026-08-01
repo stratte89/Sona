@@ -41,6 +41,7 @@ impl Client {
             .map(|d| RosterDevice {
                 device_id: d.device_id.clone(),
                 identity_key: d.identity_key.clone(),
+                signing_key: d.signing_key.clone(),
             })
             .collect();
         let bseq = history
@@ -301,6 +302,7 @@ impl Client {
             .map(|d| RosterDevice {
                 device_id: d.device_id.clone(),
                 identity_key: d.identity_key.clone(),
+                signing_key: d.signing_key.clone(),
             })
             .collect();
         let _ = history.pin_roster(&username, rotation.seq, next_seq, &my_idk, rdevices);
@@ -323,6 +325,7 @@ impl Client {
             .map(|d| RosterDevice {
                 device_id: d.device_id.clone(),
                 identity_key: d.identity_key.clone(),
+                signing_key: d.signing_key.clone(),
             })
             .collect();
         let _ = history.pin_roster(username, binding_seq, roster.seq, my_idk, rdevices);

@@ -47,6 +47,13 @@ pub struct PushSub {
     pub last_wake_normal: u64,
     /// Last `WakeClass::Call` wake (own min-interval `Config::call_wake_min_secs`).
     pub last_wake_call: u64,
+    /// Last granted `WakeClass::CallControl` wake, and how much of that class's burst
+    /// budget is currently spent. A token bucket rather than a debounce, because a real
+    /// call fires several controls in the same second — winner, terminal, the sibling
+    /// self-terminal — and each may be the only instruction that stops a ring, while an
+    /// unbounded stream of them is a silent battery DoS.
+    pub last_wake_control: u64,
+    pub control_wake_debt: u32,
 }
 
 /// Everything behind the global lock.
@@ -90,6 +97,11 @@ pub struct Inner {
     /// Byte budget for blob/sync **downloads** per client (bounds egress amplification:
     /// upload once, hammer downloads).
     pub download_bytes: ByteBudget,
+    /// Published call-control key bindings, keyed by the device's mailbox hash. Public,
+    /// self-authenticating material: each binding is signed by the device's own roster
+    /// key, and a fetcher verifies it against the KT roster before sealing anything to it.
+    /// The relay only stores the latest one it accepted.
+    pub call_keys: HashMap<String, kt_log::CallKeyBinding>,
     /// Consumed registration invite codes (hex digests) — in-memory fallback used only
     /// when there is no `db` (tests / ephemeral runs); with a `db` the durable
     /// `used_invites` table is authoritative, so a restart cannot resurrect a code.
@@ -113,6 +125,12 @@ pub struct Config {
     /// turn the relay into a battery-DoS amplifier (sender envelope rate limits apply
     /// upstream as well).
     pub call_wake_min_secs: u64,
+    /// Seconds to earn back one `WakeClass::CallControl` wake per recipient, against a
+    /// burst of [`crate::http::msg::CONTROL_WAKE_BURST`]. The burst is what lets one
+    /// answered call's controls through together; the refill is what stops an unbounded
+    /// stream of silent high-priority wakes from becoming a battery DoS the user can only
+    /// observe as drain.
+    pub control_wake_min_secs: u64,
     /// Max concurrent call rooms (M-4). Configurable via the `MAX_ROOMS` env var.
     pub max_rooms: usize,
     /// Giphy API key for the GIF-search privacy proxy (`/v1/gif/*`). `None` disables
@@ -162,6 +180,7 @@ impl Default for Config {
             rate_salt: "dev-rate-salt".to_string(),
             wake_debounce_secs: 30,
             call_wake_min_secs: 2,
+            control_wake_min_secs: 1,
             max_rooms: crate::call::DEFAULT_MAX_ROOMS,
             giphy_key: None,
             release_grace_secs: kt_log::RELEASE_GRACE_SECS,
@@ -259,7 +278,20 @@ impl AppState {
         }
 
         let state = Self::assemble(config, kt, store, directory, Some(db));
-        state.inner.lock().unwrap().push = push;
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.push = push;
+            if let Some(db) = &inner.db {
+                if let Ok(rows) = db.load_call_keys() {
+                    inner.call_keys = rows
+                        .into_iter()
+                        .filter_map(|(hash, json)| {
+                            serde_json::from_str(&json).ok().map(|b| (hash, b))
+                        })
+                        .collect();
+                }
+            }
+        }
         state
     }
 
@@ -291,6 +323,7 @@ impl AppState {
                 push: HashMap::new(),
                 sync_blobs: HashMap::new(),
                 ws_count: HashMap::new(),
+                call_keys: HashMap::new(),
                 // Byte budgets (10-minute windows). Uploads: 256 MiB — dozens of max-size
                 // attachments or several full history syncs, but no multi-GiB disk fill.
                 // Downloads: 1 GiB — a device re-fetching plenty of media, but no

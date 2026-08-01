@@ -106,11 +106,11 @@ static ACTIVITY_SLOT: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
 /// (app-context install wins over a leftover activity from the old init path).
 pub(crate) fn install_ndk_context(env: &JNIEnv, obj: &JObject, replace: bool) {
     let Ok(vm) = env.get_java_vm() else {
-        eprintln!("[init] no JavaVM");
+        crate::diag!("[init] no JavaVM");
         return;
     };
     let Ok(global) = env.new_global_ref(obj) else {
-        eprintln!("[init] global ref failed");
+        crate::diag!("[init] global ref failed");
         return;
     };
     let ptr = global.as_obj().as_raw();
@@ -126,7 +126,7 @@ pub(crate) fn install_ndk_context(env: &JNIEnv, obj: &JObject, replace: bool) {
         }
         ndk_context::initialize_android_context(vm.get_java_vm_pointer().cast(), ptr.cast());
     }
-    eprintln!("[init] ndk-context initialized");
+    crate::diag!("[init] ndk-context initialized");
 }
 
 /// Store (or clear, with null) the live Activity. Old refs are deliberately leaked —
@@ -406,7 +406,7 @@ fn call_no_args(method: &str) -> Result<(), String> {
 /// the mic so first use asks instead of failing with a bare "permission denied".
 pub fn ensure_mic_permission() {
     if let Err(e) = call_with_activity("ensureMic") {
-        eprintln!("[media] mic permission bridge: {e}");
+        crate::diag!("[media] mic permission bridge: {e}");
     }
 }
 
@@ -421,7 +421,7 @@ pub fn set_camera_capture(on: bool) {
         call_no_args("stopCamera")
     };
     if let Err(e) = r {
-        eprintln!("[media] camera bridge: {e}");
+        crate::diag!("[media] camera bridge: {e}");
     }
 }
 
@@ -434,7 +434,7 @@ pub fn set_screen_capture(on: bool) {
         }
     }
     if let Err(e) = r {
-        eprintln!("[media] screen bridge: {e}");
+        crate::diag!("[media] screen bridge: {e}");
     }
 }
 
@@ -446,7 +446,7 @@ pub fn set_screen_audio_capture(on: bool) {
         "stopScreenAudio"
     });
     if let Err(e) = r {
-        eprintln!("[media] screen-audio bridge: {e}");
+        crate::diag!("[media] screen-audio bridge: {e}");
     }
 }
 
@@ -463,7 +463,7 @@ pub fn set_voice_capture(on: bool) {
         }
     }
     if let Err(e) = r {
-        eprintln!("[media] voice-mic bridge: {e}");
+        crate::diag!("[media] voice-mic bridge: {e}");
     }
 }
 
@@ -482,7 +482,7 @@ pub fn set_voice_playout(on: bool) {
         }
     }
     if let Err(e) = r {
-        eprintln!("[media] voice-playout bridge: {e}");
+        crate::diag!("[media] voice-playout bridge: {e}");
     }
 }
 
@@ -500,11 +500,31 @@ pub fn set_voice_noise_suppression(on: bool) {
         .map_err(|e| format!("setVoiceNoiseSuppression: {e}"))
     });
     if let Err(e) = r {
-        eprintln!("[media] voice-ns bridge: {e}");
+        crate::diag!("[media] voice-ns bridge: {e}");
     }
 }
 
 /// Route call audio to the loudspeaker (`true`) or back to the earpiece (`false`).
+/// Hand route ownership to Core-Telecom (or take it back when the call ends). While
+/// Telecom owns it, `MediaBridge` keeps capture/playout and the platform AEC/NS but stops
+/// driving `setCommunicationDevice`/SCO — two writers is how call audio ends up on the
+/// wrong device (`internal/CALL_PLAN.md` §7.4).
+pub fn set_telecom_owns_route(owned: bool) {
+    let r = with_bridge(|env, class, _ctx| {
+        env.call_static_method(
+            class,
+            "setTelecomOwnsRoute",
+            "(Z)V",
+            &[JValue::Bool(owned as jboolean)],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("setTelecomOwnsRoute: {e}"))
+    });
+    if let Err(e) = r {
+        crate::diag!("[media] telecom route ownership: {e}");
+    }
+}
+
 pub fn set_speakerphone(on: bool) {
     let r = with_bridge(|env, class, activity| {
         env.call_static_method(
@@ -517,7 +537,7 @@ pub fn set_speakerphone(on: bool) {
         .map_err(|e| format!("setSpeakerphone: {e}"))
     });
     if let Err(e) = r {
-        eprintln!("[media] speakerphone bridge: {e}");
+        crate::diag!("[media] speakerphone bridge: {e}");
     }
 }
 
@@ -540,7 +560,7 @@ pub fn audio_routes() -> Option<String> {
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("[media] audio-routes bridge: {e}");
+        crate::diag!("[media] audio-routes bridge: {e}");
     }
     out
 }
@@ -565,7 +585,7 @@ pub fn set_audio_route(route: &str) -> Option<String> {
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("[media] audio-route bridge: {e}");
+        crate::diag!("[media] audio-route bridge: {e}");
     }
     out
 }
@@ -586,7 +606,7 @@ pub fn call_tone(kind: &str) {
         .map_err(|e| format!("callTone: {e}"))
     });
     if let Err(e) = r {
-        eprintln!("[media] call-tone bridge: {e}");
+        crate::diag!("[media] call-tone bridge: {e}");
     }
 }
 
@@ -623,7 +643,7 @@ pub fn move_task_to_back() {
     };
     let obj = unsafe { JObject::from_raw(act.cast()) };
     if let Err(e) = env.call_method(&obj, "moveTaskToBack", "(Z)Z", &[JValue::Bool(1)]) {
-        eprintln!("[nav] moveTaskToBack: {e}");
+        crate::diag!("[nav] moveTaskToBack: {e}");
         let _ = env.exception_clear();
     }
 }
@@ -644,7 +664,7 @@ pub fn speakerphone_on() -> bool {
         Ok(())
     });
     if let Err(e) = r {
-        eprintln!("[media] speakerphone bridge: {e}");
+        crate::diag!("[media] speakerphone bridge: {e}");
     }
     on
 }

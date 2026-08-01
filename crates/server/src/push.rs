@@ -4,9 +4,9 @@
 //! `http.rs`; this module adds a second endpoint form the relay understands natively.
 //! It speaks the FCM HTTP v1 API directly — OAuth2 service-account JWT (RS256) minted
 //! here, no Google SDK — and sends **data-only, content-free** messages: the payload is
-//! a constant `{"t":"m"}` or `{"t":"c"}` (message / call wake class). Google learns the
-//! wake class and timing, nothing else — strictly less than Signal, which ships the
-//! sealed envelope bytes *through* FCM.
+//! a constant `{"t":"m"}`, `{"t":"c"}`, or `{"t":"x"}` (message / call-ring /
+//! call-control wake class). Google learns the wake class and timing, nothing else —
+//! strictly less than Signal, which ships the sealed envelope bytes *through* FCM.
 //!
 //! Error posture: wakes are cheap and fire-and-forget. `UNREGISTERED`/dead-token
 //! responses tell the caller to delete the push row (the device re-registers via
@@ -22,6 +22,16 @@ const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const TOKEN_REUSE_SECS: u64 = 55 * 60;
 /// Outbound HTTP timeout — a slow Google endpoint must not pile up wake tasks.
 const HTTP_TIMEOUT_SECS: u64 = 10;
+
+fn fcm_wake_fields(class: WakeClass) -> (&'static str, &'static str, &'static str) {
+    // The class tag is `WakeClass::fcm_tag` (the Android messaging service parses it
+    // back); only the TTL and collapse key are the relay's own policy.
+    match class {
+        WakeClass::Call => (class.fcm_tag(), "60s", "call-ring"),
+        WakeClass::CallControl => (class.fcm_tag(), "60s", "call-control"),
+        WakeClass::None | WakeClass::Normal => (class.fcm_tag(), "86400s", "message"),
+    }
+}
 
 /// What became of one wake attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,16 +187,12 @@ impl FcmSender {
         Ok(token)
     }
 
-    /// Fire one content-free wake at `token`. Data-only, high priority for both classes
-    /// (every wake produces a user-visible result, which is what Android's high-priority
-    /// budget wants); calls get a 60 s TTL so a stale offer push dies in transit instead
-    /// of ringing a phone that was off — the drain then surfaces "Missed call" from the
-    /// mailbox. Never a `notification:` payload — display stays local, post-decrypt.
+    /// Fire one content-free wake at `token`. Data-only and high priority: message/ring
+    /// wakes produce user-visible work, while control wakes promptly cancel existing
+    /// call UI. Call classes get a 60 s TTL so stale signals die in transit. Never a
+    /// `notification:` payload — display stays local, post-decrypt.
     pub async fn wake(&self, token: &str, class: WakeClass) -> WakeOutcome {
-        let (t, ttl) = match class {
-            WakeClass::Call => ("c", "60s"),
-            _ => ("m", "86400s"),
-        };
+        let (t, ttl, collapse_key) = fcm_wake_fields(class);
         let bearer = match self.bearer().await {
             Ok(b) => b,
             Err(e) => {
@@ -205,7 +211,7 @@ impl FcmSender {
             "message": {
                 "token": token,
                 "data": { "t": t },
-                "android": { "priority": "HIGH", "ttl": ttl, "collapse_key": "wake" },
+                "android": { "priority": "HIGH", "ttl": ttl, "collapse_key": collapse_key },
             }
         });
         match self
@@ -239,5 +245,23 @@ impl FcmSender {
                 WakeOutcome::Transient
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fcm_call_control_is_urgent_but_not_a_ring() {
+        assert_eq!(fcm_wake_fields(WakeClass::Call), ("c", "60s", "call-ring"));
+        assert_eq!(
+            fcm_wake_fields(WakeClass::CallControl),
+            ("x", "60s", "call-control")
+        );
+        assert_eq!(
+            fcm_wake_fields(WakeClass::Normal),
+            ("m", "86400s", "message")
+        );
     }
 }

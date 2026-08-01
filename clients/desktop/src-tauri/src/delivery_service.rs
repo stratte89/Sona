@@ -17,7 +17,7 @@ pub fn set_background_delivery(_on: bool) {}
 #[cfg(target_os = "android")]
 pub fn set_background_delivery(on: bool) {
     if let Err(e) = imp::call(if on { "start" } else { "stop" }) {
-        eprintln!("[delivery-service] {e}");
+        crate::diag!("[delivery-service] {e}");
     }
 }
 

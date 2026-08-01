@@ -32,6 +32,16 @@ use crate::{ClientError, Result};
 /// How long the whole QUIC attempt may take before the WebSocket fallback wins.
 pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long a QUIC join waits for the relay's `joined` before failing.
+///
+/// Writing the join is not joining: `write_all` returns once the bytes are handed to the
+/// stream, so without this the connect reported success the instant the request left.
+const JOIN_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one reliable cell group may take to arrive in full. Generous next to the tens
+/// of kilobytes a video frame actually is — this is a stuck-stream bound, not pacing.
+const GROUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Trust exactly one certificate, identified by the SHA-256 of its DER encoding (the
 /// hash arrives over the already-authenticated HTTPS channel). Signatures are still
 /// verified — the pin binds the key, the handshake proves possession of it.
@@ -91,6 +101,29 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
     }
 }
 
+/// The reliable-send half of a QUIC leg (see [`QuicMedia::cells`]).
+#[derive(Clone)]
+pub(crate) struct QuicCells {
+    conn: quinn::Connection,
+}
+
+impl QuicCells {
+    /// Reliable group send (one video frame's cells, or a control cell): one short
+    /// unidirectional stream, so a retransmit delays only its own frame.
+    pub(crate) async fn send_cells(&self, cells: Vec<Vec<u8>>) -> Result<()> {
+        let mut s = self
+            .conn
+            .open_uni()
+            .await
+            .map_err(|e| ClientError::Ws(format!("quic: {e}")))?;
+        s.write_all(&frame_cells(&cells))
+            .await
+            .map_err(|e| ClientError::Ws(format!("quic: {e}")))?;
+        let _ = s.finish();
+        Ok(())
+    }
+}
+
 /// One QUIC call leg: the connection (for sending) plus a unified event queue fed by
 /// background pump tasks (control lines, datagrams, incoming streams). The pumps keep
 /// `next_event` cancel-safe — dropping its future loses nothing.
@@ -99,6 +132,9 @@ pub(crate) struct QuicMedia {
     events: tokio::sync::mpsc::UnboundedReceiver<CallWireEvent>,
     /// Keeps the endpoint (and its UDP socket) alive for the call's lifetime.
     _endpoint: quinn::Endpoint,
+    /// The relay's `joined`, read by the join itself and handed to the session on its first
+    /// [`QuicMedia::next_event`] so nothing downstream can tell the difference.
+    pending: Option<CallWireEvent>,
 }
 
 impl QuicMedia {
@@ -225,34 +261,103 @@ impl QuicMedia {
         }
 
         // ── Stream pump: each incoming uni stream is one reliable cell group. ──
+        //
+        // Drained one at a time, in the order the streams were accepted, because that is
+        // the order the frames were encoded in. Reading each group in its own task instead
+        // let a small frame overtake a large one — a keyframe is many times the size of the
+        // P-frames around it — and a decoder handed frames out of order loses its reference
+        // chain, blanks, and asks for another keyframe, which is itself large. The result
+        // was video that stuttered worst exactly when it was busiest.
+        //
+        // Sequential draining cannot delay voice: that lives in the datagram pump above,
+        // in its own task, by design. The only thing it could delay is later video, and the
+        // timeout bounds that — a group that stops arriving costs one frame, not the call's
+        // video, whatever the relay on the other end is doing.
         {
             let ev_tx = ev_tx.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
                 while let Ok(mut s) = conn.accept_uni().await {
-                    let ev_tx = ev_tx.clone();
-                    tokio::spawn(async move {
-                        let Ok(group) = s.read_to_end(MAX_STREAM_GROUP_BYTES).await else {
+                    let read = tokio::time::timeout(
+                        GROUP_READ_TIMEOUT,
+                        s.read_to_end(MAX_STREAM_GROUP_BYTES),
+                    );
+                    let Ok(Ok(group)) = read.await else {
+                        continue; // truncated, oversized or stalled — drop this frame only
+                    };
+                    let Some(cells) = parse_cells(&group) else {
+                        continue; // malformed — drop the group, not the call
+                    };
+                    for cell in cells {
+                        if ev_tx.send(CallWireEvent::Frame(cell)).is_err() {
                             return;
-                        };
-                        let Some(cells) = parse_cells(&group) else {
-                            return; // malformed — drop the group, not the call
-                        };
-                        for cell in cells {
-                            if ev_tx.send(CallWireEvent::Frame(cell)).is_err() {
-                                return;
-                            }
                         }
-                    });
+                    }
                 }
             });
         }
 
-        Ok(QuicMedia {
+        let mut media = QuicMedia {
             conn,
             events,
             _endpoint: endpoint,
+            pending: None,
+        };
+        // Writing the join is not joining. `write_all` returns when the bytes are handed to
+        // the stream, so this used to report success the instant the request left — and if
+        // the relay then refused it, or never processed it, the caller sat in a room it had
+        // never been admitted to, waiting for a peer that was never paired with it.
+        //
+        // Measured 2026-08-01: the caller's log said "room joined" while the relay logged no
+        // join for that room at all, and the callee — on the WebSocket path, which had
+        // already been gated — was alone with `peers=1` and gave up twenty seconds later.
+        // The WebSocket fix could not help, because this side never went near it.
+        let ack = tokio::time::timeout(JOIN_ACK_TIMEOUT, async {
+            loop {
+                match media.events.recv().await {
+                    Some(joined @ CallWireEvent::Joined { .. }) => return Some(joined),
+                    // The control stream ended, or the connection went, before we were let
+                    // in: a refusal, seen from here.
+                    Some(CallWireEvent::Closed) | None => return None,
+                    // Anything else this early is not ours to interpret; keep waiting.
+                    Some(_) => continue,
+                }
+            }
         })
+        .await;
+        // Give the seat back before failing.
+        //
+        // The join has already been WRITTEN by this point, so the relay has counted this
+        // member — and a room holds exactly two. Simply returning `None` here drops the
+        // connection and lets the caller fall back to WebSocket, but quinn's close is not
+        // instant and the relay still reads the member as open: the fallback's join then
+        // arrives at a room that is "already full" of this very client's ghost. Observed
+        // 2026-08-01 on the relay, four joins to one room inside a single second:
+        //
+        //   join: … newcomer sees peers=1
+        //   join: … newcomer sees peers=2
+        //   join REFUSED: already full
+        //   join REFUSED: already full
+        //
+        // Before the join gates existed that refusal was silent, and the client sat alone in
+        // a room it had never been let into — which is the whole of the original hang.
+        let ack = match ack {
+            Ok(Some(joined)) => joined,
+            Ok(None) => {
+                media.conn.close(0u32.into(), b"join-not-confirmed");
+                return Err(err(
+                    "the relay closed the call connection without admitting it".into(),
+                ));
+            }
+            Err(_) => {
+                media.conn.close(0u32.into(), b"join-timeout");
+                return Err(err("the relay never confirmed the call room join".into()));
+            }
+        };
+        // Kept, not consumed: the session needs the `peers` count to know whether the peer is
+        // already in the room.
+        media.pending = Some(ack);
+        Ok(media)
     }
 
     /// Loss-tolerant send (voice / screen audio). Dropped frames are fine; a dead
@@ -267,23 +372,23 @@ impl QuicMedia {
         }
     }
 
-    /// Reliable group send (one video frame's cells, or a control cell): one short
-    /// unidirectional stream.
-    pub(crate) async fn send_cells(&self, cells: Vec<Vec<u8>>) -> Result<()> {
-        let mut s = self
-            .conn
-            .open_uni()
-            .await
-            .map_err(|e| ClientError::Ws(format!("quic: {e}")))?;
-        s.write_all(&frame_cells(&cells))
-            .await
-            .map_err(|e| ClientError::Ws(format!("quic: {e}")))?;
-        let _ = s.finish();
-        Ok(())
+    /// A send-only handle for the reliable path, cheap to clone.
+    ///
+    /// Reliable sends may block — on congestion, on a retransmit, on the peer's
+    /// stream-concurrency limit — so they must not run on the task that owns the voice
+    /// cadence. Cloning the connection is how they get their own; a `quinn::Connection`
+    /// is a handle, and its send calls take `&self`.
+    pub(crate) fn cells(&self) -> QuicCells {
+        QuicCells {
+            conn: self.conn.clone(),
+        }
     }
 
     /// Next room/media event. Cancel-safe (pumps own the sockets).
     pub(crate) async fn next_event(&mut self) -> CallWireEvent {
+        if let Some(pending) = self.pending.take() {
+            return pending;
+        }
         self.events.recv().await.unwrap_or(CallWireEvent::Closed)
     }
 

@@ -835,6 +835,9 @@ textarea { line-height: 1.4; }
 .call-btn.ok { background: var(--brand); color: #06281c; }
 .call-btn.danger { background: var(--danger); color: #2b0707; }
 .call-btn.on { background: var(--brand-dim); }
+/* Share, while the other person is sharing: one screen at a time (the button keeps its
+   place and its tooltip says why — see setCallButtons). */
+.call-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* Phone: identity in the top bar, controls as one centred row of circles. */
 @media (max-width: 700px) {
@@ -1821,3 +1824,188 @@ input:focus-visible, textarea:focus-visible { outline: 2px solid var(--brand-2);
 }
 .ep-cell:hover { background: var(--panel-2); transform: scale(1.12); }
 .ep-empty { grid-column: 1 / -1; text-align: center; color: var(--muted); font-size: 13px; }
+
+/* ── Call stream controls: overlay buttons + the volume popover ──────
+   The three dots and the fullscreen toggle ride on top of the picture, Discord-style:
+   invisible until the pointer is over the stage, always visible on touch (there is no
+   hover to reveal them with). The same menu opens on right-click anywhere on the
+   stream, which is where most people reach for it first. */
+.call-video { position: relative; }
+.cv-ctls {
+  position: absolute; top: 10px; right: 10px; z-index: 3;
+  display: flex; gap: 6px;
+  opacity: 0; transition: opacity .16s ease;
+}
+.call-video:hover .cv-ctls,
+.cv-ctls:focus-within,
+.cv-ctls.open { opacity: 1; }
+.cv-ctl {
+  display: grid; place-items: center; width: 34px; height: 34px; padding: 0;
+  border: none; border-radius: 10px; cursor: pointer;
+  color: #fff; background: rgba(12, 16, 20, .62);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, .35);
+  transition: background .14s ease, transform .14s ease;
+}
+.cv-ctl:hover { background: rgba(28, 34, 42, .86); }
+.cv-ctl:active { transform: scale(.94); }
+.cv-ctl svg { width: 17px; height: 17px; }
+/* Your own share tile is small; its menu button sits in the corner and shows on hover. */
+.self-tile { position: relative; }
+.selfscr-menu {
+  position: absolute; top: 6px; right: 6px; z-index: 3;
+  width: 26px; height: 26px; border-radius: 8px;
+  opacity: 0; transition: opacity .16s ease;
+}
+.selfscr-menu svg { width: 14px; height: 14px; }
+.self-tile:hover .selfscr-menu, .selfscr-menu:focus-visible, .selfscr-menu.open { opacity: 1; }
+/* The avatar's dots sit just off its edge rather than on it — the avatar is a big
+   coloured circle and a button inside it reads as part of the picture. */
+.call-avwrap { position: relative; display: inline-flex; }
+.av-menu {
+  position: absolute; right: -6px; bottom: 2px;
+  width: 30px; height: 30px; border-radius: 50%;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line-2); box-shadow: var(--shadow);
+}
+.av-menu:hover { background: var(--panel); }
+.av-menu svg { width: 15px; height: 15px; }
+
+/* Fullscreen: the stream leaves the call layout and covers everything. Above the call
+   UI (60) and its dialogs' backdrop, below the popover so the menu still works. */
+.call-video.full {
+  position: fixed; inset: 0; z-index: 68;
+  width: 100vw; height: 100vh; background: #000; gap: 0; padding: 0;
+}
+.call-video.full .cv-screen { width: 100%; height: 100%; object-fit: contain; }
+.call-video.full.both .cv-camera {
+  position: absolute; right: 18px; bottom: 18px; width: 20%; max-width: 300px;
+  border-radius: 12px; box-shadow: var(--shadow);
+}
+.call-video.full .cv-ctls { top: 16px; right: 16px; opacity: 1; }
+/* Your own share preview, expanded from its own menu.
+   The class goes on the PiP *wrapper*, not the tile: the wrapper carries the drag
+   transform, and a `position: fixed` descendant of a transformed element is positioned
+   against that element rather than the viewport — so styling the tile alone produced a
+   "fullscreen" the size of the little corner preview. Clearing the transform here is
+   what makes the fixed positioning mean the screen. */
+.call-self.selffull {
+  position: fixed; inset: 0; z-index: 68;
+  width: 100vw; height: 100vh; transform: none !important;
+  align-items: stretch; gap: 0; cursor: default; background: #000;
+}
+.call-self.selffull .self-tag { display: none; }
+/* One tile at a time up there: the camera PiP would otherwise squash in beside it. */
+.call-self.selffull #self-cam { display: none; }
+.call-self.selffull .self-tile.full {
+  width: 100%; height: 100%; max-width: none; border-radius: 0; background: #000;
+}
+.call-self.selffull .self-tile.full canvas { width: 100%; height: 100%; object-fit: contain; }
+.call-self.selffull .selfscr-menu { top: 16px; right: 16px; width: 34px; height: 34px; opacity: 1; }
+.call-self.selffull .selfscr-menu svg { width: 17px; height: 17px; }
+
+/* The peer's avatar inside the control bar: the always-reachable home for the voice
+   menu, since the big avatar on the idle card is hidden behind any video. */
+.barav {
+  flex: none; position: relative; margin-right: 12px; padding: 0;
+  background: none; border: none; cursor: pointer; line-height: 0;
+  border-radius: 50%; transition: transform .14s ease;
+}
+.barav:hover { transform: scale(1.06); }
+.barav .avatar { width: 38px; height: 38px; font-size: 15px; }
+/* A small ellipsis badge so it reads as a control rather than decoration. */
+.barav-dots {
+  position: absolute; right: -2px; bottom: -2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--panel-2); border: 1px solid var(--line-2);
+  display: grid; place-items: center;
+}
+.barav-dots::after {
+  content: ''; width: 2px; height: 2px; border-radius: 50%; color: var(--faint);
+  background: currentColor;
+  box-shadow: 0 -4px 0 currentColor, 0 4px 0 currentColor;
+}
+.barav:hover .barav-dots { background: var(--panel); }
+.barav:hover .barav-dots::after { color: var(--text); }
+
+/* ── The popover ─────────────────────────────────────────────────── */
+.volmenu {
+  position: fixed; z-index: 82; width: 254px; padding: 7px;
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 14px;
+  box-shadow: var(--shadow); animation: pop .12s ease;
+}
+.volmenu h5 {
+  margin: 0; padding: 7px 10px 6px; font-size: 11px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--faint);
+}
+.volrow {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px;
+  background: none; border: none; border-radius: 9px; color: var(--text);
+  font-size: 13.5px; text-align: left; cursor: pointer;
+}
+.volrow:hover { background: var(--panel); }
+.volrow.danger { color: var(--danger); }
+.volrow svg { width: 16px; height: 16px; flex: none; }
+.volrow span { flex: 1 1 auto; }
+/* The longest label is "Unmute voice audio"; it has to stay on one line next to the
+   switch or the row grows and the menu jumps height as you toggle it. */
+.volrow > span:not(.volcheck) { white-space: nowrap; }
+/* The checkbox: a Discord-ish pill that fills when on. */
+.volcheck {
+  flex: none; width: 34px; height: 20px; border-radius: 999px;
+  background: var(--line-2); position: relative; transition: background .15s ease;
+}
+.volcheck::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; transition: transform .15s ease;
+}
+.volrow[aria-checked="true"] .volcheck { background: var(--brand); }
+.volrow[aria-checked="true"] .volcheck::after { transform: translateX(14px); }
+
+.volslider { padding: 4px 10px 10px; }
+.volslider label {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12.5px; color: var(--faint); margin-bottom: 7px;
+}
+.volslider label em { font-style: normal; color: var(--text); font-variant-numeric: tabular-nums; }
+/* The rail is ours, not the browser's.
+   Styling a native range input does not survive the engine change: WebKitGTK (the Linux
+   webview) ignores `height` on the element and paints the background across its full
+   natural height, so a 4 px rail with a gradient fill came out as a fat green bar with
+   the thumb sitting inside it — and the fill and the thumb disagreed at both ends.
+   Chromium honoured the same CSS perfectly, which is exactly why this had to be checked
+   in the real engine.
+   So: draw the rail, the fill and the knob as ordinary elements, and keep the input on
+   top as an invisible hit target. Geometry is then identical everywhere, and the input
+   still provides dragging, click-to-seek, arrow keys and the accessibility tree. */
+.volrail { position: relative; height: 16px; }
+.volrail::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 50%; margin-top: -2px;
+  height: 4px; border-radius: 999px; background: var(--line-2);
+}
+.volrail-fill {
+  position: absolute; left: 0; top: 50%; margin-top: -2px; width: 0;
+  height: 4px; border-radius: 999px; background: var(--brand); pointer-events: none;
+}
+.volrail-knob {
+  position: absolute; left: 0; top: 50%; width: 15px; height: 15px;
+  margin-top: -7.5px; margin-left: -7.5px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+  pointer-events: none;
+}
+.volrail input[type="range"] {
+  position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+  -webkit-appearance: none; appearance: none;
+  background: none; opacity: 0; cursor: pointer;
+}
+/* Invisible, but its thumb width still sets how value maps to position — it has to
+   match `.volrail-knob` or the knob drifts from the pointer as you drag. */
+.volrail input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 15px; height: 15px;
+}
+.volrail input[type="range"]::-moz-range-thumb {
+  width: 15px; height: 15px; border: none;
+}
+/* Muted: the slider stays readable but stops claiming to be doing anything. */
+.volslider.off { opacity: .45; }
+.volmenu hr { height: 1px; margin: 5px 8px; border: none; background: var(--line-2); }

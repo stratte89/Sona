@@ -123,6 +123,18 @@ $('#sp-go').onclick = async () => {
 
 $('#call-share').onclick = async () => {
   if (callUi.screenOn) { await setScreenShare(false); return; }
+  // One screen at a time, checked against the backend at the moment of the click rather
+  // than trusting the cached flag. The button is greyed while the peer shares, but that
+  // relies on a `peer_track` event having arrived; asking here costs one call and turns
+  // "the picker opened and then the share failed" into a plain explanation up front.
+  try {
+    const st = await invoke('call_status');
+    if (st.active && st.active.peer_screen) {
+      toast('Only one person can share a screen at a time', 'err');
+      setCallButtons(); // resync the button with what we just learned
+      return;
+    }
+  } catch (_) { /* fall through — call_set_screen refuses independently */ }
   if (IS_ANDROID) { await setScreenShare(true); return; }
   await openSharePick();
 };

@@ -141,7 +141,7 @@ impl MessageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol_types::PayloadKind;
+    use protocol_types::{PayloadKind, WakeClass};
 
     fn env_for(to: &str, msg_id: &str, expires_at: Option<u64>) -> Envelope {
         Envelope {
@@ -152,6 +152,13 @@ mod tests {
             expires_at,
             wake: Default::default(),
             raw_identifier: None,
+        }
+    }
+
+    fn call_env(to: &str, msg_id: &str, expires_at: Option<u64>, wake: WakeClass) -> Envelope {
+        Envelope {
+            wake,
+            ..env_for(to, msg_id, expires_at)
         }
     }
 
@@ -246,6 +253,68 @@ mod tests {
             store.fetch(&bob, 1000)[0].expires_at,
             Some(1000 + MAX_MESSAGE_TTL_SECS)
         );
+    }
+
+    /// Call signaling sets a call-scale expiry (~65 s). The relay must keep it exactly:
+    /// clamping is a ceiling, never an extension, or a stale ring/terminal could be
+    /// served to a device that reconnects minutes later.
+    #[test]
+    fn a_call_scale_expiry_is_kept_exactly_and_never_extended() {
+        let mut store = MessageStore::new();
+        let bob = IdentityHash::from_identifier("bob");
+        let deadline = 1000 + 65;
+        store
+            .enqueue(
+                call_env("bob", "offer", Some(deadline), WakeClass::Call),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(store.fetch(&bob, 1000)[0].expires_at, Some(deadline));
+        // One second past its own deadline the offer is gone, long before the generic
+        // 30-day ceiling — a late reconnect can never be rung by it.
+        assert!(store.fetch(&bob, deadline + 1).is_empty());
+        assert_eq!(store.depth(&bob), 0);
+    }
+
+    /// A duplicate control (an at-least-once outbox retry) is idempotent success, and
+    /// must not push the original's deadline out.
+    #[test]
+    fn a_duplicate_control_neither_double_stores_nor_extends_the_deadline() {
+        let mut store = MessageStore::new();
+        let bob = IdentityHash::from_identifier("bob");
+        store
+            .enqueue(
+                call_env("bob", "terminal", Some(1065), WakeClass::CallControl),
+                1000,
+            )
+            .unwrap();
+        // Same msg_id, a much later expiry: accepted (the sender's ACK may have been
+        // lost) but nothing changes.
+        assert_eq!(
+            store.enqueue(
+                call_env("bob", "terminal", Some(9999), WakeClass::CallControl),
+                1010,
+            ),
+            Ok(false)
+        );
+        assert_eq!(store.depth(&bob), 1);
+        assert_eq!(store.fetch(&bob, 1010)[0].expires_at, Some(1065));
+    }
+
+    /// A control that arrives after its own deadline is accepted (the sender must not
+    /// show a failure for a call that is over anyway) and stored nowhere.
+    #[test]
+    fn an_already_expired_control_is_accepted_but_never_stored() {
+        let mut store = MessageStore::new();
+        let bob = IdentityHash::from_identifier("bob");
+        assert_eq!(
+            store.enqueue(
+                call_env("bob", "late", Some(999), WakeClass::CallControl),
+                1000,
+            ),
+            Ok(false)
+        );
+        assert_eq!(store.depth(&bob), 0);
     }
 
     #[test]

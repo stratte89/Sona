@@ -348,6 +348,30 @@ impl Client {
             self.add_contact(account, &member.username).await
         }
     }
+    /// [`member_contact`](Self::member_contact) restricted to members we already share a
+    /// session with — network-free, for the call paths that prepare envelopes under a
+    /// session lock. `None` means "not addressable yet"; the caller's off-lock
+    /// [`warm_account_routes`](Self::warm_account_routes) is what makes it addressable.
+    pub fn member_contact_pinned(
+        &self,
+        account: &Account,
+        member: &GroupMember,
+    ) -> Option<Contact> {
+        if !account.ratchet_ref().has_session(&member.identity_key) {
+            return None;
+        }
+        Some(Contact {
+            username: member.username.clone(),
+            identity_hash: IdentityHash::from_identifier(&member.username)
+                .as_str()
+                .to_string(),
+            identity_key: member.identity_key.clone(),
+            safety_number: safety_number(
+                &account.ratchet_ref().identity_key(),
+                &member.identity_key,
+            ),
+        })
+    }
     /// Toggle a group emoji reaction, fanned out over every other member's 1:1 session
     /// (same transport as [`send_group`](Self::send_group)).
     pub async fn send_group_reaction(

@@ -378,6 +378,10 @@ pub(crate) struct PrivacyView {
     pub(crate) send_typing: bool,
     pub(crate) send_receipts: bool,
     pub(crate) notif_level: String,
+    /// Seconds this device keeps internal call-control records (see `Prefs`).
+    pub(crate) call_retention_secs: u64,
+    /// Whether answering a call on this device requires unlocking the app first.
+    pub(crate) require_unlock_to_answer: bool,
 }
 
 /// What the UI needs to render call state after a reload.
@@ -385,9 +389,15 @@ pub(crate) struct PrivacyView {
 pub(crate) struct CallStatusView {
     pub(crate) active: Option<serde_json::Value>,
     pub(crate) incoming: Option<serde_json::Value>,
+    pub(crate) claiming: Option<serde_json::Value>,
     pub(crate) reconnecting: Option<serde_json::Value>,
     pub(crate) group_active: Option<serde_json::Value>,
     pub(crate) group_incoming: Option<serde_json::Value>,
+    pub(crate) group_claiming: Option<serde_json::Value>,
+    /// An answer is held over the keyguard and the OS has no factor to check a human with,
+    /// so Sona's own password/PIN is owed (A-19). Read on load as well as pushed as an
+    /// event: the webview is often started *by* this flow and would miss the event.
+    pub(crate) unlock_credential: bool,
 }
 
 /// What the notifications-settings screen renders (mode, live state, capabilities,

@@ -137,7 +137,7 @@ mod tests {
         let (inputs, outputs) = crate::audio::list_devices();
         for d in inputs.iter().chain(outputs.iter()) {
             assert!(!d.id.is_empty() && !d.name.is_empty());
-            eprintln!(
+            crate::diag!(
                 "{}{}  [{}]",
                 if d.is_default { "* " } else { "  " },
                 d.name,
@@ -147,7 +147,7 @@ mod tests {
         assert!(!outputs.is_empty(), "no audio outputs");
         for c in list_cameras() {
             assert!(!c.name.is_empty());
-            eprintln!(
+            crate::diag!(
                 "{}camera {}",
                 if c.is_default { "* " } else { "  " },
                 c.name

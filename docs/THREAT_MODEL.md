@@ -90,6 +90,24 @@ copy of the vault seal key* (`crypto_core::quick`) next to the vault:
 * *Auto-unlock (opt-in, default off):* wrapped under the device key alone — possession of
   the unlocked OS session becomes the gate. Useless off-device; the user is warned.
 
+**The call-control subsystem (Android) is not a fourth quick-unlock method.** So a
+locked phone can ring, stop ringing, and decline, it holds a scoped call-only identity
+whose secret is sealed under a key derived from the **device key** — deliberately not the
+vault seal key, which is what a quick-unlock blob wraps. The distinction is the whole
+security argument: that identity is not a ratchet identity, signs nothing else, and
+cannot open the vault, decrypt chat or group content, send a message or receipt, read
+history, touch account state, or satisfy "Require app unlock to answer". What it can
+decrypt is a capsule carrying no media capability — enough to present or cancel a ring
+and nothing more. Its store is bounded, sealed with its own domain separation, excluded
+from Android backup, and destroyed with the account on deletion or KT-verified
+revocation. Off-device the sealed blob is useless: the device key is Keystore-held.
+
+Answering still costs a human unlock (`Require app unlock to answer calls`, default on):
+the platform answer is accepted immediately so the ringtone stops, but the answer claim,
+the microphone and the media room all wait for the vault, correlated to that exact call
+and ring — a stale unlock cannot answer a later one, and a timeout disconnects only this
+device rather than declining a call a sibling could still take.
+
 A password change rotates the seal key, instantly invalidating every quick-unlock blob
 (PIN/auto are re-wrapped inside the ceremony; biometric must be re-enabled). Username and
 password changes are gated by a three-factor ceremony re-verified atomically in Rust:
@@ -116,18 +134,21 @@ endpoints never touch the URL fetcher.
 **Push-wake metadata (deliberate, bounded).** Making messages/calls arrive with the
 app closed adds exactly three metadata facts, each chosen over a worse alternative:
 
-1. *Wake class → relay.* Every envelope carries one sender-declared coarse bit
-   (`none` / `normal` / `call`) the relay reads ONLY to decide whether/how to fire a
-   wake. It carries no identifier and is strictly less than Signal's per-envelope
+1. *Wake class → relay.* Every envelope carries one sender-declared coarse class
+   (`none` / `normal` / `call` / `call_control`) the relay reads ONLY to decide
+   whether/how to fire a wake. `call_control` is urgent but **silent**: it exists
+   because a sleeping phone must wake to *stop* ringing when the call was answered
+   elsewhere or cancelled, and a class that could ring would let a cancellation be
+   mistaken for an offer. It carries no identifier and is strictly less than Signal's per-envelope
    `urgent` flag. Without it, either every receipt would burn a battery wake or calls
    could not ring through Doze.
-2. *Wake class + timing → push broker.* The FCM payload is a constant `{"t":"m"}` or
-   `{"t":"c"}`, data-only, high priority; TTL 60 s for calls / 24 h for messages.
-   Google learns "this device was poked (message|call) at time T" — compare Signal,
-   which ships the sealed envelope bytes *through* FCM. The `"t":"c"` bit exists so a
-   locked-vault (PIN/password-only) device can still ring generically without
-   decrypting anything; users who reject even that stay on connection mode, which
-   involves no third party at all and remains the default.
+2. *Wake class + timing → push broker.* The FCM payload is a constant `{"t":"m"}`,
+   `{"t":"c"}` or `{"t":"x"}`, data-only, high priority; TTL 60 s for calls / 24 h for
+   messages. Google learns "this device was poked (message|call|call-control) at time
+   T" — compare Signal, which ships the sealed envelope bytes *through* FCM. The
+   `"t":"c"` bit exists so a locked-vault (PIN/password-only) device can still ring
+   without decrypting anything, and `"t":"x"` so it can stop; users who reject even
+   that stay on connection mode, which involves no third party at all.
 3. *FCM token ↔ mailbox hash → relay DB.* Stored AEAD-encrypted at rest, deleted on
    unregister/revocation, self-purged when FCM reports the token dead. Google already
    knows the device; the relay already knows the mailbox — the link is the only new
@@ -152,6 +173,19 @@ Frames are constant-size (CBR Opus + padding) at a constant 20 ms cadence in bot
 directions — silence and mute included — so traffic analysis of the stream yields
 nothing beyond the call's existence and duration, which the relay necessarily observes.
 Call keys live only in memory and die at hangup (per-call forward secrecy).
+
+*Answer arbitration.* An account's devices all ring, and the **caller** picks the
+winner: each device sends a claim carrying its own nonce and device id, and only the
+device named by the caller's acknowledgement may start media. A device that merely
+sent a claim never joins the room, so two devices cannot both believe they answered,
+and a claim replayed by a hostile relay wins nothing — the nonce is single-use and the
+acknowledgement names an exact device from the KT-verified roster.
+
+*Ordering and expiry.* Every offer, claim, winner and terminal carries an absolute
+deadline and a call-scale envelope TTL, so a control captured and released later is
+dead on arrival rather than able to ring a phone or revive a finished call. Terminal
+outcomes write bounded tombstones, so a delayed offer that lost its race is
+acknowledged and silently discarded instead of ringing for its full timeout.
 
 ### Video calls & screen share
 *Can:* an observer/relay try to learn who shares what with whom; a hostile relay try to
@@ -214,9 +248,20 @@ key bindings, signed by the account key, with a per-device proof-of-possession.
   relay, so the relay — which holds the blob — cannot brute-force the password *or* the PIN.
   A device-bound *vault* copied to another device still opens nowhere; history arrives only
   through this explicit, user-authenticated channel.
+* **Call-control keys are bound the same way, and revoked the same way.** A device's
+  call-control key is published under a binding signed by that device's own roster key
+  and verified against the KT-verified roster, so a relay serving a key of its own has
+  nothing to verify it against, and a device removed from the roster has no valid
+  binding left. Publication is monotonic (`supersedes`), so a recorded older
+  publication cannot be replayed to make a device listen with a key an attacker holds.
+  The relay drops the call-control mailbox record on revocation and account deletion,
+  exactly as it drops a device mailbox.
 *New metadata exposure (accepted, documented):* the public KT log now reveals, per account
 hash, device **count**, device public keys, and link/revoke **times** (never device names or
-models). The relay can group an account's device mailboxes (it must, to route) and learns
+models). A device's call-control mailbox is one more mailbox the relay can group under the
+account (it must, to route capsules); it is derived distinctly from the message mailbox so
+a call-only key can never drain chat ciphertext, and the capsule itself is
+sender-anonymous on the wire. The relay can group an account's device mailboxes (it must, to route) and learns
 per-device delivery timing. **Self-fan-out** (a send also copies to the sender's own other
 devices) would produce a correlatable burst; own-device copies are therefore delayed by a
 random 0–25 s **jitter** so the relay cannot reliably tie the burst back to who is talking to

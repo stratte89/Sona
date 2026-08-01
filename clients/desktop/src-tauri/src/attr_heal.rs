@@ -1,7 +1,7 @@
 //! Attribution self-heal: inbound content from a device key we cannot attribute,
-//! whose claimed username IS a pinned contact, is quarantined (`Session::pending_attr`)
-//! instead of silently dropped by the request gate's spoof rule, then replayed after
-//! a KT-verified roster re-resolve. Split from runtime.rs (no-monolith); the delivery
+//! whose claimed username is a pinned contact or known group member, is quarantined
+//! (`Session::pending_attr`) instead of silently dropped by the request gate's spoof
+//! rule, then replayed after a KT-verified roster re-resolve. Split from runtime.rs; the delivery
 //! loop spawns [`resolve_attr_and_replay`], and `accept_key_change` drains the same
 //! quarantine after re-pinning a rotated key.
 
@@ -21,21 +21,8 @@ pub(crate) async fn resolve_attr_and_replay(
     client: &Arc<Client>,
     username: &str,
 ) {
-    let claimed_of = |event: &InboundEvent| -> String {
-        match event {
-            InboundEvent::Message {
-                sender_username, ..
-            }
-            | InboundEvent::Attachment {
-                sender_username, ..
-            }
-            | InboundEvent::Knock {
-                sender_username, ..
-            } => sender_username.clone(),
-            _ => String::new(),
-        }
-    };
     let mut plans = Vec::new();
+    let mut call_signals = Vec::new();
     let mut applied = false;
     {
         let mut s = inner.lock().await;
@@ -50,7 +37,7 @@ pub(crate) async fn resolve_attr_and_replay(
             .await
             .is_err()
         {
-            eprintln!(
+            crate::diag!(
                 "client: roster re-resolve for {username} failed; {} event(s) stay quarantined",
                 events.len()
             );
@@ -65,13 +52,24 @@ pub(crate) async fn resolve_attr_and_replay(
         let level = s.prefs.notif_level.clone();
         for event in &events {
             let key = event.sender_identity_key().to_string();
+            let claimed = event
+                .attribution_claim()
+                .map(|(_, username)| username)
+                .unwrap_or_default();
             if s.history
-                .device_resolution_candidate(&key, &claimed_of(event))
+                .device_resolution_candidate(&key, claimed)
                 .is_some()
             {
-                eprintln!(
+                crate::diag!(
                     "client: dropping quarantined event from {key}: not in {username}'s verified roster"
                 );
+                continue;
+            }
+            if s.history.peer_blocked(&key) {
+                continue;
+            }
+            if event.is_call_signal() {
+                call_signals.push(event.clone());
                 continue;
             }
             s.history.apply(event);
@@ -102,5 +100,8 @@ pub(crate) async fn resolve_attr_and_replay(
     }
     for plan in &plans {
         notify_now(plan);
+    }
+    for event in call_signals {
+        handle_call_signal(inner, client, event).await;
     }
 }

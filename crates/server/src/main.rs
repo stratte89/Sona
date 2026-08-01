@@ -147,6 +147,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(Config::default().call_wake_min_secs);
+    let control_wake_min_secs = std::env::var("CONTROL_WAKE_MIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Config::default().control_wake_min_secs);
 
     // Access tier: open (default) / token / stealth. An unrecognized value is fatal —
     // a typo silently falling back to `open` would run a private relay wide open.
@@ -259,6 +263,7 @@ async fn main() {
         release_grace_secs,
         wake_debounce_secs,
         call_wake_min_secs,
+        control_wake_min_secs,
         access_mode,
         access_token_hashes,
         ip_allowlist,

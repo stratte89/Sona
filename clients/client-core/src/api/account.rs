@@ -216,7 +216,7 @@ impl Client {
     }
 
     /// Fetch a single-use auth nonce for our own mailbox.
-    async fn fetch_nonce(&self, hash: &str) -> Result<String> {
+    pub(crate) async fn fetch_nonce(&self, hash: &str) -> Result<String> {
         let challenge: Value = self
             .http
             .get(format!("{}/v1/challenge?hash={hash}", self.base_url))

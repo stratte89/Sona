@@ -28,6 +28,7 @@
 //! client-side verification functions. The Merkle proof math is delegated entirely to
 //! the vetted `ct-merkle` crate — we do not hand-roll consistency-proof verification.
 
+pub mod callbinding;
 pub mod entry;
 pub mod group;
 pub mod head;
@@ -35,7 +36,8 @@ pub mod log;
 pub mod roster;
 pub mod verify;
 
-pub use entry::{EntryError, KtEntry};
+pub use callbinding::CallKeyBinding;
+pub use entry::{verify_ed25519, EntryError, KtEntry};
 pub use group::{GroupEpoch, GroupEpochError, GroupMemberEntry, MAX_GROUP_MEMBERS};
 pub use head::SignedTreeHead;
 pub use log::{AppendError, KtLog, KtRecord, RELEASE_GRACE_SECS};

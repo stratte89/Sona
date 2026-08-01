@@ -188,16 +188,16 @@ pub async fn create_account(
     let invite_code = invite_code
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty());
-    eprintln!("[create] start (deriving vault key + device binding)");
+    crate::diag!("[create] start (deriving vault key + device binding)");
     let dk = device_key_or_create();
-    eprintln!(
+    crate::diag!(
         "[create] device key: {}",
         if dk.is_some() { "bound" } else { "none" }
     );
     let (mut account, _vault) =
         create_account_with_username_bound(&username, &password, dk.as_ref())
             .map_err(|e| e.to_string())?;
-    eprintln!("[create] vault sealed; registering with relay");
+    crate::diag!("[create] vault sealed; registering with relay");
     let mut s = state.inner.lock().await;
     let client = s.client.clone().ok_or("not configured")?;
     // `register` advances the ratchet (mints one-time keys); persist happens below.
@@ -205,7 +205,7 @@ pub async fn create_account(
         .register_with_invite(&mut account, 20, invite_code.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    eprintln!("[create] registered");
+    crate::diag!("[create] registered");
     s.multi_device = detect_capabilities(&client).await;
     let id = account.account_id().to_string();
     let my_key = account.ratchet_ref().identity_key();
@@ -250,6 +250,44 @@ pub(crate) async fn finish_unlock(
         let inner = inner.clone();
         eng().spawn(async move {
             maybe_auto_delivery_mode(&inner).await;
+        });
+    }
+    // Who may ring this device while it is locked, distilled from the state that just
+    // came out of the vault.
+    refresh_call_screen(s);
+    // Pick the call-control store back up: its tombstones are what stop a call that ended
+    // while this process was gone from ringing again, and reconciliation takes down a ring
+    // this device died holding.
+    load_call_store(s);
+    // Make sure this device can be rung while locked: mint/keep its call-control key and
+    // put the current one on the relay's shelf. Off-lock, best effort — a device with no
+    // key store simply has no capsule identity.
+    if let Some(client) = s.client.clone() {
+        let inner = inner.clone();
+        eng().spawn(async move {
+            ensure_call_identity(&inner, &client).await;
+            // Pin the rosters this device needs to *screen* an incoming call, and rebuild
+            // the index from them (E-1).
+            //
+            // `refresh_call_screen` above rebuilds the index faithfully — from rosters that
+            // a receive-only device never had, because a roster was pinned by exactly one
+            // call site and that site is reached only when this device *places* a call. So
+            // the index stayed empty, every capsule was refused as unplaceable, and the
+            // locked ring had nothing behind it. Confirmed on a device 2026-07-31: a single
+            // outgoing call was the whole difference between a dead notification and a real,
+            // answerable ring. This is the path a device that only receives calls runs.
+            warm_call_screen(&inner, &client).await;
+            // Anything the call-control mailbox collected while this device was locked
+            // (or down) converges with call state now, before it can ring stale.
+            drain_call_capsules(&inner, &client).await;
+        });
+    }
+    // An answer this device accepted while locked: now that the vault is open, finish it
+    // — but only for that exact call, and only if it is still live.
+    if s.pending_unlock.is_some() {
+        let inner = inner.clone();
+        eng().spawn(async move {
+            resume_pending_unlock(&inner).await;
         });
     }
     // A primary-transfer offer (or a half-finished accept) survived the restart —
@@ -323,7 +361,7 @@ pub(crate) async fn install_unlocked_account(
     // superseded: the subscriber/drain this unlock starts produces the real, leveled
     // notifications. A generic ring left ringing past this point reads as a second
     // incoming call (§7.4).
-    notifier::clear_generics();
+    eng().clear_generics();
     Ok(id)
 }
 
@@ -342,9 +380,26 @@ pub async fn unlock(state: tauri::State<'_, AppState>, password: String) -> Resu
 /// disk; the relay config stays configured.
 #[tauri::command]
 pub async fn lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // The connection state is `do_lock`'s to set: it is the only place that knows whether
+    // the process hold was kept for a wake transport (E-2), and overriding it here with a
+    // blanket `Off` is what made "locked" and "unreachable" the same thing.
     do_lock(&state.inner).await;
-    eng().set_conn_state(notifier::ConnState::Off);
     Ok(())
+}
+
+/// Must the foreground process hold survive a lock? (E-2, `internal/CALL_PLAN.md` §9)
+///
+/// A locked vault has no session and no socket, so the hold buys nothing *for messages*.
+/// It buys the one thing that still matters: a process an incoming-call wake can reach.
+/// Dropping it unconditionally is what turned "locked" into "unreachable" — the caller
+/// rang out while the phone produced no ring, no notification and no missed call.
+///
+/// `push_endpoint` is the honest condition rather than the mode string alone. Mode `c`
+/// unregisters its endpoint, so a locked `c` device really cannot be reached until the user
+/// unlocks, and holding a foreground service (and its persistent notification) open to
+/// imply otherwise is exactly the dishonesty §4.5 forbids. Mode `p` never holds one.
+pub(crate) fn keep_hold_while_locked(prefs: &Prefs) -> bool {
+    prefs.delivery_mode != "p" && prefs.push_endpoint.is_some()
 }
 
 /// The lock itself — shared by the command and the engine's background auto-lock
@@ -357,18 +412,117 @@ pub(crate) async fn do_lock(inner: &Arc<Mutex<Session>>) {
     // Locking mid-call hangs up: the session keys leave memory, so must the call's.
     if let Some(call) = s.call.take() {
         let _ = call.stop.send(true);
+        eng().end_system_call(&call.ring_handle, telecom::cause::LOCAL);
     }
-    s.incoming = None;
-    s.reconnect = None;
+    if let Some(offer) = s.incoming.take() {
+        eng().cancel_ring(&offer.ring_handle, "");
+    }
+    if let Some(pending) = s.claiming.take() {
+        eng().end_system_call(&pending.offer.ring_handle, telecom::cause::LOCAL);
+    }
+    if let Some(rc) = s.reconnect.take() {
+        eng().end_system_call(&rc.ring_handle, telecom::cause::LOCAL);
+    }
+    // The capsule layer's view goes with it: pending rings belong to calls that just
+    // ended, and cached peer call keys are re-warmed at the next call. The sealed store
+    // stays on disk — its tombstones are what stop a late offer ringing after a restart.
+    // A call start that was mid-flight is over: its claim buffer names ids that will never
+    // have an `s.call` now (E-6).
+    s.outgoing_setup = None;
+    s.call_store.rings.clear();
+    s.mark_calls_dirty();
+    save_call_store(&mut s);
+    s.call_bindings.clear();
     if let Some(gc) = s.group_call.take() {
         let _ = gc.stop.send(true);
+        eng().end_system_call(&gc.ring_handle, telecom::cause::LOCAL);
     }
-    s.group_incoming = None;
+    if let Some(offer) = s.group_incoming.take() {
+        eng().cancel_ring(&offer.ring_handle, "");
+    }
+    if let Some(pending) = s.group_claiming.take() {
+        eng().end_system_call(&pending.offer.ring_handle, telecom::cause::LOCAL);
+    }
     if let Some(stop) = s.stop.take() {
         let _ = stop.send(true); // the live-delivery task exits promptly
     }
-    // No session, no delivery: let Android freeze/kill the process again. The push
-    // registration (if any) deliberately stays — locked-state wakes surface honest
-    // generics instead of silent loss (docs/NOTIFICATIONS.md §7.4).
-    delivery_service::set_background_delivery(false);
+    // E-2. Closing the vault closes the *session*. It must not also close this device's
+    // ability to **receive a wake** (`internal/CALL_PLAN.md` §9).
+    //
+    // This used to drop the foreground service unconditionally, on the reasoning that a
+    // locked app has nothing to deliver — and the push registration was deliberately left
+    // in place so a wake could still arrive and surface an honest generic. On a real
+    // device it did not: with no session, no socket and now no foreground component,
+    // Android reclaimed the process, and an incoming call produced nothing at all. No
+    // ring, no notification, no missed call, while the caller rang out believing the phone
+    // was ringing. That is a worse failure than any degraded ring.
+    //
+    // So the hold survives the lock wherever a wake is the transport. `push_endpoint` is
+    // the exact condition: mode `c` unregisters it, so this is false there and the service
+    // still stops — with no socket and no push, a locked `c` device genuinely cannot be
+    // reached until the user unlocks, and claiming otherwise with a persistent
+    // notification would be the dishonesty §4.5 forbids.
+    if keep_hold_while_locked(&s.prefs) {
+        eng().set_conn_state(notifier::ConnState::LockedWakeable);
+    } else {
+        delivery_service::set_background_delivery(false);
+        eng().set_conn_state(notifier::ConnState::Off);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E-2: locking the vault must not make the device unreachable.
+    ///
+    /// `do_lock` used to stop the foreground service unconditionally, and the comment said
+    /// why — no session, no delivery, let Android reclaim the process — with the push
+    /// registration deliberately left in place so a wake could still arrive. On a real
+    /// device it did not. With no session, no socket and no foreground component, the
+    /// process was reclaimed and an incoming call produced *nothing*: no ring, no
+    /// notification, no missed call, while the caller rang out believing the phone rang.
+    ///
+    /// Measured 2026-07-31: the relay recorded the offer and the capsule for both callee
+    /// devices, and the phone's logcat over the whole window contained zero Sona lines.
+    #[test]
+    fn locking_keeps_the_process_hold_exactly_when_a_wake_can_reach_it() {
+        let wakeable = Prefs {
+            delivery_mode: "cp".into(),
+            push_endpoint: Some("fcm:token".into()),
+            ..Prefs::default()
+        };
+        assert!(
+            keep_hold_while_locked(&wakeable),
+            "connection+push with a registered endpoint: the wake is the transport, and it \
+             needs a process to reach"
+        );
+
+        // Mode `c` unregisters its endpoint. A locked `c` device genuinely cannot be
+        // reached until the user unlocks, and holding a foreground service open to imply
+        // otherwise would be the dishonesty §4.5 forbids.
+        let connection_only = Prefs {
+            delivery_mode: "c".into(),
+            push_endpoint: None,
+            ..Prefs::default()
+        };
+        assert!(!keep_hold_while_locked(&connection_only));
+
+        // Mode `p` never holds a persistent service in the first place.
+        let push_only = Prefs {
+            delivery_mode: "p".into(),
+            push_endpoint: Some("fcm:token".into()),
+            ..Prefs::default()
+        };
+        assert!(!keep_hold_while_locked(&push_only));
+
+        // The registration is what makes the hold worth keeping — a mode that *wants* push
+        // but has no endpoint yet has nothing to be woken through.
+        let no_endpoint_yet = Prefs {
+            delivery_mode: "cp".into(),
+            push_endpoint: None,
+            ..Prefs::default()
+        };
+        assert!(!keep_hold_while_locked(&no_endpoint_yet));
+    }
 }

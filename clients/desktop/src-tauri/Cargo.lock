@@ -5299,6 +5299,7 @@ dependencies = [
  "nokhwa",
  "notify-rust",
  "png 0.17.16",
+ "pulseaudio",
  "serde",
  "serde_json",
  "sha2 0.10.9",

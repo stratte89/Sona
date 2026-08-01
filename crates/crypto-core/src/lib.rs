@@ -8,6 +8,7 @@
 //! Phase 2 will add the Double Ratchet (libsignal) and the Key Transparency client
 //! inside this same crate.
 
+pub mod callkey;
 pub mod kt;
 pub mod localbox;
 pub mod quick;
@@ -19,6 +20,7 @@ use rand::RngCore;
 use ratchet::{RatchetEngine, RatchetError};
 use vault::VaultPayload;
 
+pub use callkey::{CallKey, CallKeyError};
 pub use vault::{VaultError, DEVICE_KEY_LEN};
 
 /// Result of checking a vault password against policy.

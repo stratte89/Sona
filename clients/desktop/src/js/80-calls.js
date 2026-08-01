@@ -7,8 +7,10 @@ const callUi = {
   // media v2 state
   videoReady: false, cameraOn: false, screenOn: false, screenAudioOn: false,
   screenAudioAvail: false, peerCam: false, peerScr: false, channel: null,
-  // Whether the backend ended up on a hardware H.264 encoder (desktop diagnostics).
-  hwEncode: false,
+  // Desktop diagnostics from the backend: where video encoding ended up
+  // ('hardware' | 'software' | 'idle'), why if it declined, and which media transport
+  // the call negotiated ('quic' | 'ws').
+  videoEncode: 'idle', videoEncodeWhy: null, transport: null,
   // user hung up while setup was still in flight → kill the call when it lands
   cancelled: false,
   // group call: same overlay, voice-only; `peers` = usernames with audio flowing
@@ -122,101 +124,9 @@ function stopIncomingRing() {
   inRingNodes = null;
 }
 
-// ── WebGL I420 painter ────────────────────────────────────────────────────────────
-// Decoded peer frames arrive as raw I420 planes over a Tauri IPC channel; a tiny
-// fragment shader does YUV→RGB on the GPU so even 1080p screen shares paint cheaply.
-class YuvCanvas {
-  constructor(canvas) {
-    this.canvas = canvas;
-    const gl = canvas.getContext('webgl', { preserveDrawingBuffer: false });
-    this.gl = gl;
-    if (!gl) return; // painted never; tile stays black (webgl unavailable)
-    const vs = 'attribute vec2 p;varying vec2 t;void main(){t=vec2((p.x+1.)/2.,(1.-p.y)/2.);gl_Position=vec4(p,0.,1.);}';
-    const fs = 'precision mediump float;varying vec2 t;uniform sampler2D y,u,v;' +
-      'void main(){float Y=1.1643*(texture2D(y,t).r-0.0625);float U=texture2D(u,t).r-0.5;float V=texture2D(v,t).r-0.5;' +
-      'gl_FragColor=vec4(Y+1.5958*V,Y-0.39173*U-0.8129*V,Y+2.017*U,1.);}';
-    const sh = (type, src) => {
-      const h = gl.createShader(type);
-      gl.shaderSource(h, src); gl.compileShader(h);
-      return h;
-    };
-    const prog = gl.createProgram();
-    gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
-    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(prog); gl.useProgram(prog);
-    const quad = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, 'p');
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    this.tex = ['y', 'u', 'v'].map((n, i) => {
-      const t = gl.createTexture();
-      gl.activeTexture(gl.TEXTURE0 + i);
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      for (const [k, w] of [['TEXTURE_MIN_FILTER', 'LINEAR'], ['TEXTURE_MAG_FILTER', 'LINEAR'],
-        ['TEXTURE_WRAP_S', 'CLAMP_TO_EDGE'], ['TEXTURE_WRAP_T', 'CLAMP_TO_EDGE']]) {
-        gl.texParameteri(gl.TEXTURE_2D, gl[k], gl[w]);
-      }
-      gl.uniform1i(gl.getUniformLocation(prog, n), i);
-      return t;
-    });
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  }
-  paint(w, h, bytes) {
-    const gl = this.gl;
-    if (!gl) return;
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w; this.canvas.height = h;
-      gl.viewport(0, 0, w, h);
-    }
-    const ysz = w * h, csz = ysz >> 2, cw = w >> 1, ch = h >> 1;
-    const planes = [[w, h, bytes.subarray(0, ysz)], [cw, ch, bytes.subarray(ysz, ysz + csz)],
-      [cw, ch, bytes.subarray(ysz + csz, ysz + 2 * csz)]];
-    planes.forEach(([pw, ph, data], i) => {
-      gl.activeTexture(gl.TEXTURE0 + i);
-      gl.bindTexture(gl.TEXTURE_2D, this.tex[i]);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, pw, ph, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
-    });
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  }
-  // Forget the picture. Resizing the canvas is what actually does it — that drops the
-  // drawing buffer and reallocates it as transparent black — and it hands a 1080p
-  // share's worth of GPU memory back at the same time. `paint` resizes again on the
-  // next frame, so nothing else has to know this happened.
-  clear() {
-    if (!this.gl) return;
-    this.canvas.width = 1;
-    this.canvas.height = 1;
-    this.gl.viewport(0, 0, 1, 1);
-  }
-}
-const yuvTiles = {}; // track id → YuvCanvas (1 = peer camera, 2 = peer screen, 101/102 = self)
-
-function tileFor(track) {
-  const el = { 1: $('#cv-camera'), 2: $('#cv-screen'), 101: $('#cv-self-cam'), 102: $('#cv-self-scr') }[track];
-  if (!yuvTiles[track]) yuvTiles[track] = new YuvCanvas(el);
-  return { el, painter: yuvTiles[track] };
-}
-
-// Wipe every tile. Hiding one is not enough: a hidden canvas keeps the last frame it
-// was given, so the next thing to reveal it shows the *previous* call's picture — which
-// is how the peer's shared screen ended up behind the ringing state of the call after
-// it. It is also somebody's screen sitting in GPU memory long after they stopped
-// sharing it, which is not ours to keep.
-function clearTiles() {
-  Object.values(yuvTiles).forEach((t) => t.clear());
-}
-
 // One frame from the backend: track(1) || w(2 BE) || h(2 BE) || I420. w=h=0 → off.
 // Tracks 1/2 are the peer; 101/102 are the local self-view preview.
 function onMediaFrame(msg) {
-  // Only a connected call has media. Anything arriving outside one is a straggler from
-  // the call that just ended: the frame channel is process-wide and outlives any single
-  // call, and a frame already queued on it can be delivered after the end-of-call event
-  // has been handled. Painting it would re-show the video stage over the avatar card,
-  // and it would stay that way until the next call tore it down.
-  if (callUi.mode !== 'connected') return;
   let bytes;
   if (msg instanceof ArrayBuffer) bytes = new Uint8Array(msg);
   else if (ArrayBuffer.isView(msg)) bytes = new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
@@ -224,20 +134,53 @@ function onMediaFrame(msg) {
   if (bytes.length < 5) return;
   const track = bytes[0];
   const w = (bytes[1] << 8) | bytes[2], h = (bytes[3] << 8) | bytes[4];
+
+  // Self-view frames are throttled and shrunk at the source and reserve nothing, so they
+  // must never be acknowledged — an ack the backend did not hand out a slot for would
+  // release somebody else's, and the flow control would let a backlog through after all.
   if (track === 101 || track === 102) {
     if (!w || !h || bytes.length < 5 + (w * h * 3) / 2) return;
+    if (callUi.mode !== 'connected') return;
     const wrap = track === 101 ? $('#self-cam') : $('#self-scr');
     wrap.querySelector('.self-note').hidden = true; // first frame — capture is live
     tileFor(track).painter.paint(w, h, bytes.subarray(5));
     return;
   }
   if (track !== 1 && track !== 2) return;
+
+  // Peer frames: the backend is holding a slot for this one and sends no more until it
+  // hears back, so every path out of here from this point acknowledges — including the
+  // ones that discard the frame. A missed ack costs a stall until it times out.
+  const ack = () => { invoke('call_frame_ack', { track }).catch(() => {}); };
+  // The track-off marker (w = h = 0) is NOT acknowledged: the backend sends it without
+  // reserving, precisely because it must never be dropped, so acking it would release a
+  // credit that a real frame is still holding and let the backlog through anyway.
+  if (!w || !h) { trackWentOff(track); return; }
+  // Frames that were already in flight when the track stopped must not resurrect the tile.
+  //
+  // The off marker is five bytes and a 1080p frame is three megabytes, and Tauri splits
+  // its channel at one kilobyte: small payloads are handed to the webview directly, large
+  // ones through an asynchronous fetch. Two delivery paths, two latencies, and the tiny
+  // marker overtakes the frames still crossing the big one. The tile hid and the next
+  // straggler unhid it, which is why a stopped share left its last frame on screen for the
+  // rest of the call. Ordering cannot be relied on here, so the off is treated as a fact
+  // about the track rather than a position in a queue.
+  if (offGuardActive(track)) { ack(); return; }
+  // Only a connected call has media. Anything arriving outside one is a straggler from
+  // the call that just ended: the frame channel is process-wide and outlives any single
+  // call, and a frame already queued on it can be delivered after the end-of-call event
+  // has been handled. Painting it would re-show the video stage over the avatar card,
+  // and it would stay that way until the next call tore it down.
+  if (callUi.mode !== 'connected') { ack(); return; }
   const { el, painter } = tileFor(track);
-  if (!w || !h) { el.hidden = true; updateVideoStage(); return; }
-  if (bytes.length < 5 + (w * h * 3) / 2) return;
+  if (bytes.length < 5 + (w * h * 3) / 2) { ack(); return; }
   el.hidden = false;
+  lastFrameAt[track] = Date.now();
   updateVideoStage();
   painter.paint(w, h, bytes.subarray(5));
+  // After the paint call, not before: the point of the acknowledgement is that the
+  // webview has done the work, and asking for the next frame first would defeat it.
+  ack();
 }
 
 // (Re)bind the frame channel — called when a call starts and after webview reloads.
@@ -251,17 +194,6 @@ async function bindMediaChannel() {
   } catch (e) { console.error('media channel bind failed:', e); }
 }
 
-// Show the video stage when any peer tile is live; drop back to the avatar card
-// when both are off.
-function updateVideoStage() {
-  const cam = !$('#cv-camera').hidden, scr = !$('#cv-screen').hidden;
-  $('#call-video').hidden = !(cam || scr);
-  $('#callui').classList.toggle('has-video', cam || scr);
-  $('#call-video').classList.toggle('both', cam && scr);
-  // The bubble shows the peer's video when there is one, the avatar otherwise.
-  $('#cm-avatar').hidden = cam || scr;
-}
-
 function setCallButtons() {
   const inCall = callUi.mode === 'connected';
   const vid = inCall && callUi.videoReady;
@@ -270,6 +202,18 @@ function setCallButtons() {
   $('#call-cam').innerHTML = icon(callUi.cameraOn ? 'cam' : 'camoff');
   $('#call-cam').classList.toggle('on', callUi.cameraOn);
   $('#call-share').classList.toggle('on', callUi.screenOn);
+  // One screen at a time: while the peer is sharing, ours is not on offer. Greyed with
+  // a reason rather than hidden — a button that vanishes reads as a bug, and the backend
+  // refuses this case anyway (see `call_set_screen`), so the disable is there to explain
+  // the rule rather than to enforce it. Cameras are unaffected; several at once is fine.
+  const blocked = callUi.peerScr && !callUi.screenOn;
+  $('#call-share').disabled = blocked;
+  $('#call-share').setAttribute('aria-disabled', blocked ? 'true' : 'false');
+  $('#call-share').title = blocked
+    ? `${callUi.username || 'The other person'} is sharing — only one screen at a time`
+    : 'Share your screen';
+  // The per-person voice menu only exists where there is one person to point at.
+  if (typeof syncCallMenus === 'function') syncCallMenus();
 }
 
 // Self-view PiP: visible whenever *we* are sending video. The per-tile spinner note
@@ -307,6 +251,9 @@ function placePip(animate) {
   const el = $('#call-self');
   el.addEventListener('pointerdown', (e) => {
     if (el.hidden) return;
+    // Fullscreen is not a picture-in-picture tile any more; dragging it would fling a
+    // full-window canvas across the screen and leave a transform behind on exit.
+    if (el.classList.contains('selffull')) return;
     const r = el.getBoundingClientRect();
     pip.drag = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top };
     el.setPointerCapture(e.pointerId);
@@ -353,7 +300,7 @@ function paintCallId() {
   const name = callUi.username || '—';
   $('#call-topname').textContent = name;
   $('#call-barname').textContent = name;
-  for (const id of ['#call-avatar', '#cm-avatar']) {
+  for (const id of ['#call-avatar', '#cm-avatar', '#call-baravatar']) {
     const av = $(id);
     av.textContent = initial(name);
     av.style.setProperty('--av-h', hue(name));
@@ -428,6 +375,15 @@ function showCall(mode, username) {
   if (mode === 'connected' && !callUi.timer) {
     callUi.startedAt = Date.now();
     callUi.timer = setInterval(() => {
+      // A tile whose frames stopped arriving is a tile that should not still be up.
+      //
+      // Belt and braces on purpose. A track going off is announced twice — a `peer_track`
+      // event and a zero-sized frame — and this call has now twice ended with a stopped
+      // share still showing its last picture on the far side, which means one or both of
+      // those announcements does not always arrive. Rather than keep guessing which, the
+      // absence of frames is treated as its own evidence: video that has stopped for this
+      // long has stopped, whatever the control path said or failed to say.
+      reapStaleTiles();
       if (callUi.reconnecting) return; // status line shows "reconnecting…"
       const t = mss(Math.floor((Date.now() - callUi.startedAt) / 1000));
       paintCallState(callUi.group ? `${t} · ${callUi.peers.size + 1} in call` : t);
@@ -451,6 +407,9 @@ function hideCall() {
   $('#call-speaker').classList.remove('on');
   $('#call-speaker').innerHTML = icon('vol');
   $('#call-settings').hidden = true;
+  // Fullscreen and the stream menus are per-call: a stage still covering the window
+  // after a hang-up would leave the app looking wedged.
+  if (typeof resetCallMenus === 'function') resetCallMenus();
   closeSharePick(); // the call ended while the picker was up
   callUi.videoReady = false; callUi.cameraOn = false; callUi.screenOn = false;
   callUi.screenAudioOn = false; callUi.peerCam = false; callUi.peerScr = false;
@@ -501,22 +460,11 @@ async function acceptIncoming() {
 }
 $('#call-accept').onclick = acceptIncoming;
 
-// Answer tapped on the OS ring notification. The tap and the incoming-call state can
-// arrive in either order (warm app vs. cold/locked start), so the tap arms a flag and
-// every place that lands in 'incoming' redeems it. 60 s window ≈ ring timeout plus
-// unlock time; after that a stale tap must not answer a later, unrelated call.
-let pendingAnswerAt = 0;
-function armAutoAnswer() {
-  pendingAnswerAt = Date.now();
-  maybeAutoAnswer();
-}
-function maybeAutoAnswer() {
-  if (!pendingAnswerAt) return;
-  if (Date.now() - pendingAnswerAt > 60_000) { pendingAnswerAt = 0; return; }
-  if (callUi.mode !== 'incoming') return;
-  pendingAnswerAt = 0;
-  acceptIncoming();
-}
+// Answer tapped on the OS ring notification is NOT handled here any more: it goes
+// straight to the engine, which owns the one answer path (the same one Core-Telecom, a
+// headset, and a watch use) and holds the answer for the exact call while the vault is
+// opened. The old flag here answered whatever rang inside a 60-second window — including
+// a later, unrelated call.
 $('#call-hangup').onclick = async () => {
   if (callUi.mode === 'incoming') {
     try { await invoke(callUi.group ? 'group_call_decline' : 'call_decline'); } catch (_) {}
@@ -609,14 +557,25 @@ $('#call-gear').onclick = async () => {
     $('#cset-shareaudio-hint').hidden = !callUi.screenAudioAvail;
     $('#cset-devices').hidden = IS_ANDROID || !audioDev.supported;
     if (!IS_ANDROID) refreshAudioDevices();
-    // Whether video is going through the GPU. Shown only while it matters (a call with
-    // video negotiated), and worded so that "software" reads as information, not fault:
-    // on a machine without a usable hardware encoder it is the correct outcome.
+    // Where video encoding ended up, and on which transport. Shown only while it matters
+    // (a call with video negotiated). 'idle' is its own answer, not a synonym for
+    // software: nothing opens an encoder until this machine actually has a frame to send,
+    // so a call where only the peer is sharing has not decided anything yet. Saying
+    // "software" there was wrong, and it masked a real hardware failure on the other end.
+    // The reason line is only worth showing when a backend declined and said why.
     const hw = $('#cset-hw');
     hw.hidden = !callUi.videoReady;
-    hw.textContent = callUi.hwEncode
-      ? 'Video encoding: hardware (GPU)'
-      : 'Video encoding: software';
+    const enc = {
+      hardware: 'hardware (GPU)',
+      software: 'software (CPU)',
+      idle: 'not encoding yet',
+    }[callUi.videoEncode] || 'software (CPU)';
+    const via = callUi.transport === 'quic' ? 'QUIC'
+      : callUi.transport === 'ws' ? 'WebSocket (fallback)' : null;
+    hw.textContent = `Video encoding: ${enc}`
+      + (via ? ` · media over ${via}` : '')
+      + (callUi.videoEncode === 'software' && callUi.videoEncodeWhy
+        ? ` — ${callUi.videoEncodeWhy}` : '');
   }
 };
 // Tap outside the card closes the modal.
@@ -699,7 +658,6 @@ function onGroupCallEvent(ev) {
       callUi.group = true;
       showCall('incoming', p.name || 'Group');
       paintCallState(`incoming group call · ${escapeHtml(p.from || '')}`);
-      maybeAutoAnswer();
       break;
     case 'outgoing':
       callUi.group = true;
@@ -714,10 +672,11 @@ function onGroupCallEvent(ev) {
       if (p.username) callUi.peers.delete(p.username);
       if (p.kind === 'peer_declined' && callUi.mode) toast(`${p.username || 'Someone'} declined`);
       break;
+    case 'claiming':
     case 'accepted': if (callUi.mode === 'incoming') showCall('connecting'); break;
     case 'no_answer': toast('No one answered'); hideCall(); break;
     case 'missed': if (callUi.mode === 'incoming') { toast('Missed group call'); hideCall(); } break;
-    case 'handled': if (callUi.mode === 'incoming') { toast('Answered on another device'); hideCall(); } break;
+    case 'handled': if (handledClosesUi()) { toast(handledText(p)); hideCall(); } break;
     case 'ended': if (callUi.group) { toast('Call ended'); hideCall(); } break;
   }
 }
@@ -730,7 +689,7 @@ function onCallEvent(ev) {
     return;
   }
   switch (p.kind) {
-    case 'incoming': showCall('incoming', p.username); maybeAutoAnswer(); break;
+    case 'incoming': showCall('incoming', p.username); break;
     case 'outgoing': showCall('outgoing', p.username); bindMediaChannel(); break;
     case 'connected':
       callUi.reconnecting = false;
@@ -745,18 +704,31 @@ function onCallEvent(ev) {
       paintCallState('<span class="spinner-sm"></span> reconnecting…');
       break;
     case 'video_ready': callUi.videoReady = !!p.ready; refreshScreenAudioAvail(); break;
-    case 'peer_track':
+    case 'peer_track': {
       if (p.track === 'camera') callUi.peerCam = !!p.on;
       if (p.track === 'screen') callUi.peerScr = !!p.on;
-      // Tiles hide on the explicit off marker from the frame channel; nothing else here.
+      // This is the other announcement of the same fact as the frame channel's zero-sized
+      // marker, on a different transport, with no ordering between them — so whichever
+      // lands first does the work and the other is a no-op.
+      const id = p.track === 'camera' ? 1 : p.track === 'screen' ? 2 : 0;
+      if (id) {
+        if (p.on) trackCameOn(id);
+        else trackWentOff(id);
+      }
+      // The share button's enabled state follows the peer's screen track.
+      if (p.track === 'screen') setCallButtons();
       break;
+    }
     // Answered via the headset button while the incoming overlay was up.
+    case 'claiming':
     case 'accepted': if (callUi.mode === 'incoming') showCall('connecting'); break;
     case 'declined': toast('Call declined'); hideCall(); break;
     case 'no_answer': toast('No answer'); hideCall(); break;
     case 'missed': if (callUi.mode === 'incoming') { toast('Missed call'); hideCall(); } break;
-    // Another of this account's devices took (or declined) the ring.
-    case 'handled': if (callUi.mode === 'incoming') { toast('Answered on another device'); hideCall(); } break;
+    // Another of this account's devices, or the caller, ended the ring — say which.
+    case 'handled': if (handledClosesUi()) { toast(handledText(p)); hideCall(); } break;
+    // An answer is held over the keyguard and the OS can check nobody: ask for Sona's own.
+    case 'unlock_credential': promptAnswerCredential(); break;
     case 'ended': toast('Call ended'); hideCall(); break;
   }
 }
@@ -771,7 +743,9 @@ async function resyncCall() {
       callUi.screenOn = !!st.active.screen_on;
       callUi.screenAudioOn = !!st.active.screen_audio_on;
       callUi.screenAudioAvail = !!st.active.screen_audio_available;
-      callUi.hwEncode = !!st.active.hw_encode;
+      callUi.videoEncode = st.active.video_encode || 'idle';
+      callUi.videoEncodeWhy = st.active.video_encode_why || null;
+      callUi.transport = st.active.transport || null;
       callUi.peerCam = !!st.active.peer_camera;
       callUi.peerScr = !!st.active.peer_screen;
       showCall(st.active.connected ? 'connected' : 'outgoing', st.active.username);
@@ -780,7 +754,8 @@ async function resyncCall() {
       bindMediaChannel(); // frames resume painting after a reload
     } else if (st.incoming) {
       showCall('incoming', st.incoming.username);
-      maybeAutoAnswer();
+    } else if (st.claiming) {
+      showCall('connecting', st.claiming.username);
     } else if (st.reconnecting) {
       callUi.reconnecting = true;
       showCall('connecting', st.reconnecting.username);
@@ -794,8 +769,15 @@ async function resyncCall() {
       callUi.group = true;
       showCall('incoming', st.group_incoming.name);
       paintCallState(`incoming group call · ${escapeHtml(st.group_incoming.from || '')}`);
-      maybeAutoAnswer();
+    } else if (st.group_claiming) {
+      callUi.group = true;
+      showCall('connecting', st.group_claiming.name);
     }
+    // Answered over the keyguard, and the backend is waiting on a human check it could not
+    // get from the OS. This flow *starts* the webview, so the event that asks for it is
+    // usually sent before anything is listening — reading it here is what makes the request
+    // survive a cold start.
+    if (st.unlock_credential) promptAnswerCredential();
   } catch (_) {}
 }
 
@@ -804,7 +786,15 @@ async function refreshScreenAudioAvail() {
   try {
     const st = await invoke('call_status');
     callUi.screenAudioAvail = !!(st.active && st.active.screen_audio_available);
-    callUi.hwEncode = !!(st.active && st.active.hw_encode);
+    // Re-read who is sharing from the backend, which holds the authoritative flag: the
+    // `peer_track` event that normally maintains it can be missed, and the consequence of
+    // a stale copy is an enabled share button the backend then refuses — a dead-feeling
+    // button with an error toast instead of a greyed-out one that explains itself.
+    callUi.peerScr = !!(st.active && st.active.peer_screen);
+    callUi.peerCam = !!(st.active && st.active.peer_camera);
+    callUi.videoEncode = (st.active && st.active.video_encode) || 'idle';
+    callUi.videoEncodeWhy = (st.active && st.active.video_encode_why) || null;
+    callUi.transport = (st.active && st.active.transport) || null;
   } catch (_) {}
   setCallButtons();
 }
@@ -881,4 +871,3 @@ window.addEventListener('focus', () => {
     setInterval(onSync, 1500);
   }
 })();
-

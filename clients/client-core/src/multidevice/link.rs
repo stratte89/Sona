@@ -19,101 +19,9 @@ impl Client {
         history: &mut History,
         username: &str,
     ) -> Result<ResolvedDevices> {
-        let hash = IdentityHash::from_identifier(username).as_str().to_string();
-        let entry = self.fetch_verified_entry(&hash).await?;
-        let primary_key = entry.identity_key.clone();
-
-        let resp = self
-            .http
-            .get(format!("{}/v1/kt/roster/{hash}", self.base_url))
-            .send()
-            .await?;
-
-        if resp.status().as_u16() == 404 {
-            if let Some(pinned) = history.pinned_roster(username) {
-                // Ownership moved: the (verified) binding advanced past our pin to a new
-                // key — a released name taken over by an owner who has not published a
-                // roster yet. The old owner's pin no longer applies.
-                if pinned.primary_key != primary_key && entry.seq > pinned.binding_seq {
-                    history.clear_pinned_roster(username);
-                } else {
-                    // Same owner: an append-only roster is never deleted; a 404 after we
-                    // pinned one is a downgrade attempt.
-                    return Err(RosterRollback {
-                        username: username.to_string(),
-                        pinned_seq: pinned.seq,
-                        served_seq: 0,
-                    }
-                    .into());
-                }
-            }
-            return Ok(ResolvedDevices {
-                primary_key: primary_key.clone(),
-                roster_seq: None,
-                devices: vec![RosterDevice {
-                    device_id: PRIMARY_DEVICE_ID.to_string(),
-                    identity_key: primary_key,
-                }],
-            });
-        }
-
-        let v: Value = resp.error_for_status()?.json().await?;
-        let roster: KtRosterEntry = serde_json::from_value(v["roster"].clone())
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let sth: SignedTreeHead = serde_json::from_value(v["sth"].clone())
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let index = v["index"]
-            .as_u64()
-            .ok_or_else(|| ClientError::Protocol("missing index".into()))?;
-        let proof_b64 = v["proof_b64"]
-            .as_str()
-            .ok_or_else(|| ClientError::Protocol("missing proof".into()))?;
-
-        if !verify_sth_b64(&self.pinned_kt_key, &sth) {
-            return Err(ClientError::KtVerification(
-                crypto_core::kt::KtCheck::BadTreeHead,
-            ));
-        }
-        if !verify_roster_inclusion_b64(&sth, &roster, index, proof_b64) {
-            return Err(ClientError::KtVerification(
-                crypto_core::kt::KtCheck::NotInLog,
-            ));
-        }
-        // Semantic validation against the current binding. A failure here is a *stale*
-        // roster (e.g. pre-rotation) — fall back to single-device on the current key,
-        // rather than trusting a list that doesn't match the account's live keys.
-        if roster.validate_against(&entry).is_err() {
-            return Ok(ResolvedDevices {
-                primary_key: primary_key.clone(),
-                roster_seq: None,
-                devices: vec![RosterDevice {
-                    device_id: PRIMARY_DEVICE_ID.to_string(),
-                    identity_key: primary_key,
-                }],
-            });
-        }
-
-        let devices: Vec<RosterDevice> = roster
-            .devices
-            .iter()
-            .map(|d| RosterDevice {
-                device_id: d.device_id.clone(),
-                identity_key: d.identity_key.clone(),
-            })
-            .collect();
-        // Anti-rollback pin (fail-closed on a lower epoch or a rolled-back binding).
-        history.pin_roster(
-            username,
-            entry.seq,
-            roster.seq,
-            &primary_key,
-            devices.clone(),
-        )?;
-        Ok(ResolvedDevices {
-            primary_key,
-            roster_seq: Some(roster.seq),
-            devices,
-        })
+        let (resolved, update) = self.fetch_account_devices(username).await?;
+        history.apply_roster_update(username, &update)?;
+        Ok(resolved)
     }
     /// Prepare a delivery/read receipt addressed to the DEVICE that actually sent us the
     /// message, instead of to the account mailbox.
@@ -218,6 +126,22 @@ impl Client {
         if account.ratchet_ref().has_session(expected_key) {
             return Ok(());
         }
+        let bundle = self.fetch_device_bundle(mailbox_hash, expected_key).await?;
+        account
+            .ratchet()
+            .establish_outbound(&bundle)
+            .map_err(|e| ClientError::Crypto(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The network half of [`ensure_device_session`](Self::ensure_device_session): fetch
+    /// one device's bundle and refuse it unless it carries the (roster-verified)
+    /// `expected_key`. Touches no local state.
+    pub(crate) async fn fetch_device_bundle(
+        &self,
+        mailbox_hash: &str,
+        expected_key: &str,
+    ) -> Result<protocol_types::PreKeyBundle> {
         let bundle: protocol_types::PreKeyBundle = self
             .http
             .get(format!("{}/v1/bundle/{mailbox_hash}", self.base_url))
@@ -231,18 +155,27 @@ impl Client {
                 crypto_core::kt::KtCheck::KeyMismatch,
             ));
         }
-        account
-            .ratchet()
-            .establish_outbound(&bundle)
-            .map_err(|e| ClientError::Crypto(e.to_string()))?;
-        Ok(())
+        Ok(bundle)
     }
     /// Post a batch of prepared envelopes (each a distinct mailbox — order-independent).
     pub async fn post_envelopes(&self, envelopes: &[Envelope]) -> Result<()> {
-        for env in envelopes {
-            self.post_envelope(env).await?;
+        for result in self.post_envelopes_concurrent(envelopes).await {
+            result?;
         }
         Ok(())
+    }
+
+    /// Post an already-prepared device fanout concurrently, with a fixed bound so one
+    /// slow mailbox cannot serialize every sibling ring. Results preserve input order
+    /// and every target is attempted even when another post fails.
+    pub async fn post_envelopes_concurrent(&self, envelopes: &[Envelope]) -> Vec<Result<()>> {
+        use futures_util::{stream, StreamExt};
+
+        stream::iter(envelopes.iter().cloned())
+            .map(|envelope| async move { self.post_envelope(&envelope).await })
+            .buffered(8)
+            .collect()
+            .await
     }
     /// A device's mailbox hash. Errors only on a malformed username.
     pub fn device_mailbox(&self, username: &str, device_id: &str) -> Result<String> {
@@ -478,6 +411,7 @@ impl Client {
             .map(|d| RosterDevice {
                 device_id: d.device_id.clone(),
                 identity_key: d.identity_key.clone(),
+                signing_key: d.signing_key.clone(),
             })
             .collect();
         // pin_roster is monotonic; our own publish never rolls back. The binding did

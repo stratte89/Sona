@@ -15,8 +15,14 @@ class SonaApp : Application() {
     @Volatile lateinit var instance: SonaApp
       private set
 
-    /// FirebaseApp.initializeApp succeeded (build config present + Play Services
-    /// answered). Gates the push-only delivery mode in the UI.
+    /// Google Play services is installed in THIS profile. On GrapheneOS that means
+    /// sandboxed Play was installed here (it is per-profile); everywhere de-Googled it
+    /// is false, and no Firebase class is ever loaded.
+    @Volatile var playInstalled: Boolean = false
+      private set
+
+    /// FirebaseApp.initializeApp succeeded (Play services present + build config).
+    /// Gates the push modes in the UI and the auto-resolved delivery default.
     @Volatile var firebaseReady: Boolean = false
       private set
   }
@@ -32,18 +38,51 @@ class SonaApp : Application() {
     nativeInitAppContext(applicationContext)
     NotificationBridge.createChannels(this)
     NetworkMonitor.register(this)
+    // SONA-TELECOM — register with Telecom before any component can ring: a call added
+    // by a headless wake must find the app already registered. Idempotent, and a refusal
+    // (no telecom service, permission missing) is reported rather than thrown.
+    TelecomBridge.register()
     initFirebase()
     // UnifiedPush distributors expect re-registration after boot/app update; it is an
     // idempotent upsert on their side and a no-op when none was ever chosen.
-    UnifiedPushMgr.reRegister(this)
+    //
+    // Wrapped, and every optional step below should be (E-15). An exception escaping
+    // `Application.onCreate` kills the process before a single component runs — no
+    // delivery, no ring, no notification — and this one really did: reading these
+    // preferences before the first unlock after a reboot throws rather than returning a
+    // default, so *anything* that started Sona in that window crash-looped it. A push
+    // re-registration is worth exactly nothing compared to the app existing.
+    try {
+      UnifiedPushMgr.reRegister(this)
+    } catch (t: Throwable) {
+      android.util.Log.e("SonaApp", "UnifiedPush re-registration skipped", t)
+    }
+  }
+
+  // Google Play services present in this profile? Package visibility for it is declared
+  // in the manifest <queries> (harden-android.sh 15c3) — without that this returns false
+  // on Android 11+ even where Play IS installed.
+  private fun playServicesInstalled(): Boolean = try {
+    packageManager.getPackageInfo("com.google.android.gms", 0)
+    true
+  } catch (_: Throwable) {
+    false
   }
 
   // Manual Firebase init — no google-services.json, no gradle plugin (reproducible
   // builds stay deterministic; see docs/REPRODUCIBLE_BUILDS.md). Values come from
-  // buildConfigFields injected by harden-android.sh; absent values → mode P (FCM) is
+  // buildConfigFields injected by harden-android.sh; absent values → the push modes are
   // simply unavailable and the settings UI explains why.
+  //
+  // Gated on Play services actually being installed (internal/CALL_PLAN.md §10.1: no FCM class
+  // may be loaded unconditionally when Play is absent). It is not only hygiene —
+  // FirebaseApp.initializeApp SUCCEEDS on a de-Googled phone, and only the token fetch
+  // later fails, so initializing unconditionally made `firebaseReady` claim a wake
+  // transport GrapheneOS does not have. The delivery default is resolved from that flag.
   private fun initFirebase() {
     try {
+      playInstalled = playServicesInstalled()
+      if (!playInstalled) return
       if (BuildConfig.FCM_PROJECT.isEmpty() || BuildConfig.FCM_APP_ID.isEmpty()) return
       val options = com.google.firebase.FirebaseOptions.Builder()
         .setProjectId(BuildConfig.FCM_PROJECT)
@@ -54,8 +93,8 @@ class SonaApp : Application() {
       com.google.firebase.FirebaseApp.initializeApp(this, options)
       firebaseReady = true
     } catch (_: Throwable) {
-      // Missing Play Services (Graphene etc.) or bad config: push-only mode stays
-      // gated off; connection mode is unaffected.
+      // Missing Play Services (Graphene etc.) or bad config: the push modes stay gated
+      // off and the delivery default resolves to the connection; delivery is unaffected.
       firebaseReady = false
     }
   }

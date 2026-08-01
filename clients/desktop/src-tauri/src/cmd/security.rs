@@ -50,7 +50,7 @@ pub(crate) async fn auto_reset_if_dead(
                 .record_system(peer, "Secure session reset automatically", now_secs());
             let _ = s.persist();
         }
-        Err(e) => eprintln!("client: auto session reset failed: {e}"),
+        Err(e) => crate::diag!("client: auto session reset failed: {e}"),
     }
 }
 
@@ -645,16 +645,26 @@ fn wipe_local_account(s: &mut Session) {
     let _ = std::fs::remove_file(s.quick_pin_path());
     let _ = std::fs::remove_file(s.quick_auto_path());
     let _ = std::fs::remove_file(s.quick_bio_path());
+    // The call-control identity is not in the vault, so it needs its own erasure.
+    wipe_call_identity(s);
     s.prefs = Prefs::default();
     let _ = s.save_prefs();
     // `Account` zeroizes its secrets on drop.
     s.account = None;
     s.history = History::new();
+    // Every presentation handle this account handed the platform comes back: an account
+    // that no longer exists must not leave a system call the user cannot end.
+    for ring_handle in eng().system_calls() {
+        eng().end_system_call(&ring_handle, telecom::cause::LOCAL);
+    }
     s.call = None;
     s.incoming = None;
+    s.claiming = None;
     s.reconnect = None;
+    s.call_bindings.clear();
     s.group_call = None;
     s.group_incoming = None;
+    s.group_claiming = None;
     s.pending_link = None;
     s.last_presence_ok = None;
 }
@@ -809,17 +819,23 @@ pub async fn privacy_prefs(state: tauri::State<'_, AppState>) -> Result<PrivacyV
         send_typing: s.prefs.send_typing,
         send_receipts: s.prefs.send_receipts,
         notif_level: s.prefs.notif_level.clone(),
+        call_retention_secs: call_retention_secs(&s),
+        require_unlock_to_answer: s.prefs.require_unlock_to_answer,
     })
 }
 
 /// Update a Privacy setting. Any argument left `None` is unchanged. `notif_level` accepts
-/// `"sender_message"` | `"sender"` | `"generic"`.
+/// `"sender_message"` | `"sender"` | `"generic"`; `call_retention_secs` accepts one of
+/// [`CALL_RETENTION_CHOICES`] and takes effect immediately — shortening it cleans the
+/// call-control store now rather than at the next call.
 #[tauri::command]
 pub async fn set_privacy(
     state: tauri::State<'_, AppState>,
     send_typing: Option<bool>,
     send_receipts: Option<bool>,
     notif_level: Option<String>,
+    call_retention_secs: Option<u64>,
+    require_unlock_to_answer: Option<bool>,
 ) -> Result<(), String> {
     let mut s = state.inner.lock().await;
     if let Some(v) = send_typing {
@@ -831,6 +847,31 @@ pub async fn set_privacy(
     if let Some(v) = notif_level {
         if matches!(v.as_str(), "sender_message" | "sender" | "generic") {
             s.prefs.notif_level = v;
+        }
+    }
+    if let Some(v) = require_unlock_to_answer {
+        // §8: changing it at all needs an open vault. It decides who may answer this
+        // device's calls, and a setting the locked call subsystem could reach would be a
+        // way around the very boundary that subsystem is scoped by.
+        if s.account.is_none() {
+            return Err("unlock first".into());
+        }
+        // Turning it OFF weakens who may answer this device's calls, so it costs an OS
+        // presence check — the same gate the account ceremonies use. Turning it ON only
+        // ever adds a requirement, so it is free.
+        if !v && s.prefs.require_unlock_to_answer {
+            let recent = matches!(s.last_presence_ok, Some(t)
+                if t.elapsed().as_secs() < PRESENCE_WINDOW_SECS);
+            if cfg!(target_os = "android") && !recent {
+                return Err("verify it's you first — then turn this off".into());
+            }
+        }
+        s.prefs.require_unlock_to_answer = v;
+    }
+    if let Some(v) = call_retention_secs {
+        if CALL_RETENTION_CHOICES.contains(&v) {
+            s.prefs.call_retention_secs = v;
+            apply_call_retention(&mut s);
         }
     }
     s.save_prefs()

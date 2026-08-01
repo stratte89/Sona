@@ -80,7 +80,7 @@ pub fn chain(challenge: &[u8]) -> Option<Vec<String>> {
             }
         }
         Err(e) => {
-            eprintln!("[hw-attest] unavailable: {e}");
+            crate::diag!("[hw-attest] unavailable: {e}");
             None
         }
     }

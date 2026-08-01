@@ -82,6 +82,11 @@ class DeliveryService : Service() {
     private fun statusText(): String = when {
       status == 0 -> "Connected — receiving messages"
       status == 2 -> "Delivery paused — unlock Sona to receive messages"
+      // Locked, but a wake transport is registered and the process hold was kept (E-2), so
+      // an incoming call still reaches this device. Said explicitly rather than folded into
+      // the line above: the difference between these two states is whether the phone rings,
+      // and §4.5 forbids being vague about exactly that.
+      status == 4 -> "Locked — unlock for messages. Incoming calls will still ring."
       // Honest offline text: the OS presents no network (airplane mode, or the app's
       // Network permission revoked on GrapheneOS) — "Reconnecting…" would imply a
       // fixable fault. Reconnect resumes the instant a network appears (onAvailable

@@ -221,61 +221,185 @@ pub fn decode_frame(text: &str, account: &mut Account) -> Decoded {
                         avatar,
                     }
                 }
-                Some(ChatPayload::CallOffer {
+                Some(ChatPayload::CallOfferV2 {
+                    call_instance_id,
+                    offer_id,
                     call_id,
                     key_b64,
-                    ts,
+                    created_at,
+                    ring_expires_at,
+                    expires_at,
                     from,
+                    caller_device_id,
+                    reply_to_mailbox,
                     caps,
-                    reconnect_of,
-                }) => InboundEvent::CallOffered {
+                    resume_of,
+                }) => InboundEvent::CallOfferedV2 {
                     sender_identity_key: sender,
                     sender_username: from,
+                    call_instance_id,
+                    offer_id,
                     call_id,
                     key_b64,
-                    ts,
+                    created_at,
+                    ring_expires_at,
+                    expires_at,
+                    caller_device_id,
+                    reply_to_mailbox,
                     caps,
-                    reconnect_of,
+                    resume_of,
                 },
-                Some(ChatPayload::CallAnswer {
-                    call_id,
-                    accept,
+                Some(ChatPayload::CallAnswerClaimV2 {
+                    call_instance_id,
+                    offer_id,
+                    claim_nonce,
+                    answering_device_id,
+                    reply_to_mailbox,
                     caps,
-                    busy,
-                }) => InboundEvent::CallAnswered {
+                    expires_at,
+                }) => InboundEvent::CallAnswerClaimedV2 {
                     sender_identity_key: sender,
-                    call_id,
-                    accept,
+                    call_instance_id,
+                    offer_id,
+                    claim_nonce,
+                    answering_device_id,
+                    reply_to_mailbox,
                     caps,
-                    busy,
+                    expires_at,
                 },
-                Some(ChatPayload::CallEnd { call_id }) => InboundEvent::CallEnded {
+                Some(ChatPayload::CallWinnerV2 {
+                    call_instance_id,
+                    offer_id,
+                    claim_nonce,
+                    winner_device_id,
+                    expires_at,
+                }) => InboundEvent::CallWinnerV2 {
                     sender_identity_key: sender,
-                    call_id,
+                    call_instance_id,
+                    offer_id,
+                    claim_nonce,
+                    winner_device_id,
+                    expires_at,
                 },
-                Some(ChatPayload::GroupCallOffer {
-                    group_id,
-                    call_instance,
-                    call_id,
-                    key_b64,
-                    ts,
+                Some(ChatPayload::CallBusyV2 {
+                    call_instance_id,
+                    offer_id,
+                    device_id,
+                    expires_at,
+                }) => InboundEvent::CallBusyV2 {
+                    sender_identity_key: sender,
+                    call_instance_id,
+                    offer_id,
+                    device_id,
+                    expires_at,
+                },
+                Some(ChatPayload::CallTerminalV2 {
+                    call_instance_id,
+                    offer_id,
+                    reason,
                     from,
-                }) => InboundEvent::GroupCallOffered {
+                    actor_device_id,
+                    expires_at,
+                }) => InboundEvent::CallTerminalV2 {
+                    sender_identity_key: sender,
+                    sender_username: from,
+                    call_instance_id,
+                    offer_id,
+                    reason,
+                    actor_device_id,
+                    expires_at,
+                },
+                Some(ChatPayload::GroupCallOfferV2 {
+                    group_id,
+                    call_instance_id,
+                    ring_id,
+                    offer_id,
+                    call_id,
+                    key_b64,
+                    created_at,
+                    ring_expires_at,
+                    expires_at,
+                    from,
+                    caller_device_id,
+                    coordinator_username,
+                    coordinator_identity_key,
+                    coordinator_device_id,
+                    coordinator_reply_to_mailbox,
+                    resume,
+                }) => InboundEvent::GroupCallOfferedV2 {
                     sender_identity_key: sender,
                     sender_username: from,
                     group_id,
-                    call_instance,
+                    call_instance_id,
+                    ring_id,
+                    offer_id,
                     call_id,
                     key_b64,
-                    ts,
+                    created_at,
+                    ring_expires_at,
+                    expires_at,
+                    caller_device_id,
+                    coordinator_username,
+                    coordinator_identity_key,
+                    coordinator_device_id,
+                    coordinator_reply_to_mailbox,
+                    resume,
                 },
-                Some(ChatPayload::GroupCallEnd {
+                Some(ChatPayload::GroupCallAnswerClaimV2 {
                     group_id,
-                    call_instance,
-                }) => InboundEvent::GroupCallEnded {
+                    call_instance_id,
+                    ring_id,
+                    claim_nonce,
+                    answering_device_id,
+                    reply_to_mailbox,
+                    expires_at,
+                }) => InboundEvent::GroupCallAnswerClaimedV2 {
                     sender_identity_key: sender,
                     group_id,
-                    call_instance,
+                    call_instance_id,
+                    ring_id,
+                    claim_nonce,
+                    answering_device_id,
+                    reply_to_mailbox,
+                    expires_at,
+                },
+                Some(ChatPayload::GroupCallWinnerV2 {
+                    group_id,
+                    call_instance_id,
+                    ring_id,
+                    claim_nonce,
+                    winner_device_id,
+                    expires_at,
+                }) => InboundEvent::GroupCallWinnerV2 {
+                    sender_identity_key: sender,
+                    group_id,
+                    call_instance_id,
+                    ring_id,
+                    claim_nonce,
+                    winner_device_id,
+                    expires_at,
+                },
+                Some(ChatPayload::GroupCallTerminalV2 {
+                    group_id,
+                    call_instance_id,
+                    ring_id,
+                    reason,
+                    actor_device_id,
+                    coordinator_username,
+                    coordinator_identity_key,
+                    coordinator_device_id,
+                    expires_at,
+                }) => InboundEvent::GroupCallTerminalV2 {
+                    sender_identity_key: sender,
+                    group_id,
+                    call_instance_id,
+                    ring_id,
+                    reason,
+                    actor_device_id,
+                    coordinator_username,
+                    coordinator_identity_key,
+                    coordinator_device_id,
+                    expires_at,
                 },
                 Some(ChatPayload::SelfText {
                     peer_key,
@@ -318,9 +442,19 @@ pub fn decode_frame(text: &str, account: &mut Account) -> Decoded {
                     peer_key,
                     ids,
                 },
-                Some(ChatPayload::SelfCallHandled { call_id }) => InboundEvent::SelfCallHandled {
+                Some(ChatPayload::SelfCallTerminalV2 {
+                    call_instance_id,
+                    offer_id,
+                    reason,
+                    actor_device_id,
+                    expires_at,
+                }) => InboundEvent::SelfCallTerminalV2 {
                     sender_identity_key: sender,
-                    call_id,
+                    call_instance_id,
+                    offer_id,
+                    reason,
+                    actor_device_id,
+                    expires_at,
                 },
                 Some(ChatPayload::SyncRequest {
                     provisioning_id,
@@ -496,9 +630,8 @@ mod wire_tests {
         ));
     }
 
-    // Every payload family carries the right sender-declared wake class: content wakes
-    // (debounced), offers ring-wake, silent reconnect offers must NOT ring-wake, and
-    // ephemeral/receipt/self-sync traffic never wakes at all.
+    // Every v2 call signal is explicitly short-lived and requests either a ring wake or
+    // an urgent silent control wake.
     #[test]
     fn wake_classes_per_payload() {
         let text = ChatPayload::Text {
@@ -510,27 +643,49 @@ mod wire_tests {
             fwd: false,
         };
         assert_eq!(wake_class_for(&text), WakeClass::Normal);
-        let offer = |reconnect_of: &str| ChatPayload::CallOffer {
+        let offer = |resume_of: &str| ChatPayload::CallOfferV2 {
+            call_instance_id: "1".repeat(32),
+            offer_id: "2".repeat(32),
             call_id: "c".into(),
             key_b64: "k".into(),
-            ts: 1,
+            created_at: 1,
+            ring_expires_at: 46,
+            expires_at: 61,
             from: "a".into(),
+            caller_device_id: "0".into(),
+            reply_to_mailbox: "a".repeat(64),
             caps: vec![],
-            reconnect_of: reconnect_of.into(),
+            resume_of: resume_of.into(),
         };
         assert_eq!(wake_class_for(&offer("")), WakeClass::Call);
-        assert_eq!(wake_class_for(&offer("old-call")), WakeClass::Normal);
         assert_eq!(
-            wake_class_for(&ChatPayload::GroupCallOffer {
-                group_id: "g".into(),
-                call_instance: "i".into(),
-                call_id: "c".into(),
-                key_b64: "k".into(),
-                ts: 1,
-                from: "a".into(),
-            }),
-            WakeClass::Call
+            wake_class_for(&offer("old-media-call")),
+            WakeClass::CallControl
         );
+        assert_eq!(envelope_expiry_for(&offer("")), Some(61));
+        let mut group_offer = ChatPayload::GroupCallOfferV2 {
+            group_id: "g".into(),
+            call_instance_id: "1".repeat(32),
+            ring_id: "4".repeat(32),
+            offer_id: "2".repeat(32),
+            call_id: "c".into(),
+            key_b64: "k".into(),
+            created_at: 1,
+            ring_expires_at: 46,
+            expires_at: 61,
+            from: "a".into(),
+            caller_device_id: "0".into(),
+            coordinator_username: "a".into(),
+            coordinator_identity_key: "key".into(),
+            coordinator_device_id: "0".into(),
+            coordinator_reply_to_mailbox: "b".repeat(64),
+            resume: false,
+        };
+        assert_eq!(wake_class_for(&group_offer), WakeClass::Call);
+        if let ChatPayload::GroupCallOfferV2 { resume, .. } = &mut group_offer {
+            *resume = true;
+        }
+        assert_eq!(wake_class_for(&group_offer), WakeClass::CallControl);
         for silent in [
             ChatPayload::Typing { typing: true },
             ChatPayload::Receipt {
@@ -541,20 +696,92 @@ mod wire_tests {
                 peer_key: "p".into(),
                 ids: vec!["m".into()],
             },
-            ChatPayload::CallAnswer {
-                call_id: "c".into(),
-                accept: true,
-                caps: vec![],
-                busy: false,
-            },
-            ChatPayload::CallEnd {
-                call_id: "c".into(),
-            },
-            ChatPayload::SelfCallHandled {
-                call_id: "c".into(),
-            },
         ] {
             assert_eq!(wake_class_for(&silent), WakeClass::None);
+        }
+        for control in [
+            ChatPayload::CallAnswerClaimV2 {
+                call_instance_id: "1".repeat(32),
+                offer_id: "2".repeat(32),
+                claim_nonce: "3".repeat(32),
+                answering_device_id: "0".into(),
+                reply_to_mailbox: "a".repeat(64),
+                caps: vec![],
+                expires_at: 61,
+            },
+            ChatPayload::CallWinnerV2 {
+                call_instance_id: "1".repeat(32),
+                offer_id: "2".repeat(32),
+                claim_nonce: "3".repeat(32),
+                winner_device_id: "0".into(),
+                expires_at: 61,
+            },
+            ChatPayload::CallBusyV2 {
+                call_instance_id: "1".repeat(32),
+                offer_id: "2".repeat(32),
+                device_id: "0".into(),
+                expires_at: 61,
+            },
+            ChatPayload::CallTerminalV2 {
+                call_instance_id: "1".repeat(32),
+                offer_id: "2".repeat(32),
+                reason: callstate::CallTerminalReason::CallerCancelled,
+                from: "alice".into(),
+                actor_device_id: "0".into(),
+                expires_at: 61,
+            },
+            ChatPayload::GroupCallTerminalV2 {
+                group_id: "g".into(),
+                call_instance_id: "1".repeat(32),
+                ring_id: "4".repeat(32),
+                reason: callstate::CallTerminalReason::DeclinedHere,
+                actor_device_id: "0".into(),
+                coordinator_username: "a".into(),
+                coordinator_identity_key: "key".into(),
+                coordinator_device_id: "0".into(),
+                expires_at: 61,
+            },
+            ChatPayload::GroupCallAnswerClaimV2 {
+                group_id: "g".into(),
+                call_instance_id: "1".repeat(32),
+                ring_id: "4".repeat(32),
+                claim_nonce: "3".repeat(32),
+                answering_device_id: "0".into(),
+                reply_to_mailbox: "a".repeat(64),
+                expires_at: 61,
+            },
+            ChatPayload::GroupCallWinnerV2 {
+                group_id: "g".into(),
+                call_instance_id: "1".repeat(32),
+                ring_id: "4".repeat(32),
+                claim_nonce: "3".repeat(32),
+                winner_device_id: "0".into(),
+                expires_at: 61,
+            },
+            ChatPayload::SelfCallTerminalV2 {
+                call_instance_id: "1".repeat(32),
+                offer_id: "2".repeat(32),
+                reason: callstate::CallTerminalReason::AnsweredElsewhere,
+                actor_device_id: "0".into(),
+                expires_at: 61,
+            },
+        ] {
+            assert_eq!(wake_class_for(&control), WakeClass::CallControl);
+            assert_eq!(envelope_expiry_for(&control), Some(61));
+        }
+    }
+
+    #[test]
+    fn v1_call_payloads_are_rejected() {
+        for old in [
+            r#"{"t":"call_offer","call_id":"c","key_b64":"k","ts":1}"#,
+            r#"{"t":"call_answer","call_id":"c","accept":true}"#,
+            r#"{"t":"call_end","call_id":"c"}"#,
+            r#"{"t":"group_call_offer","group_id":"g","call_id":"c","key_b64":"k"}"#,
+            r#"{"t":"group_call_end","group_id":"g","call_instance":"c"}"#,
+            r#"{"t":"self_call_handled","call_id":"c"}"#,
+        ] {
+            assert!(serde_json::from_str::<ChatPayload>(old).is_err());
         }
     }
 

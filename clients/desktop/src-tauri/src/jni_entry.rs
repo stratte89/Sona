@@ -9,7 +9,7 @@
 //! any of these can run — Kotlin loads the native library in `SonaApp.onCreate`.
 
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::jboolean;
+use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
 
 use crate::eng;
@@ -54,8 +54,8 @@ pub extern "system" fn Java_app_sona_messenger_DeliveryService_nativeStartHeadle
     });
 }
 
-/// A content-free push wake arrived (`{"t":"m"}` / `{"t":"c"}`): drain the mailbox in
-/// a short burst (or ring/notify generically when the vault can't open headless). The
+/// A content-free push wake arrived (`m` / ring `c` / silent-control `x`): drain the
+/// mailbox in a short burst (or notify generically when the vault can't open headless). The
 /// shortService is released through `NotificationBridge.drainFinished()` when the
 /// engine is done.
 #[no_mangle]
@@ -63,13 +63,13 @@ pub extern "system" fn Java_app_sona_messenger_NotificationBridge_nativeWake(
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
-    call_class: jboolean,
+    wake_class: jint,
 ) {
     ensure_engine_init(&mut env, &data_dir);
     let inner = eng().session.clone();
-    let call = call_class != 0;
+    let wake = crate::push::PushWakeClass::from_jni(wake_class);
     eng().spawn(async move {
-        crate::headless_wake(&inner, call).await;
+        crate::headless_wake(&inner, wake).await;
     });
 }
 
@@ -107,6 +107,24 @@ pub extern "system" fn Java_app_sona_messenger_NotificationBridge_nativeNotifAct
     let inner = eng().session.clone();
     eng().spawn(async move {
         crate::notif_action(&inner, &json).await;
+    });
+}
+
+/// A Core-Telecom lifecycle event: the system answered, disconnected, held, or changed
+/// the audio route for one of our calls. Telecom is the authority for those transitions,
+/// so the shell reacts to them rather than assuming its own.
+#[no_mangle]
+pub extern "system" fn Java_app_sona_messenger_TelecomBridge_nativeTelecomEvent(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) {
+    let Some(json) = jstr(&mut env, &json) else {
+        return;
+    };
+    let inner = eng().session.clone();
+    eng().spawn(async move {
+        crate::handle_telecom_event(&inner, &json).await;
     });
 }
 

@@ -7,8 +7,9 @@
 //!   metadata-minimal, so media flows through the self-hosted relay's blind call rooms
 //!   (`/v1/call/{id}`): the relay pairs two anonymous sockets by a random id and forwards
 //!   opaque frames. Latency cost is one relay hop.
-//! * **Signaling rides the Double Ratchet.** `CallOffer` (random 128-bit call id + random
-//!   32-byte call key) travels inside the existing E2E session — authenticated,
+//! * **Signaling rides the Double Ratchet.** The v2 offer (logical IDs plus a random
+//!   128-bit media-room id and random 32-byte call key) travels inside the existing E2E
+//!   session — authenticated,
 //!   forward-secret, invisible to the server. Whoever can decrypt the offer *is* the
 //!   callee; the relay never learns identities (joining a room takes only the id, which
 //!   is a capability token).
@@ -27,14 +28,16 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{Client, ClientError, Result};
+use crate::{ClientError, Result};
+
+// The transport lives next door (see `crate::callmedia`), re-exported here so
+// `call::CallMedia` stays the one public path to it.
+pub use crate::callmedia::{CallMedia, CallWireEvent, CellSender};
 
 /// Minimal safe wrapper over libopus (`opusic-sys` — maintained bindings; the previous
 /// ecosystem wrapper crates sit on an unmaintained `-sys`). Only what the engine needs:
@@ -195,6 +198,56 @@ pub const CHANNELS: u16 = 1;
 pub const SAMPLES_PER_FRAME: usize = 960; // 48_000 * 0.020
 /// Opus bitrate. CBR: a 20 ms frame is a constant ~60 bytes regardless of content.
 pub const OPUS_BITRATE: i32 = 24_000;
+/// Playout gain, in percent, that means "exactly what was sent". Volume controls are
+/// carried as percentages end to end: they come from a slider, they are shown to
+/// someone as a number, and an integer that reads the same in the UI, the wire of a
+/// Tauri command and the vault cannot drift the way a rounded float would.
+pub const GAIN_UNITY: u32 = 100;
+/// The loudest a listener may make someone. Past roughly this, a normalised voice
+/// clips instead of getting louder, so the slider stops where the benefit does.
+pub const GAIN_MAX: u32 = 200;
+
+/// The amplitude multiplier a slider percentage means.
+///
+/// **Not linear.** A percentage that multiplies amplitude directly is a poor volume
+/// control: loudness is roughly logarithmic, so a linear slider does almost nothing
+/// across its top half and everything in a narrow band near the bottom, and "200 %"
+/// is only +6 dB — much less than the word suggests. Squaring the ratio spreads the
+/// same numbers over twice the decibel range, so the slider moves the sound about
+/// evenly along its length and the ends mean something:
+///
+/// ```text
+///     0 %  →  silence          50 %  →  0.25x  (-12 dB)
+///    25 %  →  0.06x (-24 dB)  100 %  →  1.00x  (unchanged, exactly)
+///                             200 %  →  4.00x  (+12 dB)
+/// ```
+///
+/// The percentage stays the thing shown, stored and sent — it is what a person
+/// reasons about — and this is the only place it becomes a number to multiply by.
+pub fn gain_factor(percent: u32) -> f32 {
+    let r = percent.min(GAIN_MAX) as f32 / GAIN_UNITY as f32;
+    r * r
+}
+
+/// Scale 20 ms of playout in place. `GAIN_UNITY` is a no-op and costs nothing.
+///
+/// Saturating, in `i32`: a boosted loud frame *will* reach the rails, and wrapping
+/// there turns a peak into a full-scale sign flip — which is not "a bit distorted",
+/// it is a click on every peak.
+pub fn apply_gain(frame: &mut [i16; SAMPLES_PER_FRAME], percent: u32) {
+    if percent == GAIN_UNITY {
+        return;
+    }
+    if percent == 0 {
+        frame.fill(0);
+        return;
+    }
+    let g = gain_factor(percent);
+    for s in frame.iter_mut() {
+        *s = (*s as f32 * g).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
 /// Every plaintext frame is padded to exactly this many bytes before sealing, so the
 /// ciphertext (and the wire frame) is constant-size. Leaves codec headroom.
 pub const PADDED_PLAINTEXT: usize = 256;
@@ -222,6 +275,20 @@ impl CallTicket {
         };
         key.zeroize();
         ticket
+    }
+
+    /// Strictly validate an untrusted media capability before it can create a ring or
+    /// be interpolated into a relay URL.
+    pub fn valid(call_id: &str, key_b64: &str) -> bool {
+        if !crate::callstate::valid_call_id(call_id) || key_b64.len() != 43 {
+            return false;
+        }
+        let Ok(mut key) = STANDARD_NO_PAD.decode(key_b64) else {
+            return false;
+        };
+        let valid = key.len() == 32 && STANDARD_NO_PAD.encode(&key) == key_b64;
+        key.zeroize();
+        valid
     }
 }
 
@@ -338,222 +405,6 @@ impl CallKeys {
         }
         self.recv_last = Some(seq);
         Ok(plain[2..2 + len].to_vec())
-    }
-}
-
-/// What the relay room socket yields.
-#[derive(Debug)]
-pub enum CallWireEvent {
-    /// We are in the room; `peers` counts members including us. `media` is the relay's
-    /// media protocol level: 1 = voice-only frame cap (legacy relay), 2 = video-size
-    /// frames allowed. Video/screen tracks are enabled only when the relay says 2.
-    Joined { peers: u8, media: u8 },
-    /// The other party arrived — start streaming.
-    PeerJoined,
-    /// The other party left/hung up.
-    PeerLeft,
-    /// An opaque media frame from the peer (still sealed).
-    Frame(Vec<u8>),
-    /// Socket closed.
-    Closed,
-}
-
-/// One leg of a call room, over either transport. QUIC is preferred (no TCP
-/// head-of-line blocking: lost voice frames become silence, not stalls; each video
-/// frame rides its own short reliable stream); WebSocket is the always-works fallback
-/// for old relays and UDP-hostile networks. Same blind room, same E2E media.
-pub struct CallMedia {
-    inner: MediaTransport,
-}
-
-enum MediaTransport {
-    // Boxed: the tungstenite stream is ~3x the QUIC handle, and there is exactly one
-    // CallMedia per call — indirection is free here and keeps the enum lean.
-    Ws(Box<crate::WsStream>),
-    Quic(crate::quicmedia::QuicMedia),
-}
-
-/// The relay's QUIC discovery document (`GET /v1/call/quic`).
-#[derive(serde::Deserialize)]
-struct QuicInfoResp {
-    enabled: bool,
-    #[serde(default)]
-    port: u16,
-    #[serde(default)]
-    cert_sha256: String,
-}
-
-impl Client {
-    /// The relay-room URL for a call id (same host as the delivery socket).
-    pub fn call_ws_url(&self, call_id: &str) -> String {
-        let base = self.ws_url.trim_end_matches("/v1/ws");
-        format!("{base}/v1/call/{call_id}")
-    }
-
-    /// Join a call room. No identity is presented — the random id is the capability.
-    /// Tries the QUIC media path first (lower latency on lossy links) and falls back
-    /// to WebSocket silently; the choice is invisible to the engine and the peer (the
-    /// relay bridges transports).
-    pub async fn join_call(&self, call_id: &str) -> Result<CallMedia> {
-        if let Some(quic) = self.try_join_call_quic(call_id).await {
-            return Ok(CallMedia {
-                inner: MediaTransport::Quic(quic),
-            });
-        }
-        self.join_call_ws(call_id).await
-    }
-
-    /// Join over WebSocket explicitly (fallback path; also useful in tests).
-    pub async fn join_call_ws(&self, call_id: &str) -> Result<CallMedia> {
-        let ws = self
-            .ws_connect(self.ws_request(&self.call_ws_url(call_id))?)
-            .await
-            .map_err(|e| ClientError::Ws(e.to_string()))?;
-        Ok(CallMedia {
-            inner: MediaTransport::Ws(Box::new(ws)),
-        })
-    }
-
-    /// Best-effort QUIC attempt: discovery + connect + join, all inside one short
-    /// timeout. Any failure (endpoint disabled, old relay, UDP blocked, bad pin)
-    /// returns `None` and costs the call nothing but the timeout.
-    async fn try_join_call_quic(&self, call_id: &str) -> Option<crate::quicmedia::QuicMedia> {
-        // SOCKS proxy set: QUIC is UDP, which neither SOCKS5-over-TCP nor Tor carries —
-        // a direct connect would bypass the proxy and leak the real IP it is hiding.
-        // Skip straight to the relay-bridged WebSocket media path (proxied).
-        if self.proxy_active() {
-            return None;
-        }
-        tokio::time::timeout(crate::quicmedia::CONNECT_TIMEOUT, async {
-            let info: QuicInfoResp = self
-                .http
-                .get(format!("{}/v1/call/quic", self.base_url))
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
-            if !info.enabled || info.port == 0 {
-                return None;
-            }
-            use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-            let hash: [u8; 32] = STANDARD_NO_PAD
-                .decode(&info.cert_sha256)
-                .ok()?
-                .try_into()
-                .ok()?;
-            let host = reqwest::Url::parse(&self.base_url)
-                .ok()?
-                .host_str()?
-                .to_string();
-            let addr = tokio::net::lookup_host((host.as_str(), info.port))
-                .await
-                .ok()?
-                .next()?;
-            crate::quicmedia::QuicMedia::connect(
-                addr,
-                &host,
-                hash,
-                call_id,
-                self.access_token.as_deref(),
-            )
-            .await
-            .ok()
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-}
-
-impl CallMedia {
-    /// Which transport this leg runs on (`"quic"` or `"ws"`), for status/UI/tests.
-    pub fn transport(&self) -> &'static str {
-        match &self.inner {
-            MediaTransport::Ws(_) => "ws",
-            MediaTransport::Quic(_) => "quic",
-        }
-    }
-
-    /// Send one loss-tolerant wire frame (voice, screen audio). Over QUIC this is an
-    /// unreliable datagram — a dropped frame plays as 20 ms of silence and never
-    /// stalls the stream. `Err` means the connection itself is gone.
-    pub async fn send_lossy(&mut self, wire: Vec<u8>) -> Result<()> {
-        match &mut self.inner {
-            MediaTransport::Ws(ws) => ws
-                .send(WsMessage::Binary(wire))
-                .await
-                .map_err(|e| ClientError::Ws(e.to_string())),
-            MediaTransport::Quic(q) => q.send_lossy(wire),
-        }
-    }
-
-    /// Send a group of cells that must arrive intact and together (one encoded video
-    /// frame's fragments, or a control cell). Over QUIC the group gets its own short
-    /// reliable stream, so a retransmit delays only this frame.
-    pub async fn send_cells(&mut self, cells: Vec<Vec<u8>>) -> Result<()> {
-        match &mut self.inner {
-            MediaTransport::Ws(ws) => {
-                for cell in cells {
-                    ws.send(WsMessage::Binary(cell))
-                        .await
-                        .map_err(|e| ClientError::Ws(e.to_string()))?;
-                }
-                Ok(())
-            }
-            MediaTransport::Quic(q) => q.send_cells(cells).await,
-        }
-    }
-
-    /// Await the next room event. Cancel-safe (a dropped future loses nothing).
-    pub async fn next_event(&mut self) -> Result<CallWireEvent> {
-        match &mut self.inner {
-            MediaTransport::Quic(q) => Ok(q.next_event().await),
-            MediaTransport::Ws(ws) => {
-                while let Some(frame) = ws.next().await {
-                    match frame.map_err(|e| ClientError::Ws(e.to_string()))? {
-                        WsMessage::Binary(b) => return Ok(CallWireEvent::Frame(b.to_vec())),
-                        WsMessage::Text(t) => {
-                            let v: serde_json::Value = match serde_json::from_str(t.as_str()) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            match v["type"].as_str() {
-                                Some("joined") => {
-                                    return Ok(CallWireEvent::Joined {
-                                        peers: v["peers"].as_u64().unwrap_or(1) as u8,
-                                        media: v["media"].as_u64().unwrap_or(1) as u8,
-                                    })
-                                }
-                                Some("peer_joined") => return Ok(CallWireEvent::PeerJoined),
-                                Some("peer_left") => return Ok(CallWireEvent::PeerLeft),
-                                _ => continue,
-                            }
-                        }
-                        WsMessage::Ping(p) => {
-                            let _ = ws.send(WsMessage::Pong(p)).await;
-                        }
-                        WsMessage::Close(_) => return Ok(CallWireEvent::Closed),
-                        _ => continue,
-                    }
-                }
-                Ok(CallWireEvent::Closed)
-            }
-        }
-    }
-
-    pub async fn close(self) {
-        match self.inner {
-            MediaTransport::Ws(mut ws) => {
-                // Fully qualified: on Box<WsStream>, plain `.close(None)` resolves to
-                // tungstenite's inherent close on some targets and to SinkExt::close
-                // (zero-arg) on others (seen: x86_64 vs aarch64-android) — the latter
-                // is a compile error. Pin the inherent method explicitly.
-                let _ = tokio_tungstenite::WebSocketStream::close(&mut ws, None).await;
-            }
-            MediaTransport::Quic(q) => q.close(),
-        }
     }
 }
 
@@ -739,7 +590,59 @@ mod tests {
         assert_eq!(t.call_id.len(), 32);
         assert!(t.call_id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(STANDARD_NO_PAD.decode(&t.key_b64).unwrap().len(), 32);
+        assert!(CallTicket::valid(&t.call_id, &t.key_b64));
+        assert!(!CallTicket::valid("../not-a-room", &t.key_b64));
+        assert!(!CallTicket::valid(&t.call_id, "not-a-key"));
         assert_ne!(CallTicket::mint().call_id, t.call_id);
+    }
+
+    /// Volume is a percentage, and the two ends of the range have to be exact: unity
+    /// must not touch a sample (it is the common path), and zero must be silence rather
+    /// than "very quiet".
+    #[test]
+    fn gain_is_exact_at_unity_and_zero_and_saturates_between() {
+        let orig = [1000i16, -1000, 32_767, -32_768, 0, 7];
+        let mut f = [0i16; SAMPLES_PER_FRAME];
+        f[..orig.len()].copy_from_slice(&orig);
+
+        let mut unity = f;
+        apply_gain(&mut unity, GAIN_UNITY);
+        assert_eq!(unity, f, "unity gain must be bit-for-bit untouched");
+
+        let mut silent = f;
+        apply_gain(&mut silent, 0);
+        assert!(silent.iter().all(|&s| s == 0));
+
+        // Half the slider is a quarter of the amplitude — the curve, not a typo.
+        let mut half = f;
+        apply_gain(&mut half, 50);
+        assert_eq!(&half[..orig.len()], &[250, -250, 8191, -8192, 0, 1]);
+
+        // Boosting a full-scale sample must hit the rail, not wrap round to the other
+        // one — a wrap is a click on every peak, which is far worse than clipping.
+        let mut loud = f;
+        apply_gain(&mut loud, GAIN_MAX);
+        assert_eq!(
+            &loud[..orig.len()],
+            &[4000, -4000, i16::MAX, i16::MIN, 0, 28]
+        );
+
+        // The curve itself, at the points a person actually reads off the slider.
+        assert_eq!(
+            gain_factor(GAIN_UNITY),
+            1.0,
+            "100 % must be exactly unchanged"
+        );
+        assert_eq!(gain_factor(0), 0.0);
+        assert_eq!(gain_factor(50), 0.25);
+        assert_eq!(gain_factor(GAIN_MAX), 4.0);
+
+        // Past the top of the slider the gain is held, not extrapolated.
+        let mut absurd = f;
+        apply_gain(&mut absurd, 10_000);
+        let mut capped = f;
+        apply_gain(&mut capped, GAIN_MAX);
+        assert_eq!(absurd, capped);
     }
 
     #[test]

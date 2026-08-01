@@ -18,6 +18,9 @@ pub async fn delivery_status(state: tauri::State<'_, AppState>) -> Result<Delive
         notifier::ConnState::Connected => "connected",
         notifier::ConnState::Reconnecting => "reconnecting",
         notifier::ConnState::Locked => "locked",
+        // Distinct from "locked": messages wait for the unlock either way, but this device
+        // can still be woken for a call (E-2). The health panel must not merge the two.
+        notifier::ConnState::LockedWakeable => "locked_wakeable",
         notifier::ConnState::Off => "off",
     };
     Ok(DeliveryView {

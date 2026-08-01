@@ -76,7 +76,7 @@ pub async fn link_start(
         .flatten();
     if let Some(chain) = chain {
         if let Err(e) = client.attach_link_attestation(&mut req, &chain).await {
-            eprintln!("[hw-attest] upload failed, linking without attestation: {e}");
+            crate::diag!("[hw-attest] upload failed, linking without attestation: {e}");
         }
     }
     let qr = serde_json::to_string(&req).map_err(|e| e.to_string())?;
@@ -218,6 +218,14 @@ pub async fn complete_link_cmd(
         let inner = state.inner.clone();
         eng().spawn(async move {
             maybe_auto_delivery_mode(&inner).await;
+        });
+    }
+    // A freshly linked device has a new device id, so its call-control key must be
+    // (re)published under it before anyone can seal a capsule to this phone.
+    {
+        let inner = state.inner.clone();
+        eng().spawn(async move {
+            ensure_call_identity(&inner, &client).await;
         });
     }
     Ok(view)

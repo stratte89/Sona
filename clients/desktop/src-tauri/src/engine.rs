@@ -28,6 +28,10 @@ const MAX_NOTIF_LINES: usize = 8;
 /// redelivery in steady state, this is cheap insurance against a duplicate
 /// *notification* when a push drain and a reviving socket race.
 const SEEN_IDS_CAP: usize = 256;
+/// How often a deferred background auto-lock re-checks whether the call it is waiting on
+/// has ended. Short enough that the vault closes promptly after a call, long enough that
+/// a long call costs a handful of lock acquisitions rather than a poll loop.
+const IN_CALL_LOCK_RECHECK_SECS: u64 = 30;
 
 pub struct Engine {
     /// Engine-owned runtime — never Tauri's, so delivery survives without a UI.
@@ -54,9 +58,9 @@ pub struct Engine {
     seen_ids: StdMutex<(VecDeque<String>, HashSet<String>)>,
     /// The natively-ringing call (call_id / group call_instance), if any.
     ring: StdMutex<Option<String>>,
-    /// The call whose ring window holds the headset-button MediaSession (started for
-    /// EVERY ring, native or in-app — a tap on the earbuds must answer either way).
-    buttons: StdMutex<Option<String>>,
+    /// Presentation handles handed to the platform and not yet taken back. A handle that
+    /// outlives its call is a system call nothing will ever disconnect.
+    system_calls: StdMutex<HashSet<String>>,
     /// Latest FCM registration token pushed up from Kotlin (`nativeSetPushToken`).
     push_token: StdMutex<Option<String>>,
     /// Live UnifiedPush endpoint URL from the chosen distributor
@@ -80,7 +84,15 @@ static ENGINE: OnceLock<Engine> = OnceLock::new();
 pub fn global() -> &'static Engine {
     ENGINE.get_or_init(|| Engine {
         rt: tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            // Four, because a call in progress needs four things running at once and
+            // three of them are allowed to block their worker: the session loop (voice,
+            // on a hard 20 ms cadence), the video encode task, the video decode task
+            // (~10 ms per 1080p frame, and 20 of those a second), and the reliable-send
+            // task. On two workers a share could park both of them in codec work and the
+            // voice tick simply did not get scheduled — the same "everything went choppy"
+            // symptom as the wire-level stall, arriving by a different route. Idle
+            // workers cost a parked thread each, which is nothing next to that.
+            .worker_threads(4)
             .enable_all()
             .thread_name("sona-engine")
             .build()
@@ -95,7 +107,7 @@ pub fn global() -> &'static Engine {
         notif_lines: StdMutex::new(HashMap::new()),
         seen_ids: StdMutex::new((VecDeque::new(), HashSet::new())),
         ring: StdMutex::new(None),
-        buttons: StdMutex::new(None),
+        system_calls: StdMutex::new(HashSet::new()),
         push_token: StdMutex::new(None),
         up_endpoint: StdMutex::new(None),
         pending_intent: StdMutex::new(None),
@@ -154,7 +166,17 @@ impl Engine {
             if !s.data_dir.as_os_str().is_empty() {
                 return;
             }
+            // Before the first diagnostic line, and idempotent. A headless wake never goes
+            // through `run()`, which is where this used to be installed, so without it the
+            // whole capsule-path diagnostic (E-9) writes to a stdout Android has closed.
+            #[cfg(target_os = "android")]
+            crate::redirect_stdio_to_logcat();
             let _ = std::fs::create_dir_all(&dir);
+            // Diagnostics get a file from here on. This is the first moment there is
+            // anywhere to put one, and on Windows it is the only way the lines ever reach
+            // a human: those builds have no console, so stderr goes nowhere no matter what
+            // it is redirected to.
+            crate::diag::init(&dir);
             s.data_dir = dir;
             if let Ok(b) = std::fs::read(s.prefs_path()) {
                 if let Ok(p) = serde_json::from_slice(&b) {
@@ -207,8 +229,31 @@ impl Engine {
             if *engine.unfocus_epoch.lock().unwrap() != epoch || engine.is_focused() {
                 return; // focus came back (or flapped) — not idle-in-background
             }
+            // A call in progress is not an idle app (`internal/CALL_PLAN.md` §8). Locking takes the
+            // session keys out of memory and the call's with them, and a phone in a call is
+            // *supposed* to have its screen off — which is exactly the state this timer
+            // reads as idle. Wait it out and lock when the call ends; an explicit lock from
+            // the user still hangs up, because that one was asked for.
+            //
+            // "In a call" is `call_slot_free`, not just a connected one: `do_lock` also
+            // cancels a ring, an answer waiting on the caller's winner acknowledgement, and
+            // a reconnect. A ring that lands inside the auto-lock window is exactly the
+            // case this timer must not destroy, and it is the likeliest one — the phone is
+            // unfocused because it is asleep, which is when calls arrive.
+            while {
+                let s = engine.session.lock().await;
+                s.account.is_some() && !crate::call_slot_free(&s)
+            } {
+                tokio::time::sleep(std::time::Duration::from_secs(IN_CALL_LOCK_RECHECK_SECS)).await;
+                if *engine.unfocus_epoch.lock().unwrap() != epoch || engine.is_focused() {
+                    return;
+                }
+            }
+            // `do_lock` owns the connection state now: only it knows whether the process
+            // hold was kept for a wake transport (E-2). Overriding it here would put the
+            // auto-lock back on the "locked means unreachable" path the manual lock just
+            // came off.
             crate::do_lock(&engine.session).await;
-            engine.set_conn_state(ConnState::Off);
             // Tell a (possibly frozen) UI; it re-checks app_status on resume anyway.
             engine.emit("locked", ());
         });
@@ -393,39 +438,202 @@ impl Engine {
 
     // ── Call ring ─────────────────────────────────────────────────────────────────
 
-    /// Start the native ring for `ring_id` (call_id, or group call_instance).
-    /// `title` must already be privacy-leveled by the caller.
+    /// Start the native ring for `ring_id` — the call's opaque presentation handle, never
+    /// a media room id. `title` must already be privacy-leveled by the caller.
+    ///
+    /// The notification is *presentation*: Core-Telecom owns the call itself (see
+    /// [`start_system_call`](Self::start_system_call)), which is why the two are separate
+    /// calls — the system call exists even when the app is on screen and no notification
+    /// is posted.
     pub fn show_ring(&self, ring_id: &str, title: &str, is_group: bool) {
         *self.ring.lock().unwrap() = Some(ring_id.to_string());
         notifier::show_call(ring_id, title, is_group);
     }
 
-    /// Headset-button MediaSession for the ring window: a tap answers, stop/end
-    /// declines. Started at every incoming offer (independent of whether the ring is
-    /// native or in-app); stopped by [`cancel_ring`](Self::cancel_ring), which every
-    /// ring-clearing path already calls.
-    pub fn call_buttons_start(&self, ring_id: &str) {
-        *self.buttons.lock().unwrap() = Some(ring_id.to_string());
-        notifier::call_buttons_start(ring_id);
+    /// The **locked-vault** ring: one content-free notification, posted under
+    /// [`notifier::LOCKED_CALL_RING`] rather than a per-call handle, because a locked
+    /// device may not say which call is ringing.
+    ///
+    /// It goes through the engine for one reason: [`cancel_ring`](Self::cancel_ring) only
+    /// takes down the ring it believes is showing, so a ring posted behind the engine's
+    /// back cannot be cancelled by it. That is exactly what left a locked phone ringing at
+    /// a call already answered elsewhere — the terminal capsule arrived, was verified, and
+    /// the cancel it triggered was refused by a guard that had never been told about the
+    /// ring.
+    pub fn show_locked_ring(&self) {
+        *self.ring.lock().unwrap() = Some(notifier::LOCKED_CALL_RING.to_string());
+        notifier::show_generic(notifier::Generic::LockedCall);
     }
 
-    /// Stop the native ring for `ring_id` if it is the one showing. Empty
-    /// `missed_title` = silent cancel (answered here / handled elsewhere); non-empty =
-    /// also post a missed-call entry. Also releases the headset-button session — this
-    /// runs even when no native notification was posted (in-app ring), because the
-    /// button session exists for both.
-    pub fn cancel_ring(&self, ring_id: &str, missed_title: &str) {
+    /// A call is happening that this device **cannot act on** (`internal/CALL_PLAN.md` §3.1, E-1).
+    ///
+    /// The locked path used to raise [`show_locked_ring`](Self::show_locked_ring) here as
+    /// well, on the reasoning that the user must learn a call is happening. That part is
+    /// right — it is L-11's decision and silence would be worse. What was wrong is the
+    /// surface: an `INSISTENT|NO_DISMISS` ringtone with an Answer that resolves to
+    /// `AnswerPlan::Nothing` and a Decline with no capsule to aim at. The tester's session
+    /// ended with a phone ringing at a call it could not answer, decline, or silence, until
+    /// the device rebooted itself.
+    ///
+    /// So this is deliberately not a ring, and deliberately not recorded in `self.ring`:
+    /// there is no ring to cancel, `ring_active()` must stay false so the *next* call's
+    /// in-app ringtone is not silenced by it, and the notification is dismissible by the
+    /// user like any other.
+    pub fn show_unactionable_call(&self) {
+        notifier::show_generic(notifier::Generic::UnactionableCall);
+    }
+
+    /// The vault opened: the locked-state generics are superseded by real, leveled
+    /// notifications. Clears the engine's ring bookkeeping with them, so a stale
+    /// `LOCKED_CALL_RING` cannot keep [`ring_active`](Self::ring_active) true and silence
+    /// the in-app ringtone of the next call.
+    pub fn clear_generics(&self) {
+        let mut ring = self.ring.lock().unwrap();
+        if ring.as_deref() == Some(notifier::LOCKED_CALL_RING) {
+            *ring = None;
+        }
+        drop(ring);
+        notifier::clear_generics();
+    }
+
+    /// Hand the call to the platform: Core-Telecom becomes the authority for its
+    /// lifecycle and audio route (`internal/CALL_PLAN.md` §7.3). Off Android this is a no-op and
+    /// the shell keeps its own ring, unchanged.
+    pub fn start_system_call(&self, ring_id: &str, title: &str, video: bool, incoming: bool) {
+        // Tracked whether or not the platform took it: on a target with no Telecom the set
+        // is what proves the shell balances its own bookkeeping, and on Android an
+        // untracked handle is a handle nothing will ever disconnect.
+        self.system_calls
+            .lock()
+            .unwrap()
+            .insert(ring_id.to_string());
+        let added = if incoming {
+            crate::telecom::add_incoming(ring_id, title, video)
+        } else {
+            crate::telecom::add_outgoing(ring_id, title, video)
+        };
+        // Only hand the route over if Telecom actually took the call: a refusal must
+        // leave the existing AudioManager routing in charge rather than nobody.
+        #[cfg(target_os = "android")]
+        if added {
+            crate::android_media::set_telecom_owns_route(true);
+        }
+        let _ = added;
+    }
+
+    /// Media is flowing: the system call is now active (audio focus, route, in-call UI).
+    pub fn system_call_active(&self, ring_id: &str) {
+        crate::telecom::set_active(ring_id);
+        // The answer's process hold has done its job — Telecom owns a live call now, which
+        // is a stronger claim on the process than a ring service ever was. Without this the
+        // *direct* answer path (unlocked device, no pending unlock, so `clear_unlock_prompt`
+        // never runs) would sit on the hold and its "Answering…" notification for the full
+        // backstop window while a call was already up (E-5).
+        notifier::release_call_hold();
+    }
+
+    /// End the system call with an honest [`crate::telecom::cause`], separately from the
+    /// notification — a call that never rang here still has to be taken down in Telecom.
+    ///
+    /// Every path that drops a call must reach this or [`cancel_ring`](Self::cancel_ring),
+    /// or the platform keeps a call the shell has forgotten: the ongoing-call chip stays
+    /// up, audio focus is never released, `MediaBridge` never gets its route back, and the
+    /// next `addCall` meets an occupied slot. Idempotent — ending an unknown handle is a
+    /// no-op, so a doubled call costs nothing.
+    pub fn end_system_call(&self, ring_id: &str, cause: i32) {
+        let remaining = {
+            let mut calls = self.system_calls.lock().unwrap();
+            if !calls.remove(ring_id) {
+                return;
+            }
+            calls.len()
+        };
+        crate::telecom::disconnect(ring_id, cause);
+        // Hand the route back only when the platform holds no call of ours at all.
+        // Reconciliation ends orphaned handles while a live call is up, and giving
+        // `MediaBridge` the route back mid-call is the fight §7.4 forbids, in the other
+        // direction.
+        #[cfg(target_os = "android")]
+        if remaining == 0 {
+            crate::android_media::set_telecom_owns_route(false);
+        }
+        let _ = remaining;
+    }
+
+    /// The presentation handles the shell believes the platform is holding. The shell's
+    /// own bookkeeping, not Telecom's — [`crate::telecom::active_calls`] is the platform's
+    /// answer, and reconciliation compares the two.
+    pub fn system_calls(&self) -> Vec<String> {
+        self.system_calls.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Answer: clear the ring *presentation* and tell Telecom this call was accepted —
+    /// without disconnecting it, which is what [`cancel_ring`](Self::cancel_ring) does.
+    /// The system call stays up and becomes active once media connects.
+    ///
+    /// The cancel is **unconditional**, and cancels the exact id the answering surface
+    /// named rather than "the ring this process thinks is showing". After a locked wake
+    /// Android freezes or kills the process: the notification survives, `self.ring` does
+    /// not, and the ring carries `FLAG_INSISTENT` — so a guarded cancel left the system
+    /// looping the ringtone for the whole ring window, straight through the unlock. The
+    /// notification id may belong to a ring this process never posted; that is the case.
+    pub fn accept_ring(&self, ring_id: &str, video: bool) {
+        // `accept_call`, not `cancel_call`: an answer is not a missed call — so nothing is
+        // posted in its place — and it is not the end of the ring's *process hold* either.
+        // What follows an answer on a locked phone is a wait of up to
+        // `UNLOCK_TO_ANSWER_SECS` with no socket, and the foreground service that carried
+        // the ring is what carries the process through it (E-5).
+        notifier::accept_call(ring_id);
         {
-            let mut buttons = self.buttons.lock().unwrap();
-            if buttons.as_deref() == Some(ring_id) {
-                *buttons = None;
-                notifier::call_buttons_stop();
+            let mut ring = self.ring.lock().unwrap();
+            // The *bookkeeping* stays guarded: a stale handle must not wipe the record of a
+            // ring that really is showing (A-12's cancel depends on that record).
+            if ring.as_deref() == Some(ring_id) {
+                *ring = None;
             }
         }
+        crate::telecom::answer(ring_id, video);
+    }
+
+    /// Stop the native ring for `ring_id`. Empty `missed_title` = silent cancel
+    /// (answered here / handled elsewhere); non-empty = also post a missed-call entry.
+    /// Also releases the headset-button session — this runs even when no native
+    /// notification was posted (in-app ring), because the button session exists for both.
+    ///
+    /// The cancel is **unconditional**, for exactly the reason
+    /// [`accept_ring`](Self::accept_ring) is: the notification and this process do not
+    /// share a lifetime. A push-woken ring is posted inside a `shortService` window that
+    /// ends seconds later, and Android then freezes or kills the process — while the
+    /// notification, its `FLAG_INSISTENT` ringtone, and its 45-second timeout all survive
+    /// in `system_server`. Every remote terminal (answered elsewhere, declined elsewhere,
+    /// the caller hanging up) therefore lands on a process whose `self.ring` is empty, and
+    /// a guarded cancel there is a cancel that never happens: the phone rings out the full
+    /// window at a call that ended seconds after it started. Restart reconciliation
+    /// (`call/store.rs`) rang the same bell — its whole job is to cancel a ring left on
+    /// screen by a process that died, and the guard refused every one of them by
+    /// construction.
+    ///
+    /// Cancelling an id nothing is showing is free (`NotificationManager.cancel` on an
+    /// unknown id is a no-op), so the cost of being wrong here is nothing, and the cost of
+    /// being guarded was the flagship bug.
+    pub fn cancel_ring(&self, ring_id: &str, missed_title: &str) {
+        // The system call goes with the ring. A non-empty missed title is exactly the
+        // "rang out / cancelled before answer" case; everything else is a local end.
+        self.end_system_call(
+            ring_id,
+            if missed_title.is_empty() {
+                crate::telecom::cause::LOCAL
+            } else {
+                crate::telecom::cause::MISSED
+            },
+        );
+        notifier::cancel_call(ring_id, missed_title);
+        // The *bookkeeping* stays guarded: a stale handle must not wipe the record of a
+        // ring that really is showing, which is what `ring_active` reads to keep the
+        // in-app ringtone and the native one from sounding at once.
         let mut ring = self.ring.lock().unwrap();
         if ring.as_deref() == Some(ring_id) {
             *ring = None;
-            notifier::cancel_call(ring_id, missed_title);
         }
     }
 

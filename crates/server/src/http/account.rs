@@ -258,8 +258,17 @@ pub(crate) async fn delete_account(
     // the account mailbox, its device mailboxes (from the latest published roster),
     // and each claimed alias whose directory record carries the same signing key.
     let mut mailboxes = vec![req.hash.clone()];
+    // Every device's message mailbox AND its call-control mailbox: the latter has its own
+    // directory record (keyed by the call-control key), so deleting the account must take
+    // it down too — the primary's included.
+    if let Some(mb) = protocol_types::call_mailbox_hash(&req.hash, kt_log::PRIMARY_DEVICE_ID) {
+        mailboxes.push(mb.as_str().to_string());
+    }
     if let Some(roster) = inner.kt.latest_roster_for(&req.hash) {
         for d in &roster.devices {
+            if let Some(mb) = protocol_types::call_mailbox_hash(&req.hash, &d.device_id) {
+                mailboxes.push(mb.as_str().to_string());
+            }
             if d.device_id == kt_log::PRIMARY_DEVICE_ID {
                 continue;
             }
@@ -283,12 +292,14 @@ pub(crate) async fn delete_account(
         store,
         live,
         push,
+        call_keys,
         db,
         ..
     } = &mut *inner;
     for mb in &mailboxes {
         directory.remove(mb);
         push.remove(mb);
+        call_keys.remove(mb);
         store.purge(mb);
         // Live sockets get the terminal frame first (so a connected device lands on
         // its lockout screen instead of a silent reconnect loop), then the channel
@@ -303,6 +314,7 @@ pub(crate) async fn delete_account(
         if let Some(db) = db {
             let _ = db.delete_directory(mb);
             let _ = db.delete_push(mb);
+            let _ = db.delete_call_key(mb);
             let _ = db.delete_messages_for(mb);
         }
     }

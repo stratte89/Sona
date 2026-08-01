@@ -56,6 +56,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.DisplayMetrics
 
 object MediaBridge {
@@ -495,6 +496,11 @@ object MediaBridge {
   fun startVoiceMic(activity: Activity) {
     voiceWanted = true
     voiceCtx = activity.applicationContext
+    // Before anything else, and from here specifically: this is the one call-audio entry
+    // point that always has an `Activity`, so the app is in the foreground and the service
+    // is allowed to take while-in-use microphone access with it. Started anywhere in the
+    // background it would get none, and the mic would die on the next screen lock.
+    CallAudioService.start(activity)
     ui {
       if (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
         != PackageManager.PERMISSION_GRANTED
@@ -510,6 +516,10 @@ object MediaBridge {
       }
       ensureVoiceMic(0)
       beginRouteSession(activity)
+      // Arm proximity for the route this call actually starts on. `applyRoute` keeps it
+      // honest from here — it fires on every later change, including the automatic ones
+      // (a headset arriving or leaving), so this only has to get the opening state right.
+      CallAudioService.setProximityActive(!isSpeakerphoneOn(activity))
     }
   }
 
@@ -609,6 +619,10 @@ object MediaBridge {
     voiceWanted = false
     micPromptShown = false
     voiceCtx = null
+    // The hold and the proximity lock both end with the call. Stopping the service releases
+    // the lock too (`onDestroy`), so a crash between here and there cannot leave the screen
+    // blanked.
+    CallAudioService.stop(activity.applicationContext)
     ui {
       val am = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
       releaseVoiceMic()
@@ -731,6 +745,28 @@ object MediaBridge {
   // JNI thread (AudioManager is thread-safe) so read-backs see the new route.
 
   @Volatile private var chosenRoute: String? = null
+
+  // SONA-TELECOM — Core-Telecom owns route selection while a Telecom call is up
+  // (internal/CALL_PLAN.md §7.4). This bridge keeps capture/playout and the platform AEC/NS; it
+  // must NOT also drive setCommunicationDevice / SCO, or the two fight and the audio ends
+  // up wherever the last writer put it. When Telecom owns the route, route requests are
+  // forwarded to it and the reported route is the endpoint Telecom last named.
+  @Volatile private var telecomOwnsRoute: Boolean = false
+  @Volatile private var telecomRoute: String? = null
+
+  /// Rust: a Telecom call was added (`true`) or ended (`false`).
+  @JvmStatic
+  fun setTelecomOwnsRoute(owned: Boolean) {
+    telecomOwnsRoute = owned
+    if (!owned) telecomRoute = null
+  }
+
+  /// TelecomBridge: the endpoint Telecom moved this call to.
+  @JvmStatic
+  fun onTelecomRoute(route: String) {
+    telecomRoute = route
+    routeCtx?.let { notifyRoute(it) }
+  }
   private var routeCb: AudioDeviceCallback? = null
   private var routeCtx: Context? = null
 
@@ -739,6 +775,9 @@ object MediaBridge {
       .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
 
   private fun currentRoute(am: AudioManager): String {
+    // Telecom's own answer wins whenever it has one: it is the authority, and reading
+    // AudioManager back can lag (or contradict) the endpoint it just selected.
+    telecomRoute?.let { return it }
     if (Build.VERSION.SDK_INT >= 31) {
       return when (am.communicationDevice?.type) {
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth"
@@ -778,6 +817,15 @@ object MediaBridge {
   }
 
   private fun applyRoute(am: AudioManager, route: String) {
+    // Proximity blanking belongs to the **earpiece** and nothing else: that is the route
+    // where the phone is against a face. On speaker or a headset the user is looking at the
+    // screen, and blanking it because a hand passed the sensor would be a fault of its own.
+    // Set before the Telecom bail-out below, because the route is the user's either way.
+    CallAudioService.setProximityActive(route == "earpiece")
+    // Telecom owns the route: Rust forwards the user's pick through
+    // TelecomBridge.requestRoute, and the result comes back as an endpoint event. Doing
+    // it here as well is the fight §7.4 forbids.
+    if (telecomOwnsRoute) return
     try {
       if (Build.VERSION.SDK_INT >= 31) {
         when (route) {
@@ -848,7 +896,9 @@ object MediaBridge {
       routeCb = cb
       am.registerAudioDeviceCallback(cb, null) // main-looper callbacks
     }
-    if (chosenRoute == null && scoDevice(am) != null && currentRoute(am) != "bluetooth") {
+    if (!telecomOwnsRoute && chosenRoute == null && scoDevice(am) != null &&
+      currentRoute(am) != "bluetooth"
+    ) {
       applyRoute(am, "bluetooth")
       notifyRoute(app)
     }
@@ -960,6 +1010,151 @@ object MediaBridge {
   fun isSpeakerphoneOn(activity: Activity): Boolean {
     val am = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     return currentRoute(am) == "speaker"
+  }
+}
+
+/**
+ * Foreground service that keeps the **microphone** alive for the duration of a call.
+ *
+ * Android's while-in-use rule: a foreground service started while the app is in the
+ * background never gets mic, camera or location, whatever type it declares. `CallRingService`
+ * is started from a push wake, so it is always background-started, and the system says so:
+ *
+ * ```
+ * W ActivityManager: Foreground service started from background can not have
+ * location/camera/microphone access: service app.sona.messenger/.CallRingService
+ * ```
+ *
+ * So the mic worked only while the UI was on screen and was revoked the moment the phone was
+ * locked — the far end stopped hearing us while we went on hearing them, and the call then
+ * fell into reconnect. Measured 2026-08-01 from the caller's log: connected, then 40 s later
+ * `ending local call state (DeclinedHere) — holds: … reconnect=true`.
+ *
+ * This service exists to be started from [MediaBridge.startVoiceMic], which always runs with
+ * an `Activity` and therefore in the foreground. Started there, it holds while-in-use mic
+ * access for as long as it lives — across the screen locking, which is the whole point.
+ *
+ * It also owns the **proximity** lock, because the two have exactly the same lifetime: a
+ * voice call that is using the earpiece. `PROXIMITY_SCREEN_OFF_WAKE_LOCK` blanks the screen
+ * when the phone is at the ear, so a cheek cannot press anything. Released whenever audio
+ * leaves the earpiece (speakerphone, headset) and when the call ends.
+ */
+class CallAudioService : Service() {
+  companion object {
+    private const val CHANNEL = "sona-call-audio"
+    private const val NOTE_ID = 4408
+
+    @Volatile private var live: CallAudioService? = null
+
+    /** Start (or keep) the call-audio hold. **Must** be called from the foreground. */
+    fun start(activity: Activity) {
+      val i = Intent(activity, CallAudioService::class.java)
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(i)
+        else activity.startService(i)
+      } catch (_: Throwable) {
+        // Refused (the app was backgrounded in the meantime): the call still runs, it just
+        // loses the mic on lock — the state this fixes, not a new failure.
+      }
+    }
+
+    fun stop(ctx: Context) {
+      try {
+        ctx.stopService(Intent(ctx, CallAudioService::class.java))
+      } catch (_: Throwable) {
+      }
+    }
+
+    /** Earpiece → blank the screen near the ear. Speaker/headset → never. */
+    fun setProximityActive(on: Boolean) {
+      live?.applyProximity(on)
+    }
+  }
+
+  private var proximity: PowerManager.WakeLock? = null
+
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  /// Held only while the earpiece is the route. Acquiring it on speakerphone would blank the
+  /// screen whenever anything passed the sensor — a pocket, a hand — during a call the user
+  /// is looking at.
+  private fun applyProximity(on: Boolean) {
+    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+    if (on) {
+      if (proximity?.isHeld == true) return
+      if (!pm.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) return
+      try {
+        @Suppress("DEPRECATION")
+        val lock = pm.newWakeLock(
+          PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "sona:call-proximity"
+        )
+        lock.setReferenceCounted(false)
+        lock.acquire()
+        proximity = lock
+      } catch (_: Throwable) {
+      }
+    } else {
+      try {
+        proximity?.let { if (it.isHeld) it.release() }
+      } catch (_: Throwable) {
+      }
+      proximity = null
+    }
+  }
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    live = this
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val nm = getSystemService(NotificationManager::class.java)
+      if (nm?.getNotificationChannel(CHANNEL) == null) {
+        nm?.createNotificationChannel(
+          // MIN: the call itself is already announced by Telecom and the in-call UI. This
+          // notification exists because a foreground service must have one, not to be read.
+          NotificationChannel(CHANNEL, "Call audio", NotificationManager.IMPORTANCE_MIN)
+            .apply { setShowBadge(false) }
+        )
+      }
+    }
+    val note: Notification =
+      (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+        Notification.Builder(this, CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this))
+        .setContentTitle("Sona call")
+        .setSmallIcon(R.drawable.ic_stat_sona)
+        .setOngoing(true)
+        .setVisibility(Notification.VISIBILITY_PRIVATE)
+        .build()
+    try {
+      if (Build.VERSION.SDK_INT >= 34) {
+        startForeground(
+          NOTE_ID, note,
+          android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+        )
+      } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        startForeground(
+          NOTE_ID, note, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        )
+      } else {
+        startForeground(NOTE_ID, note)
+      }
+    } catch (_: Throwable) {
+      // The five-second `startForegroundService` deadline is cancelled by stopping, and a
+      // refused hold must not cost the call.
+      stopSelf()
+      return START_NOT_STICKY
+    }
+    // START_STICKY would resurrect this with no call behind it after a process death.
+    return START_NOT_STICKY
+  }
+
+  override fun onDestroy() {
+    applyProximity(false)
+    if (live === this) live = null
+    try {
+      stopForeground(STOP_FOREGROUND_REMOVE)
+    } catch (_: Throwable) {
+    }
+    super.onDestroy()
   }
 }
 

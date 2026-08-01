@@ -14,6 +14,7 @@ pub(crate) fn emit_conn(alias: &Option<String>, up: bool) {
 /// what keeps linked devices' history convergent. Best-effort per envelope: a failed
 /// post stays queued for the next pass.
 pub(crate) async fn drain_outbox(inner: &Arc<Mutex<Session>>, client: &Arc<Client>) {
+    drain_call_outbox(inner, client).await;
     let due = {
         let s = inner.lock().await;
         s.history.outbox_due(now_secs())
@@ -45,6 +46,10 @@ pub(crate) fn spawn_reaper(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     eng().spawn(async move {
+        // The call-control store's periodic sweep rides this loop rather than owning a
+        // task of its own: it needs the same session lock and the same lifetime, and it
+        // runs orders of magnitude less often than the reaper tick.
+        let mut next_call_cleanup = now_secs();
         loop {
             let (removed, chats) = {
                 let mut s = inner.lock().await;
@@ -52,6 +57,10 @@ pub(crate) fn spawn_reaper(
                     let (n, chats) = s.history.reap_with_chats(now_secs());
                     if n > 0 {
                         let _ = s.persist();
+                    }
+                    if now_secs() >= next_call_cleanup {
+                        next_call_cleanup = now_secs().saturating_add(CALL_CLEANUP_TICK_SECS);
+                        cleanup_call_store(&mut s);
                     }
                     (n, chats)
                 } else {
@@ -216,6 +225,10 @@ pub(crate) async fn verify_revoked_claim(
         }
         Ok(RevocationCheck::Revoked) => {
             s.history.set_revoked(true);
+            // The account no longer recognizes this device: its call-control identity is
+            // dead too (the relay drops the shelf on revocation, and no peer would verify
+            // a binding for a device that is off the roster).
+            wipe_call_identity(&mut s);
             let _ = s.persist();
             RevokedVerdict::Revoked
         }
@@ -413,7 +426,9 @@ pub(crate) fn spawn_delivery_loop(
                                 let _ = s.persist(); // ratchet advanced during decrypt
                                 ack_id = Some(ack_msg_id);
                                 false
-                            } else if let Some(uname) = match &event {
+                            } else if let Some(uname) = event
+                                .attribution_claim()
+                                .and_then(|(sender_identity_key, sender_username)| {
                                 // Attribution self-heal: content from an unattributed
                                 // device key claiming a name we know would be silently
                                 // dropped by the request gate's spoof rule — but it may
@@ -422,24 +437,12 @@ pub(crate) fn spawn_delivery_loop(
                                 // and re-resolve the claimed account's roster
                                 // (KT-verified); replay happens on success. The frame is
                                 // acked — we own delivery of the quarantined copy now.
-                                InboundEvent::Message {
-                                    sender_identity_key,
-                                    sender_username,
-                                    ..
-                                }
-                                | InboundEvent::Attachment {
-                                    sender_identity_key,
-                                    sender_username,
-                                    ..
-                                }
-                                | InboundEvent::Knock {
-                                    sender_identity_key,
-                                    sender_username,
-                                } => s
-                                    .history
-                                    .device_resolution_candidate(sender_identity_key, sender_username),
-                                _ => None,
-                            } {
+                                    s.history.device_resolution_candidate(
+                                        sender_identity_key,
+                                        sender_username,
+                                    )
+                                })
+                            {
                                 let q = s.pending_attr.entry(uname.clone()).or_default();
                                 if q.len() < PENDING_ATTR_CAP {
                                     q.push(event.clone());
@@ -458,29 +461,19 @@ pub(crate) fn spawn_delivery_loop(
                                 // this device is already in), and answers/hangups only
                                 // touch existing call state.
                                 let ring_ok = match &event {
-                                    InboundEvent::CallOffered {
+                                    InboundEvent::CallOfferedV2 {
                                         sender_identity_key,
                                         sender_username,
-                                        reconnect_of,
+                                        resume_of,
                                         ..
-                                    } if reconnect_of.is_empty() => s.history.screen_call_offer(
+                                    } if resume_of.is_empty() => s.history.screen_call_offer(
                                         sender_identity_key,
                                         sender_username,
                                         now_secs(),
                                     ),
                                     _ => true,
                                 };
-                                if ring_ok
-                                    && matches!(
-                                        event,
-                                        InboundEvent::CallOffered { .. }
-                                            | InboundEvent::CallAnswered { .. }
-                                            | InboundEvent::CallEnded { .. }
-                                            | InboundEvent::GroupCallOffered { .. }
-                                            | InboundEvent::GroupCallEnded { .. }
-                                            | InboundEvent::SelfCallHandled { .. }
-                                    )
-                                {
+                                if ring_ok && event.is_call_signal() {
                                     call_sig = Some(event.clone());
                                 }
                                 if let InboundEvent::SyncRequested {
@@ -529,7 +522,7 @@ pub(crate) fn spawn_delivery_loop(
                                 ))
                                 .is_err()
                                 {
-                                    eprintln!(
+                                    crate::diag!(
                                         "client: history.apply panicked on an inbound event; dropping it"
                                     );
                                 }
@@ -571,7 +564,7 @@ pub(crate) fn spawn_delivery_loop(
                                             &me,
                                         )
                                     } else {
-                                        eprintln!(
+                                        crate::diag!(
                                             "client: inbound message dropped by apply(); notification suppressed"
                                         );
                                         None
@@ -740,7 +733,7 @@ pub(crate) fn spawn_delivery_loop(
                             // happened but never who from.
                             if ack_msg_id.is_some() {
                                 undecryptable = true;
-                                eprintln!(
+                                crate::diag!(
                                     "client: inbound message could not be decrypted — dropping it. \
                                      A contact's secure session is likely desynced; reset it from \
                                      that chat's settings."

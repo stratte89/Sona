@@ -45,6 +45,8 @@ All base64 is standard alphabet, **no padding** (matches vodozemac).
 | GET | `/gif/search?q=&pos=` | — | GIF search via the relay privacy proxy (`GIPHY_API_KEY` set): `{ results: [{url, preview, width, height}], next }`. The provider sees only the relay, never the client |
 | GET | `/gif/trending?pos=` | — | Trending GIFs through the same proxy (relay-side cached) |
 | GET | `/gif/proxy?url=` | — | Fetch GIF bytes through the relay (strict `*.giphy.com` https allowlist, ≤10 MiB). The client re-sends the GIF as a normal E2E attachment, so the recipient never contacts the provider |
+| POST | `/callkey` | signed publication | Publish this device's **call-control key** (§ Locked call delivery): challenge-signed by the same device key the directory holds for that mailbox, refuses a future-dated or non-superseding binding, and gives the device's call-control mailbox its own directory record |
+| GET | `/callkey/{mailbox}` | — | Fetch a device's published call-control key binding — public and self-authenticating, like a prekey bundle |
 | POST | `/kt/roster` | `KtRosterEntry` | Append a device-roster epoch to the KT log (account-signed, validated fail-closed; see `MULTI_DEVICE.md`) |
 | GET | `/kt/roster/{hash}` | — | `{ roster, index, proof_b64, sth }` — latest device roster + inclusion proof; 404 = single-device account |
 | POST | `/sync` | raw ciphertext bytes | Store an opaque history-sync blob (≤32 MiB, 7-day TTL) → `{ sync_id }` (capability id; see `MULTI_DEVICE.md`) |
@@ -223,23 +225,60 @@ decrypted ratchet message — never from anything the server can read.
 
 ## Voice calls (`/v1/call/{id}`)
 
-Signaling is three `ChatPayload` variants inside the normal ratchet channel — the relay
-never sees them:
+Signaling is a family of `ChatPayload` variants inside the normal ratchet channel — the
+relay never sees them. There is **no v1 compatibility branch**; the old
+`CallOffer`/`CallAnswer`/`CallEnd`/`SelfCallHandled` names are deleted and explicitly
+rejected.
 
-* `CallOffer { call_id, key_b64, ts, from }` — `call_id` is 128 random bits (hex), the
-  capability to join the relay room; `key_b64` is a random 32-byte call key.
-* `CallAnswer { call_id, accept }` — accept/decline (busy and blocked auto-decline).
-* `CallEnd { call_id }` — hangup/cancel (also sent on 45 s ring timeout).
+Four identifiers, none of which may double as another's capability:
 
-**Silent resume after a drop.** `CallOffer` also carries `reconnect_of` (`serde
-default`, empty = normal ring). A connected call whose media leg dies without a
-`CallEnd` (a deliberate hangup's `CallEnd` lands within a 2 s grace) is a network
-drop: the pair's owner (lexicographically smaller identity key) mints a **fresh** room
-+ key — a call key is never reused — and sends the offer with `reconnect_of` naming
-the dropped call. The peer's in-call device auto-accepts silently; every other
-recipient ignores it (a reconnect never rings and is never declined, so it leaks
-nothing). Both sides give the resume 15 s, then end the call visibly. Old clients
-ignore the unknown field and simply ring — degraded, not broken.
+| Id | Names | Lifetime |
+|---|---|---|
+| `call_instance_id` | one logical call, across every recipient device and retry | the call |
+| `offer_id` | one encrypted offer (a group ring uses its `ring_id` instead) | the offer |
+| `claim_nonce` | one device's answer attempt | the attempt |
+| `call_id` | the relay media room — a capability, never a correlation id | one room |
+
+* `CallOfferV2 { call_instance_id, offer_id, call_id, key_b64, created_at,
+  ring_expires_at, expires_at, from, caller_device_id, reply_to_mailbox, caps,
+  resume_of }` — `call_id` is 128 random bits (hex), the capability to join the relay
+  room; `key_b64` is a random 32-byte call key. `reply_to_mailbox` is the caller's exact
+  device mailbox, validated against the sender's KT-verified roster entry, so replies go
+  to the device that rang rather than to the account.
+* `CallAnswerClaimV2 { …, claim_nonce, answering_device_id, reply_to_mailbox, caps }` —
+  an *attempt*, not an answer. Sending it starts no media.
+* `CallWinnerV2 { …, claim_nonce, winner_device_id }` — the caller is the authority: the
+  first valid claim wins, and only the named device+nonce may join the room. Every other
+  device gets a terminal control instead.
+* `CallBusyV2 { …, device_id }` — one occupied device, reported without cancelling its
+  siblings' rings.
+* `CallTerminalV2 { …, reason, from, actor_device_id }` — the final outcome, named:
+  `answered_here`, `answered_elsewhere`, `declined_here`, `declined_elsewhere`,
+  `caller_cancelled`, `expired`, `busy`, `transport_error`.
+
+**Ordering is not assumed.** A terminal control that arrives *before* the offer it ends
+writes a bounded tombstone; the late offer is then acknowledged and never rings. State is
+monotonic and every transition idempotent, so duplicates, retries and reordering
+converge instead of producing a second ring or extending a deadline.
+
+**Expiry is explicit at every layer.** Offers, claims, winners and terminals all carry an
+absolute deadline, and the envelope carries a call-scale TTL rather than the relay's
+generic 30-day default (45 s ring, 60 s signal TTL, one shared constant). A duplicate
+never extends the original deadline, and a peer cannot ring longer by claiming a
+far-future one.
+
+**Wake classes.** Fresh offers are a ring wake; winners, cancellations and every terminal
+control are an **urgent silent** wake — a sleeping phone must wake to *stop* ringing, not
+only to start. Resume offers and stale controls never ring.
+
+**Silent resume after a drop.** `CallOfferV2` carries `resume_of` (empty = normal ring).
+A connected call whose media leg dies without a terminal (a deliberate hangup's terminal
+lands within a 2 s grace) is a network drop: the pair's owner (lexicographically smaller
+identity key) mints a **fresh** room + key — a call key is never reused — and sends the
+offer with `resume_of` naming the dropped call. The peer's in-call device resumes
+silently; every other recipient ignores it (a reconnect never rings and is never
+declined, so it leaks nothing). Both sides give the resume 15 s, then end the call
+visibly.
 
 Media: each side opens `GET /v1/call/{call_id}` (WebSocket, **no authentication** — the
 random id is the capability, so the relay cannot link the room to identities). The room
@@ -260,6 +299,44 @@ wire  = seq(8, BE) || XChaCha20-Poly1305(key = HKDF(call_key, direction-label),
 Direction labels: `sona-call-v1 caller->callee` / `callee->caller`. Keys exist only in
 call memory; a new call mints a new id and key.
 
+## Locked call delivery (the call-control layer)
+
+A phone whose Sona vault is locked cannot decrypt a `CallOfferV2` — the ratchet lives in
+the vault — so on Android an incoming call is delivered on **two concurrent layers**. The
+encrypted offer above carries the media capability and is the only layer that can produce
+an answerable ring. Beside it rides a minimal **capsule**, and it exists so a locked or
+sleeping phone can ring, stop ringing, and decline.
+
+* **Call-control identity.** Each device mints an X25519 half (opens capsules) and an
+  Ed25519 half (signs the relay's mailbox challenge, so a locked device can authenticate
+  a subscription at all). The secret is sealed under a key derived from the **device
+  key** — not the vault seal key — which is exactly what lets it open while the vault is
+  shut, and it is useless off-device (the device key is OS-keyring/Keystore-held). It is
+  not a ratchet identity and signs nothing else.
+* **Binding.** `CallKeyBinding` is signed by the device's own roster Ed25519 key over
+  (username hash, device id, call key, created_at) and verified against the KT-verified
+  roster, so no new authority exists and revocation is free: a device off the roster has
+  no verifiable binding. `supersedes` makes publication monotonic.
+* **Mailbox.** `call_mailbox_hash(username_hash, device_id)` is deliberately distinct
+  from every message mailbox, **including the primary's** — the mailbox a call-only key
+  can drain must never be the one carrying chat ciphertext.
+* **Capsule.** `PayloadKind::CallCapsule`, sealed to that key (ephemeral-sender X25519 +
+  HKDF + XChaCha20-Poly1305, sender-anonymous on the wire). It carries version and kind
+  (offer/terminal), the `call_instance_id`, the id its ring is keyed under (`offer_id`,
+  or a group's `ring_id`), a random single-use `ring_handle`, the caller's verification
+  material, the destination device id, audio/video/group flags, absolute
+  created/ring/expiry values, the exact reply mailbox, a terminal reason, an anti-replay
+  nonce, and the caller device's signature over every one of those fields.
+  It carries **no** room id, media key, message content, or reusable capability — a
+  capsule cannot answer a call, only present or cancel one.
+* **Screening.** While locked, signing keys come from a keyed-hash approved-caller index
+  (HKDF over the call-only store key) rather than from the vault. Absent = refused, so a
+  blocked or unknown caller cannot ring a locked phone; it still rings normally after
+  unlock, which is the safe direction.
+* **Convergence.** Both layers name the same registry record, so a device that receives
+  both rings **once** — the encrypted offer adopts the capsule's presentation handle. A
+  terminal capsule writes the tombstone that stops a late offer from ringing.
+
 ## Group calls (mesh of pair rooms)
 
 A group call is a **full mesh of the 1:1 rooms above** — nothing new exists on the
@@ -269,12 +346,25 @@ groups at 8 for calls).
 
 Signaling, inside each pair's ratchet session:
 
-* `GroupCallOffer { group_id, call_instance, call_id, key_b64, ts, from }` — one **pair
-  leg's** ticket. `call_instance` (128 random bits, hex) names the call across all
-  participants; `call_id`/`key_b64` are a fresh 1:1-style room capability + key for this
-  pair only. Receiving any offer for an instance also means *the sender is in that call*.
-* `GroupCallEnd { group_id, call_instance }` — decline / leave / cancel, indistinguishable
-  on the wire by design.
+* `GroupCallOfferV2 { group_id, call_instance_id, ring_id, offer_id, call_id, key_b64,
+  created_at, ring_expires_at, expires_at, from, caller_device_id, coordinator_*,
+  resume }` — one **pair leg's** ticket. `call_instance_id` names the call across all
+  participants; `ring_id` names one logical *ring* (every participant's offer for the
+  same ring carries it, which is what makes one ring out of many offers);
+  `call_id`/`key_b64` are a fresh 1:1-style room capability + key for this pair only.
+  Receiving any offer for an instance also means *the sender is in that call*.
+* `GroupCallAnswerClaimV2` / `GroupCallWinnerV2` — the same arbitration as 1:1, with the
+  **originating device as the stable coordinator**: each recipient account's devices
+  claim, the coordinator names one winner per account, and only that device may emit or
+  join pair legs. An answer on one phone therefore cannot leave a sibling in the mesh.
+* `GroupCallTerminalV2 { …, reason, actor_device_id, coordinator_* }` — decline / leave /
+  cancel. A **coordinator** terminal ends the logical call for everyone; anyone else's
+  removes only their own pair leg.
+
+Deadlines, tombstones, idempotency, wake classes and TTLs are the 1:1 rules verbatim —
+initial offers from every participant reuse the starter's absolute deadline, so a slow
+member cannot extend the ring, and a `resume` offer for an already-active member is an
+urgent silent control that never rings.
 
 Joining (starter and accepter run the same procedure): mint one fresh ticket per other
 roster member and send each member their offer (multi-device: fan copies of the same
@@ -287,7 +377,7 @@ pair converges on exactly one two-member room with zero extra round trips.
 Security is the 1:1 call's, inherited per pair: per-direction HKDF keys, AEAD-bound
 strictly-increasing sequence numbers, constant-size CBR frames. There is **no shared
 group key** — a member removed from (or declining) a call simply never receives new pair
-tickets, and each leg's keys die with the call. Recipients honor a `GroupCallOffer` only
+tickets, and each leg's keys die with the call. Recipients honor a `GroupCallOfferV2` only
 from a ratchet-authenticated sender on the (locally stored) group roster; anyone else's
 offer is discarded unanswered. Latency is one relay hop, identical to a 1:1 call; audio
 is Opus-encoded once per 20 ms and sealed per leg; inbound legs are decoded per sender
@@ -296,8 +386,8 @@ and mixed client-side (i32 sum, saturating).
 **Key hygiene / drop recovery.** A pair-room key is used **once, ever**: clients track
 every joined room id per call and refuse to re-derive a consumed key (re-deriving would
 restart the seal counter — nonce reuse — and a malicious relay could trigger it by
-replaying an old offer). A leg that dies *without* a `GroupCallEnd` is a network drop,
-not a leave: after a short grace period (2 s, so a genuine leave's `GroupCallEnd` can
+replaying an old offer). A leg that dies *without* a `GroupCallTerminalV2` is a network
+drop, not a leave: after a short grace period (2 s, so a genuine leave's terminal can
 land) the pair's **owner** mints a fresh ticket, re-offers, and both sides converge on
 the new room — at most 3 automatic re-offers per member, reset when a leg connects.
 Deliberate leavers are never re-offered; a leaver's own fresh offer marks a rejoin.
@@ -309,8 +399,7 @@ blind call room — no second room, no new endpoints, and voice keeps the exact 
 format above.
 
 **Negotiation (three-way, degrade-to-voice):**
-* `CallOffer`/`CallAnswer` gain `caps: ["media2", …]` (`serde(default)` — absent from
-  old clients, ignored by them as an unknown field).
+* `CallOfferV2`/`CallAnswerClaimV2` carry `caps: ["media2", …]`.
 * The relay's `joined` message gains `"media": 2`. Old relays close connections on
   video-sized frames, so clients enable video tracks only when **both** the peer's caps
   and the relay's media level say v2. Anything less runs a plain voice call.
@@ -399,6 +488,23 @@ is transport armor only — media above it is end-to-end encrypted regardless.
   delays only its own frame and the H.264 reference chain never breaks.
 * *Bridging*: toward a WS member each cell becomes its own binary frame; toward a
   QUIC member the relay applies the same datagram/stream policy by first wire byte.
+
+**Isolation is part of the mapping, not an implementation detail.** Splitting the two
+classes across datagrams and streams buys nothing unless every party — sender, relay,
+receiver — also *drains* them independently. A reliable group is only complete when its
+last byte lands, which on a lossy or congested link is a retransmit away; any place that
+waits for that in the same task as voice has re-created head-of-line blocking above the
+transport that was chosen to avoid it. Both ends had exactly that bug, and the symptom was
+not "video is slow" but "the whole call breaks up while someone shares": voice stopped
+being captured, sent, forwarded and decoded for as long as one video frame took to arrive.
+Two rules follow, and both are load-bearing:
+
+* **Never await a reliable send or read on the voice path.** Outbound video belongs to its
+  own task; a relay must read datagrams in a task that no stream read can park.
+* **Drain stream groups in order, one at a time.** Frames must reach a decoder in encode
+  order — a small P-frame overtaking a large keyframe breaks the reference chain, and the
+  recovery (another keyframe) is larger still. Order costs nothing here, because a stream
+  read can only ever delay *later video*, never voice.
 
 Abuse bounds match the WS leg: same per-frame cap, same per-connection byte budget,
 join must arrive within 5 s, stream groups are capped at 300 KiB.

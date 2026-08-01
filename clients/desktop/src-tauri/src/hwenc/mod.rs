@@ -48,10 +48,27 @@ const READY: u8 = 1;
 const OFF: u8 = 2;
 static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 
+/// The last thing that went wrong, for the diagnostic in the call's gear panel.
+///
+/// Without this, the panel could say "software" and nothing else, which is the least
+/// useful true statement available: it cannot distinguish a machine with no encoder from a
+/// driver that refused one from a backend that has simply not been asked yet. Debugging
+/// "hardware encoding isn't happening" then means guessing, which is how a Windows MFT
+/// that was failing at its very first call went unnoticed (see
+/// [`mediafoundation::unlock_async`]).
+static WHY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn note(why: &str) {
+    if let Ok(mut slot) = WHY.lock() {
+        *slot = Some(why.to_string());
+    }
+}
+
 /// Give up on hardware encoding for the rest of the process.
 fn disable(why: &str) {
+    note(why);
     if STATE.swap(OFF, Ordering::SeqCst) != OFF {
-        eprintln!("[media] hardware H.264 unavailable ({why}) — using software encode");
+        crate::diag!("[media] hardware H.264 unavailable ({why}) — using software encode");
     }
 }
 
@@ -94,53 +111,99 @@ pub fn factory() -> EncoderFactory {
         if STATE.load(Ordering::SeqCst) == OFF {
             return None; // engine falls back to software
         }
-        let mut enc = match open(content) {
-            Ok(e) => e,
-            Err(OpenFailure::Permanent(e)) => {
-                disable(&e);
-                return None;
+        // A machine can have more than one hardware encoder, and the first one is not
+        // necessarily the good one. The case that forced this: an RTX 3080 behind an
+        // Intel UHD iGPU on a five-year-old driver, where Media Foundation is free to
+        // offer the Intel encoder first. Failing the probe on candidate 0 used to write
+        // hardware encoding off for the process, so the best encoder in the machine was
+        // never asked. Each candidate now gets its own probe, and only running out of
+        // them means this machine cannot do it.
+        for skip in 0..MAX_BACKENDS {
+            let mut enc = match open(content, skip) {
+                Ok(e) => e,
+                Err(OpenFailure::Permanent(e)) => {
+                    // Out of candidates (or none to begin with): that is the machine's
+                    // answer, not this attempt's.
+                    disable(&e);
+                    return None;
+                }
+                Err(OpenFailure::Transient(e)) => {
+                    note(&e);
+                    crate::diag!("[media] hardware H.264 unavailable for this track ({e})");
+                    return None; // engine falls back to software for this leg only
+                }
+            };
+            if STATE.load(Ordering::SeqCst) != UNKNOWN {
+                return Some(enc); // already proven; no probe, no search
             }
-            Err(OpenFailure::Transient(e)) => {
-                eprintln!("[media] hardware H.264 unavailable for this track ({e})");
-                return None; // engine falls back to software for this leg only
-            }
-        };
-        if STATE.load(Ordering::SeqCst) == UNKNOWN {
             // First one ever: make it prove itself before a call depends on it. The
             // encoder that is about to be handed out is the one probed, rather than a
             // second one opened alongside it — a spare session is exactly what a machine
             // at its session limit does not have, and proving a *different* encoder works
             // would not be proving this one does.
-            match probe(enc.as_mut()) {
+            match probe(enc.as_mut(), content) {
                 Ok(()) => {
                     STATE.store(READY, Ordering::SeqCst);
-                    eprintln!("[media] hardware H.264 encode active");
+                    crate::diag!("[media] hardware H.264 encode active");
+                    return Some(enc);
                 }
                 Err(e) => {
-                    disable(&e);
-                    return None;
+                    // This encoder, not this machine. Say which one failed and why, then
+                    // let the next backend try; `enc` is dropped here, so its session is
+                    // released before the replacement asks for one.
+                    note(&e);
+                    crate::diag!("[media] hardware H.264 candidate {skip} rejected ({e})");
                 }
             }
         }
-        Some(enc)
+        disable("no hardware encoder passed the probe");
+        None
     })
 }
 
-/// Build a backend encoder for this platform.
+/// How many hardware encoders to try before concluding the machine has none that work.
+/// Four covers every plausible desktop: an iGPU, a discrete card, and room to spare.
+const MAX_BACKENDS: usize = 4;
+
+/// The size a backend opens a leg at, and therefore the only size worth proving it can
+/// encode. Both backends configure themselves from this and [`probe`] uses it too — the
+/// three agreeing is the whole point of it being one function.
+///
+/// It used to be that the probe made up its own small frame (320x240) while the backends
+/// opened at full size. That looked harmless and cost us the entire Windows hardware path:
+/// a hardware encoder MFT is free to reject a resolution, several reject small ones, and
+/// his did — `SetOutputType` answered `0x80004005` for 320x240 on a GPU that encodes 1080p
+/// perfectly well. The probe then condemned the backend for the life of the process over a
+/// frame size no call would ever ask it for. Prove the real thing or prove nothing.
+pub(super) fn open_dims(content: video::Content) -> (u32, u32) {
+    match content {
+        video::Content::Camera => (640, 480),
+        video::Content::Screen => (1920, 1080),
+    }
+}
+
+/// Build a backend encoder for this platform, skipping the first `skip` candidates.
+///
+/// `Permanent` for a `skip` past the end means "no more to try", which is what ends the
+/// search in [`factory`].
 #[cfg(target_os = "windows")]
-fn open(content: video::Content) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
-    mediafoundation::Encoder::open(content)
+fn open(content: video::Content, skip: usize) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
+    mediafoundation::Encoder::open(content, skip)
         .map(|e| Box::new(e) as Box<dyn video::H264Encode>)
         .map_err(OpenFailure::Permanent)
 }
 
+/// NVENC is one vendor's driver, not an enumeration: there is exactly one candidate.
 #[cfg(target_os = "linux")]
-fn open(content: video::Content) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
+fn open(content: video::Content, skip: usize) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
+    if skip > 0 {
+        return Err(OpenFailure::Permanent("no other NVENC device".into()));
+    }
     nvenc::open(content)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn open(_content: video::Content) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
+fn open(_content: video::Content, _skip: usize) -> Result<Box<dyn video::H264Encode>, OpenFailure> {
     Err(OpenFailure::Permanent(
         "no hardware encode backend on this platform".into(),
     ))
@@ -153,27 +216,39 @@ fn open(_content: video::Content) -> Result<Box<dyn video::H264Encode>, OpenFail
 /// that and then feed the peer's decoder garbage for the whole call. What has to be true
 /// is that the very first frame is a keyframe a decoder could start from, so that is
 /// what gets checked — and checked with our own decoder, the same one the peer will use.
-fn probe(enc: &mut dyn video::H264Encode) -> Result<(), String> {
-    const W: usize = 320;
-    const H: usize = 240;
+///
+/// Probed at [`open_dims`], the size this leg is actually configured for, so the answer is
+/// about the encoder a call will use rather than about some other resolution.
+fn probe(enc: &mut dyn video::H264Encode, content: video::Content) -> Result<(), String> {
+    /// Attempts at 5 ms apart — a fifth of a second in the worst case, once per process.
+    const ATTEMPTS: usize = 40;
+    let (dw, dh) = open_dims(content);
+    let (w, h) = (dw as usize, dh as usize);
     let mut dec = video::Decoder::new().map_err(|e| format!("probe decoder: {e}"))?;
     // Gradient, not flat grey: a uniform frame compresses to almost nothing and would
     // not exercise the encoder's output path in any representative way.
-    let mut i420 = vec![128u8; W * H * 3 / 2];
-    for y in 0..H {
-        for x in 0..W {
-            i420[y * W + x] = ((x * 7 + y * 3) % 255) as u8;
+    let mut i420 = vec![128u8; w * h * 3 / 2];
+    for y in 0..h {
+        for x in 0..w {
+            i420[y * w + x] = ((x * 7 + y * 3) % 255) as u8;
         }
     }
     let frame = video::Frame {
-        width: W,
-        height: H,
+        width: w,
+        height: h,
         i420,
     };
     enc.force_keyframe();
-    // A hardware MFT may want a few frames before it emits anything; that is normal
+    // A hardware encoder may want a few frames before it emits anything; that is normal
     // pipelining, not failure. But it has to produce *something* promptly.
-    for _ in 0..8 {
+    //
+    // Paced, not spun. An asynchronous Media Foundation encoder is driven by events it
+    // raises on its own thread, so a tight loop can out-run it and see an empty queue every
+    // time — the encoder would be working fine and the probe would call it dead. A few
+    // milliseconds between attempts is what makes the answer about the encoder rather than
+    // about scheduling luck, and this runs once per process, before any call depends on it.
+    for _ in 0..ATTEMPTS {
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let au = enc
             .encode(&frame)
             .map_err(|e| format!("probe encode: {e}"))?;
@@ -184,9 +259,9 @@ fn probe(enc: &mut dyn video::H264Encode) -> Result<(), String> {
             return Err("encoder output is not Annex-B".into());
         }
         return match dec.decode(&au) {
-            Ok(Some(out)) if out.width == W && out.height == H => Ok(()),
+            Ok(Some(out)) if out.width == w && out.height == h => Ok(()),
             Ok(Some(out)) => Err(format!(
-                "probe decoded {}x{}, want {W}x{H}",
+                "probe decoded {}x{}, want {w}x{h}",
                 out.width, out.height
             )),
             // Parsed as H.264 but carried no picture: parameter sets without a frame
@@ -198,9 +273,26 @@ fn probe(enc: &mut dyn video::H264Encode) -> Result<(), String> {
     Err("encoder produced nothing".into())
 }
 
-/// Whether hardware encode ended up in use, for diagnostics in `call_status`.
-pub fn active() -> bool {
-    STATE.load(Ordering::SeqCst) == READY
+/// Where video encoding stands, for the diagnostic in `call_status`.
+///
+/// Three answers, not two. "Not yet" is a real and common state — nothing opens an encoder
+/// until a camera or a share actually produces a frame, so a call where only the *peer* is
+/// sharing has never asked this machine to encode anything. Reporting that as "software"
+/// was a plain misstatement, and one that sent us looking for a Linux fault that was not
+/// there while the real Windows fault hid behind the identical wording on both ends.
+pub fn status() -> (&'static str, Option<String>) {
+    (
+        state_word(STATE.load(Ordering::SeqCst)),
+        WHY.lock().ok().and_then(|w| w.clone()),
+    )
+}
+
+fn state_word(state: u8) -> &'static str {
+    match state {
+        READY => "hardware",
+        OFF => "software",
+        _ => "idle",
+    }
 }
 
 #[cfg(test)]
@@ -221,9 +313,23 @@ mod tests {
             OFF => assert!(got.is_none(), "OFF must decline"),
             _ => assert!(got.is_none(), "an unproven backend must not be handed out"),
         }
-        // Once written off, it stays written off.
+        // Once written off, it stays written off — and it says so, with a reason.
         disable("test");
         assert!(f(video::Content::Screen).is_none());
-        assert!(!active());
+        assert_eq!(status().0, "software");
+        assert_eq!(status().1.as_deref(), Some("test"));
+    }
+
+    /// Before anything has asked for an encoder, the honest answer is "idle" — not
+    /// "software". Reporting the two as one word is what hid a Windows backend that was
+    /// failing on its first call: both ends of a test call said "software", so the machine
+    /// that had never been asked to encode looked exactly like the one that had failed.
+    #[test]
+    fn nothing_encoded_yet_is_not_the_same_as_software() {
+        // `STATE` is process-global and the test above moves it, so this checks the
+        // mapping rather than the live value.
+        assert_eq!(state_word(UNKNOWN), "idle");
+        assert_eq!(state_word(READY), "hardware");
+        assert_eq!(state_word(OFF), "software");
     }
 }

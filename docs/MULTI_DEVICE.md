@@ -491,36 +491,43 @@ tests; wired into the Tauri desktop shell, which compiles):**
   to a mailbox that moves during the transfer can be lost (same window as any rotation);
   senders re-verify KT per send, so the window is one round-trip.
 
-* **Calls ring all devices** (first answer wins), with no added ring latency and no new
-  metadata class:
-  * The caller signals the KT-bound key first over the existing 1:1 path (first-ring
-    latency byte-identical to single-device), then posts *extra* copies of the same
-    `CallOffer` (same call id + key) to the rest of the contact's verified roster
-    (`extra_call_offer_envelopes`). Any roster problem — stale epoch, rollback, offline —
-    yields **no extra copies**: the per-call key is never sealed to a device outside the
-    current verified roster, and the primary keeps ringing regardless.
-  * `CallAnswer` gains a `busy` flag (serde-default, so old clients are unaffected): an
-    *automatic* decline (device already in a call / already ringing) no longer ends the
-    ring while the callee's other devices can still answer — the caller counts busy
-    declines against the number of devices rung (`ring_fanout`) and ends the ring only at
-    zero. An explicit decline (and every old-client decline) still ends it at once, and a
-    decline can never tear down a call that already connected (accept race).
-  * The answering/declining device sends `SelfCallHandled { call_id }` to its own other
-    devices so they stop ringing ("Answered on another device"); honored only from a
-    roster-verified own device, never enters history, carries no key material. It is sent
-    *after* the media join, so answering adds no latency to the connect path, and it is
-    **not** jittered — a ring is already a simultaneous, relay-visible event (the
-    answering device's call-room join happens at the same instant), so this adds no new
-    correlation signal beyond THREAT §9.3's accepted fan-out shape.
-  * Hangup/cancel and the caller-side ring timeout fan `CallEnd` to every rung device, so
-    nothing rings into the 45 s timeout. Old-client callers still ring the primary only
-    (documented degradation, unchanged).
-  * **Answer routing for linked-device callers:** the direct 1:1 answer travels to the
-    caller's *account* mailbox, which only the primary drains — so accepts/declines are
-    also fanned to the caller's other roster devices (`extra_call_answer_envelopes`),
-    and the fan skip rule exempts only the primary *when it is also the
-    directly-addressed key*. Without this, a call placed from a linked device could
-    never learn it was answered.
+* **Calls ring all devices, and exactly one of them wins.** The protocol is
+  `PROTOCOL.md` § Voice calls; what multi-device adds is the arbitration and the fan:
+  * **Concurrent fan, no primary-first lag.** Every device's `CallOfferV2` — the KT-bound
+    key's and every verified linked device's — is *prepared* (sealing advances ratchets,
+    no network) and then posted as **one concurrent batch**. Posting the primary first
+    and resolving the roster afterwards is what used to let a desktop answer before an
+    Android phone had even been offered the call, and it cost linked devices 10–15 s of
+    ring latency. Any roster problem — stale epoch, rollback, offline — yields no extra
+    copies: the per-call key is never sealed to a device outside the current verified
+    roster, and the KT-bound key keeps ringing regardless.
+  * **The caller is the answer authority.** Each device answers with a
+    `CallAnswerClaimV2` carrying its own `claim_nonce` and device id, sent *only* to the
+    caller's exact originating device mailbox. The caller's arbiter accepts the first
+    valid claim and replies `CallWinnerV2` naming that device+nonce; every sibling gets a
+    terminal control instead. **A device that sent a claim does not start media** — two
+    devices can both believe they answered otherwise. Losing claims arriving after the
+    winner are idempotent no-ops.
+  * **Terminal outcomes are named, not guessed.** Siblings stop ringing with
+    `answered_elsewhere` / `declined_elsewhere` / `caller_cancelled` / `expired` / `busy`
+    / `transport_error`, so the UI stops labelling every ending "Answered on another
+    device". A `busy` device (already in a call, already ringing) reports busy **without**
+    ending the ring its siblings can still answer.
+  * **Terminal-before-offer converges.** A terminal that overtakes its offer writes a
+    tombstone, and the late offer is acknowledged without ringing. This is the asymmetric
+    race behind "answering on Windows leaves Android ringing": the phone's offer had not
+    arrived yet when the cancellation did, and the old code discarded what it could not
+    match. Terminal controls also carry an **urgent silent wake**, so a sleeping phone
+    wakes up to *stop* ringing.
+  * **Replies are routed to the exact device.** Every offer carries the caller's
+    deterministic device mailbox, validated against the sender's KT-verified roster entry;
+    claims, busy and terminals go there and nowhere else. Without this a call placed from
+    a linked device could never learn it was answered — the answer went to the account
+    mailbox only the primary drains.
+  * **Android gets a second delivery layer.** Each device also publishes a call-control
+    key (`PROTOCOL.md` § Locked call delivery); the caller sends a minimal capsule beside
+    every offer and every terminal fan. It is what lets a locked or process-killed phone
+    ring, and — the half that matters most here — *stop* ringing when a sibling answers.
 
 **Hardening pass (post-ship bug sweep):**
 * **Multi-session ratchet** (`crypto-core::ratchet`): each peer identity key now holds up
@@ -545,8 +552,8 @@ tests; wired into the Tauri desktop shell, which compiles):**
   identity key alone (sound — the record PoP binds the id and only the key holder can
   sign one). A pending offer whose target was since revoked is dropped. The demotion
   watch never gives up while an offer is out (it slows to once a minute).
-* A late `CallAnswer` (another callee device losing the accept race) can no longer flip
-  the media caps of a call already connected.
+* A losing `CallAnswerClaimV2` (another callee device that did not win the arbitration)
+  can no longer flip the media caps of a call already connected.
 
 **Partial / stubbed (documented, safe defaults):**
 1. **Proactive roster-change banner**: `audit_devices` surfaces an unknown/rogue device in

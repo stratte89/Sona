@@ -50,7 +50,7 @@ use crate::call::{
 };
 use crate::{ClientError, Result};
 
-/// Capability string advertised in `CallOffer`/`CallAnswer.caps` by clients that can
+/// Capability string advertised in v2 call offers/answer claims by clients that can
 /// run this module. Absent (old client) ⇒ the call runs voice-only, v1 wire format.
 pub const MEDIA2_CAP: &str = "media2";
 
@@ -112,6 +112,29 @@ pub fn classify(frame: &[u8]) -> Option<WireClass> {
 }
 
 // ── Cells: sealed, padded, fragmenting wire units ──────────────────────────────────
+
+/// How long a call may have both parties in the room and still no voice frame that opens
+/// before it is given up on (E-7).
+///
+/// Generous by an order of magnitude: with the room up and the keys agreeing, the first
+/// frame opens within a frame interval. This is not a "poor network" threshold — a lossy
+/// link still lands frames, and the ones that arrive still open — it is the threshold for
+/// "these two endpoints cannot talk to each other at all", which is what a `caller`-flag
+/// disagreement produces, in both directions, permanently.
+pub const VOICE_SILENCE_GIVEUP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a session waits for the **peer to join the room at all** before giving up.
+///
+/// [`VOICE_SILENCE_GIVEUP`] only starts counting once the peer has joined, so it says nothing
+/// about a peer that never arrives — and nothing else bounded that wait. A call whose room
+/// never assembles therefore hung indefinitely: both ends held a live call, the callee sat on
+/// "establishing secure connection…" with no timeout at all, and the only thing that ever
+/// ended it was the signal TTL minutes later. Measured 2026-08-01, on the fifth call of a run
+/// with a minute between each, so not a teardown race.
+///
+/// Bounded well inside the ring timeout, because by the time this expires the answer has
+/// already happened and the user is looking at a call that is going nowhere.
+pub const PEER_JOIN_GIVEUP: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Cell plaintexts are padded to a multiple of this (coarse size hiding).
 pub const CELL_QUANTUM: usize = 1024;
@@ -611,6 +634,11 @@ pub struct MediaToggles {
     /// Width the screen capture should decimate to, written by the encode governor and
     /// read by the platform capture source. See [`SCREEN_WIDTHS`].
     pub screen_width: Arc<AtomicU32>,
+    /// How loud to play *this peer's voice*, in percent ([`crate::call::GAIN_UNITY`] =
+    /// as sent, 0 = muted for us only). The listener's own setting: it never reaches the
+    /// wire, so the peer cannot tell they have been turned down, and it is applied after
+    /// decode so a boost lifts concealed frames with the rest.
+    pub voice_gain: Arc<AtomicU32>,
 }
 
 impl Default for MediaToggles {
@@ -621,6 +649,7 @@ impl Default for MediaToggles {
             screen_on: Arc::default(),
             screen_audio_on: Arc::default(),
             screen_width: Arc::new(AtomicU32::new(SCREEN_WIDTHS[0])),
+            voice_gain: Arc::new(AtomicU32::new(crate::call::GAIN_UNITY)),
         }
     }
 }
@@ -638,8 +667,22 @@ const ENCODE_BUDGET: f32 = 0.5;
 /// Session events surfaced to the shell/UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaEvent {
-    /// Both parties are in the room; voice is flowing.
+    /// Both parties are **in the room**. Nothing more: it is the relay reporting
+    /// `peers >= 2`, and it is not evidence that a single byte has decrypted.
+    ///
+    /// It used to say "voice is flowing", and the shell believed it — starting the call
+    /// timer and taking the system call out of CONNECTING on the strength of it. So a call
+    /// whose frames never opened at either end presented as a healthy running call in
+    /// silence (E-7). [`MediaEvent::VoiceFlowing`] is the claim that was actually wanted.
     Connected,
+    /// The first voice frame that **decrypted and decoded**. This is the honest "the call
+    /// is up": it can only happen if the room, the relay, and — the case that made this
+    /// necessary — the direction-derived track keys all agree.
+    ///
+    /// Safe to gate the UI on, because voice is sent at a constant cadence whether or not
+    /// the peer is muted (a muted peer sends encoded silence, not nothing). A call that
+    /// never produces this is broken, not quiet.
+    VoiceFlowing,
     /// Video/screen tracks are (un)available on this call: requires the peer's
     /// `media2` capability *and* a relay that admits video-sized frames.
     VideoReady(bool),
@@ -679,6 +722,33 @@ where
     pub encoders: Option<EncoderFactory>,
 }
 
+/// Slot for a peer video track in the liveness arrays. Written by hand rather than cast
+/// from the discriminant: `Track::Camera as usize` is 1 and `Track::Screen` is 2, so any
+/// arithmetic mapping reads backwards and silently crosses the two tracks over.
+fn peer_slot(track: Track) -> usize {
+    match track {
+        Track::Screen => 1,
+        _ => 0,
+    }
+}
+
+/// How long a peer video track may go without a cell before it is treated as off.
+///
+/// Generous next to the frame intervals involved — screen video is paced at 20 fps and
+/// camera at 30 — so this only fires when a track has genuinely stopped, not when it is
+/// merely being governed down or dropping frames under load.
+const PEER_TRACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Queued cells past which the decode task stops decoding and starts skipping, and the
+/// depth it skips down to.
+///
+/// In cells, because that is what the queue holds: a 1080p frame at the screen bitrate is
+/// roughly twenty of them, so this is about two and a half frames of slack — enough to
+/// absorb one slow decode without letting a genuinely overloaded receiver build a queue it
+/// will never work off.
+const DECODE_BACKLOG_MAX: usize = 48;
+const DECODE_BACKLOG_KEEP: usize = 16;
+
 /// Cells from the socket to the decode task.
 enum DecodeMsg {
     Cell(Vec<u8>),
@@ -692,7 +762,7 @@ enum DecodeMsg {
 /// offer/answer caps, relay `media >= 2` from the join message).
 ///
 /// `peer_media2` is a live flag because the caller doesn't know the callee's caps
-/// until the `CallAnswer` arrives over the ratchet — usually around the same moment
+/// until the v2 answer claim arrives over the ratchet — usually around the same moment
 /// the callee joins the room. The shell flips it whenever the answer lands; the
 /// engine re-evaluates every tick and emits [`MediaEvent::VideoReady`] on changes.
 #[allow(clippy::too_many_arguments)] // a call session simply has this many moving parts
@@ -760,10 +830,49 @@ where
     let kf_camera = Arc::new(AtomicBool::new(false));
     let kf_screen = Arc::new(AtomicBool::new(false));
 
-    // ── Encode task: camera + screen → sealed cells. Skips (never queues) frames when
-    //    the socket side is backlogged; skipping happens *before* encoding so the
-    //    peer's reference chain stays intact. ──
+    // ── Reliable-send task: everything that must arrive intact (video cells, control
+    //    cells) goes out from here and nowhere else.
+    //
+    //    This is the one structural rule that keeps a screen share from wrecking the
+    //    call. A reliable send waits — for congestion control, for a retransmit, for a
+    //    free QUIC stream — and while the session loop below was the thing doing that
+    //    waiting, it was simultaneously failing to capture voice, send voice, and decode
+    //    the peer's voice, because a `select!` arm parked in an `await` blocks every other
+    //    arm. Voice, screen audio and video all went choppy together the moment anyone
+    //    shared a screen, and no amount of making the *encoder* faster could fix it: the
+    //    stall was on the wire, not in the codec. Here, that wait costs only video.
+    //
+    //    Control cells are polled ahead of video (`biased`): a keyframe request the peer
+    //    is waiting on must not sit behind a queued frame, and it is 1 KB against tens. ──
     let (cells_tx, mut cells_rx) = tokio::sync::mpsc::channel::<Vec<Vec<u8>>>(4);
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Vec<u8>>>();
+    let send_task = {
+        let cells = media.cell_sender();
+        let mut stop = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => break,
+                    Some(group) = ctrl_rx.recv() => {
+                        if cells.send_cells(group).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(group) = cells_rx.recv() => {
+                        if cells.send_cells(group).await.is_err() {
+                            break; // connection gone; the session loop sees it too
+                        }
+                    }
+                    else => break,
+                }
+            }
+        })
+    };
+
+    // ── Encode task: camera + screen → sealed cells. Skips (never queues) frames when
+    //    the send side is backlogged; skipping happens *before* encoding so the
+    //    peer's reference chain stays intact. ──
     let encode_task = {
         let seal_cam = TrackSeal::derive(key_b64, caller, Track::Camera)?;
         let seal_scr = TrackSeal::derive(key_b64, caller, Track::Screen)?;
@@ -940,6 +1049,52 @@ where
             let mut dec_scr: Option<video::Decoder> = None;
             let mut last_kfreq: [Option<std::time::Instant>; 2] = [None, None];
             while let Some(msg) = dec_rx.recv().await {
+                // Never decode a backlog. Video decoding is the slowest thing in a call —
+                // ~10 ms per 1080p frame in software, 20 of them a second — and this queue
+                // was unbounded, so a receiver that could not keep up did not drop frames,
+                // it *accumulated* them: every frame decoded was staler than the last and
+                // the delay grew without limit for the rest of the call. That is the "his
+                // screen is minutes behind and freezing while the audio is fine" report,
+                // and it only became visible once the sender got a hardware encoder and
+                // started delivering a genuine 20 fps instead of a governed trickle.
+                //
+                // A live frame is worth decoding and a stale one is worth skipping, so when
+                // the queue runs deep the oldest cells go and the newest are kept. Whole
+                // frames simply fail to reassemble and the next keyframe recovers the
+                // picture — the track's cell reassembler already treats an incomplete frame
+                // as nothing at all, so there is no corrupt output to guard against.
+                //
+                // Only a cell is ever skipped past. `msg` itself being a `Reset` means a
+                // track just went off, which is never stale and never dropped — it is the
+                // reason a tile hides, and losing it leaves the peer's last frame frozen on
+                // screen after they stopped sharing.
+                let backlogged =
+                    matches!(msg, DecodeMsg::Cell(_)) && dec_rx.len() > DECODE_BACKLOG_MAX;
+                let msg = if backlogged {
+                    let mut newest = msg;
+                    while dec_rx.len() > DECODE_BACKLOG_KEEP {
+                        match dec_rx.try_recv() {
+                            // A track going off must not be skipped past: it is the reason
+                            // a tile hides, and dropping it leaves the last frame frozen
+                            // on screen after the peer stopped sending.
+                            Ok(DecodeMsg::Reset(t)) => {
+                                if let Ok(mut s) = sink.lock() {
+                                    s.video_off(t);
+                                }
+                                match t {
+                                    Track::Camera => dec_cam = None,
+                                    Track::Screen => dec_scr = None,
+                                    _ => {}
+                                }
+                            }
+                            Ok(other) => newest = other,
+                            Err(_) => break,
+                        }
+                    }
+                    newest
+                } else {
+                    msg
+                };
                 match msg {
                     DecodeMsg::Reset(track) => {
                         match track {
@@ -1002,15 +1157,49 @@ where
     let mut opus_buf = [0u8; crate::call::PADDED_PLAINTEXT];
     let mut peer_here = false;
     let mut connected_sent = false;
+    // Has a single voice frame opened yet? (E-7)
+    let mut voice_flowing_sent = false;
+    // When the peer joined the room, so a call that never produces audio can be given up on
+    // instead of presenting as a healthy running call in silence.
+    let mut peer_here_since: Option<std::time::Instant> = None;
+    // What the relay last said the room held, carried into the give-up error below.
+    //
+    // It is the one fact that splits the remaining question in two, and nothing reports it:
+    // `peers: 1` means the relay believes this device is alone in the room — which it can,
+    // because `join_room` prunes members that read as closed and then tells the newcomer the
+    // count *after* pruning, so a peer dropped from the room leaves the joiner alone and the
+    // peer, already in, is never sent a `peer_joined` either. `peers: 2` would mean the relay
+    // paired them and the fault is on this side. `None` means no `joined` arrived at all.
+    let mut last_joined_peers: Option<u8> = None;
+    // Voice frames seen on the wire, and how many of those refused to open. Carried into the
+    // give-up error because they separate three failures that look identical from outside:
+    // nothing arriving (the relay or the room), arriving but not opening (the track keys
+    // disagree), and opening but not decoding.
+    let mut voice_frames_seen: u64 = 0;
+    let mut voice_frames_unopened: u64 = 0;
     let mut conceal = crate::call::Conceal::default();
+    // Hoisted out of the tick: the listener's volume for this peer, read once per frame.
+    let voice_gain = toggles.voice_gain.clone();
     let mut relay_media2 = false;
     let mut video_ready_sent: Option<bool> = None;
     // Which of our tracks the peer currently believes are on (for edge-triggered
     // TrackOn/TrackOff control cells).
     let mut sent_on = [false; 3]; // camera, screen, screen-audio
+                                  // When each of the peer's video tracks last produced a cell, and what we last told
+                                  // the shell about it. A `TrackOff` is a single control cell and it does not always
+                                  // arrive — twice now a stopped share has left the far side showing a frozen frame,
+                                  // and once it left `peer_screen` stuck true so the share button refused for the rest
+                                  // of the call. Frames stopping is evidence in its own right and it cannot go missing.
+    let mut peer_seen: [Option<std::time::Instant>; 2] = [None, None];
+    let mut peer_on = [false; 2];
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Armed once, for the whole session: the deadline by which the peer must have joined the
+    // room. Disarmed by its own `if !connected_sent` guard the moment they do.
+    let join_deadline = tokio::time::sleep(PEER_JOIN_GIVEUP);
+    tokio::pin!(join_deadline);
 
     let result: Result<()> = 'session: {
         loop {
@@ -1025,7 +1214,48 @@ where
 
                 _ = stop.changed() => break 'session Ok(()),
 
+                // The peer that never joins the room at all.
+                //
+                // This has to be its **own** arm, and getting that wrong is what left the
+                // fault open for a whole round: the check first went inside the tick arm
+                // below, which is guarded `if peer_here` — so the test for "the peer never
+                // arrived" could only run once the peer had arrived. Unreachable in exactly
+                // the case it was written for.
+                //
+                // With `peer_here` false the tick arm is disabled, so the loop has no live
+                // arms left but this one, the wire receiver and the stop signal. That is the
+                // hang the tester kept hitting: a media session that started cleanly (54 ms
+                // from join to loop, on the phone) and then sat doing nothing at all while
+                // the screen said "establishing secure connection…" — for minutes, ending
+                // only when they hung up by hand.
+                _ = &mut join_deadline, if !connected_sent => {
+                    break 'session Err(ClientError::Protocol(match last_joined_peers {
+                        Some(peers) => format!(
+                            "the peer never joined the call room (the relay put {peers} \
+                             member(s) in it)"
+                        ),
+                        None => "the call room never acknowledged this device's join".into(),
+                    }));
+                }
+
                 _ = tick.tick(), if peer_here => {
+                    // E-7. Both parties are in the room and not one frame has opened. Voice
+                    // is sent at a constant cadence whether or not the peer is muted — a
+                    // muted peer sends encoded silence, not nothing — so this is not a quiet
+                    // call, it is a broken one: a relay that is not forwarding, or track
+                    // keys that disagree, which are direction-derived and therefore fail in
+                    // BOTH directions at once. Ending it says so; the alternative is what
+                    // the tester saw, a running timer over total silence.
+                    if !voice_flowing_sent
+                        && peer_here_since
+                            .is_some_and(|t| t.elapsed() >= VOICE_SILENCE_GIVEUP)
+                    {
+                        break 'session Err(ClientError::Protocol(format!(
+                            "no voice frame opened after the peer joined \
+                             ({voice_frames_seen} voice frames seen, {voice_frames_unopened} \
+                             refused to open)"
+                        )));
+                    }
                     // Voice, exactly as v1: constant cadence, silence when muted.
                     if toggles.muted.load(Ordering::Relaxed) || !audio.read_frame(&mut capture) {
                         capture = [0i16; SAMPLES_PER_FRAME];
@@ -1046,7 +1276,23 @@ where
                     if conceal.tick(audio.playout_queued())
                         && voice_dec.conceal(&mut playout).is_ok()
                     {
+                        crate::call::apply_gain(&mut playout, voice_gain.load(Ordering::Relaxed));
                         audio.write_frame(&playout);
+                    }
+
+                    // A peer track whose cells have stopped is off, whatever the control
+                    // path did or did not say.
+                    for track in [Track::Camera, Track::Screen] {
+                        let i = peer_slot(track);
+                        let live = peer_seen[i]
+                            .is_some_and(|t| t.elapsed() < PEER_TRACK_TIMEOUT);
+                        if live != peer_on[i] {
+                            peer_on[i] = live;
+                            let _ = events.send(MediaEvent::PeerTrack { track, on: live });
+                            if !live {
+                                let _ = dec_tx.send(DecodeMsg::Reset(track));
+                            }
+                        }
                     }
 
                     // Re-evaluate negotiation every tick: the answer's caps can land
@@ -1077,9 +1323,9 @@ where
                                 Ok(c) => c,
                                 Err(e) => break 'session Err(e),
                             };
-                            if media.send_cells(vec![cell]).await.is_err() {
-                                break 'session Ok(());
-                            }
+                            // Handed to the reliable-send task, never awaited here: the
+                            // voice tick this is running inside must not wait on the wire.
+                            let _ = ctrl_tx.send(vec![cell]);
                         }
                     }
 
@@ -1106,6 +1352,7 @@ where
                     Err(e) => break 'session Err(e),
                     Ok(ev) => match ev {
                     CallWireEvent::Joined { peers, media: relay_media } => {
+                        last_joined_peers = Some(peers);
                         relay_media2 = relay_media >= 2;
                         let ready = relay_media2 && peer_media2.load(Ordering::Relaxed);
                         if video_ready_sent != Some(ready) {
@@ -1113,6 +1360,9 @@ where
                             let _ = events.send(MediaEvent::VideoReady(ready));
                         }
                         peer_here = peers >= 2;
+                        if peer_here && peer_here_since.is_none() {
+                            peer_here_since = Some(std::time::Instant::now());
+                        }
                         video_active.store(ready && peer_here, Ordering::Relaxed);
                         if peer_here && !connected_sent {
                             connected_sent = true;
@@ -1121,6 +1371,9 @@ where
                     }
                     CallWireEvent::PeerJoined => {
                         peer_here = true;
+                        if peer_here_since.is_none() {
+                            peer_here_since = Some(std::time::Instant::now());
+                        }
                         video_active.store(
                             relay_media2 && peer_media2.load(Ordering::Relaxed),
                             Ordering::Relaxed,
@@ -1132,15 +1385,36 @@ where
                     }
                     CallWireEvent::Frame(wire) => match classify(&wire) {
                         Some(WireClass::VoiceV1) => {
-                            // Bad frames dropped, not fatal (untrusted relay), as in v1.
-                            if let Ok(opus_bytes) = voice_keys.open_frame(&wire) {
+                            voice_frames_seen += 1;
+                            // Bad frames dropped, not fatal (untrusted relay), as in v1 —
+                            // but counted, because "frames arrive and none of them open" is
+                            // a key disagreement while "no frames arrive" is the relay or the
+                            // room, and silently dropping made those two indistinguishable.
+                            let opened = voice_keys.open_frame(&wire);
+                            if opened.is_err() {
+                                voice_frames_unopened += 1;
+                            }
+                            if let Ok(opus_bytes) = opened {
+                                // The first frame that actually opened. Everything upstream
+                                // of here — the room, the relay, the direction-derived track
+                                // keys — has just been proved to agree, which is the only
+                                // honest basis for telling the user the call is up (E-7).
+                                if !voice_flowing_sent {
+                                    voice_flowing_sent = true;
+                                    let _ = events.send(MediaEvent::VoiceFlowing);
+                                }
                                 if voice_dec.decode(&opus_bytes, &mut playout).is_ok() {
                                     conceal.on_frame();
+                                    crate::call::apply_gain(
+                                        &mut playout,
+                                        voice_gain.load(Ordering::Relaxed),
+                                    );
                                     audio.write_frame(&playout);
                                 }
                             }
                         }
-                        Some(WireClass::Cell(Track::Camera | Track::Screen)) => {
+                        Some(WireClass::Cell(t @ (Track::Camera | Track::Screen))) => {
+                            peer_seen[peer_slot(t)] = Some(std::time::Instant::now());
                             let _ = dec_tx.send(DecodeMsg::Cell(wire));
                         }
                         Some(WireClass::Cell(Track::ScreenAudio)) => {
@@ -1186,31 +1460,25 @@ where
                     },
                 },
 
-                // Our decoder lost sync — ask the peer for an IDR. Ahead of outbound
-                // video: an unanswered request costs the peer a second of broken
-                // picture, one late video frame costs 50 ms.
+                // Our decoder lost sync — ask the peer for an IDR. Queued on the reliable
+                // path ahead of outbound video: an unanswered request costs the peer a
+                // second of broken picture, one late video frame costs 50 ms.
                 Some(track) = kfreq_rx.recv() => {
                     let cell = match (ControlMsg::KeyframeReq { track: track as u8 }).seal(&mut ctl_seal) {
                         Ok(c) => c,
                         Err(e) => break 'session Err(e),
                     };
-                    if media.send_cells(vec![cell]).await.is_err() {
-                        break 'session Ok(());
-                    }
+                    let _ = ctrl_tx.send(vec![cell]);
                 }
 
-                // Sealed camera/screen cells from the encode task. Last on purpose —
-                // everything above is either on a deadline or already waiting.
-                Some(cells) = cells_rx.recv() => {
-                    if media.send_cells(cells).await.is_err() {
-                        break 'session Ok(());
-                    }
-                }
+                // Outbound video is deliberately absent from this loop — it belongs to
+                // `send_task`, because putting it here is what made a share stall voice.
             }
         }
     };
 
     encode_task.abort();
+    send_task.abort();
     drop(dec_tx);
     decode_task.abort();
     media.close().await;

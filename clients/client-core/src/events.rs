@@ -164,53 +164,117 @@ pub enum InboundEvent {
         sender_identity_key: String,
         avatar: Option<String>,
     },
-    /// The peer is calling. Ephemeral: never stored in history (the key must not touch
-    /// disk); the shell rings and answers over the ratchet.
-    CallOffered {
+    /// Protocol-v2 call offer. Ephemeral media capability material must never enter
+    /// history or the Android call-control store.
+    CallOfferedV2 {
         sender_identity_key: String,
         sender_username: String,
+        call_instance_id: String,
+        offer_id: String,
         call_id: String,
         key_b64: String,
-        ts: u64,
-        /// The caller's media capabilities (see [`media::peer_supports_media2`]).
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
+        caller_device_id: String,
+        reply_to_mailbox: String,
         caps: Vec<String>,
-        /// Non-empty ⇒ silent resume of the named dropped call (see
-        /// [`ChatPayload::CallOffer::reconnect_of`]); never ring on it.
-        reconnect_of: String,
+        resume_of: String,
     },
-    /// The peer accepted/declined our call offer.
-    CallAnswered {
+    /// One peer device attempts to claim an answer. The caller arbitrates and emits
+    /// one matching [`InboundEvent::CallWinnerV2`].
+    CallAnswerClaimedV2 {
         sender_identity_key: String,
-        call_id: String,
-        accept: bool,
-        /// The callee's media capabilities.
+        call_instance_id: String,
+        offer_id: String,
+        claim_nonce: String,
+        answering_device_id: String,
+        reply_to_mailbox: String,
         caps: Vec<String>,
-        /// `true` = automatic busy decline from one of the callee's devices; the ring
-        /// ends only when every ringed device declined (see [`ChatPayload::CallAnswer`]).
-        busy: bool,
+        expires_at: u64,
     },
-    /// The peer hung up / cancelled the call.
-    CallEnded {
+    /// Caller acknowledgement naming the sole answer winner.
+    CallWinnerV2 {
         sender_identity_key: String,
-        call_id: String,
+        call_instance_id: String,
+        offer_id: String,
+        claim_nonce: String,
+        winner_device_id: String,
+        expires_at: u64,
     },
-    /// A group member offered us our pair leg of a group call (see
-    /// [`ChatPayload::GroupCallOffer`]). Ephemeral: never stored (the key must not touch
-    /// disk). Doubles as presence: the sender is in call `call_instance`.
-    GroupCallOffered {
+    /// One destination device is occupied; sibling rings remain live.
+    CallBusyV2 {
+        sender_identity_key: String,
+        call_instance_id: String,
+        offer_id: String,
+        device_id: String,
+        expires_at: u64,
+    },
+    /// Explicit final call outcome.
+    CallTerminalV2 {
+        sender_identity_key: String,
+        sender_username: String,
+        call_instance_id: String,
+        offer_id: String,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: String,
+        expires_at: u64,
+    },
+    /// A group member offered us our pair leg of a group call. Ephemeral: never stored
+    /// (the key must not touch disk). Doubles as presence: the sender is in this logical
+    /// call instance.
+    GroupCallOfferedV2 {
         sender_identity_key: String,
         sender_username: String,
         group_id: String,
-        call_instance: String,
+        call_instance_id: String,
+        ring_id: String,
+        offer_id: String,
         call_id: String,
         key_b64: String,
-        ts: u64,
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
+        caller_device_id: String,
+        coordinator_username: String,
+        coordinator_identity_key: String,
+        coordinator_device_id: String,
+        coordinator_reply_to_mailbox: String,
+        resume: bool,
     },
-    /// A group member declined / left / cancelled group call `call_instance`.
-    GroupCallEnded {
+    /// One device claims its account's group-call answer.
+    GroupCallAnswerClaimedV2 {
         sender_identity_key: String,
         group_id: String,
-        call_instance: String,
+        call_instance_id: String,
+        ring_id: String,
+        claim_nonce: String,
+        answering_device_id: String,
+        reply_to_mailbox: String,
+        expires_at: u64,
+    },
+    /// Stable group-call coordinator selected the one winning device for an account.
+    GroupCallWinnerV2 {
+        sender_identity_key: String,
+        group_id: String,
+        call_instance_id: String,
+        ring_id: String,
+        claim_nonce: String,
+        winner_device_id: String,
+        expires_at: u64,
+    },
+    /// A group member explicitly declined, left, or cancelled a logical group call.
+    GroupCallTerminalV2 {
+        sender_identity_key: String,
+        group_id: String,
+        call_instance_id: String,
+        ring_id: String,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: String,
+        coordinator_username: String,
+        coordinator_identity_key: String,
+        coordinator_device_id: String,
+        expires_at: u64,
     },
     /// One of our OWN other devices sent a message we should show as outgoing (self-sync).
     /// `sender_identity_key` is the originating own-device's key (verified as ours).
@@ -245,11 +309,15 @@ pub enum InboundEvent {
         peer_key: String,
         ids: Vec<String>,
     },
-    /// One of our own devices answered/declined the ring for `call_id` — stop ringing
-    /// here. Ephemeral; the shell must verify the sender is a verified own device.
-    SelfCallHandled {
+    /// One of our own devices finalized a call. This may arrive before the offer and
+    /// must create a tombstone after roster verification.
+    SelfCallTerminalV2 {
         sender_identity_key: String,
-        call_id: String,
+        call_instance_id: String,
+        offer_id: String,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: String,
+        expires_at: u64,
     },
     /// One of our own (linked) devices asked us (the primary) to re-export history because
     /// its transfer expired. The shell prompts for the account password and calls
@@ -348,6 +416,68 @@ pub enum InboundEvent {
 }
 
 impl InboundEvent {
+    /// Claimed account attribution carried by content that may legitimately arrive
+    /// from a newly linked/rotated device. Shells can quarantine these events while
+    /// they resolve the authenticated device against the account's pinned roster.
+    pub fn attribution_claim(&self) -> Option<(&str, &str)> {
+        match self {
+            InboundEvent::Message {
+                sender_identity_key,
+                sender_username,
+                ..
+            }
+            | InboundEvent::Attachment {
+                sender_identity_key,
+                sender_username,
+                ..
+            }
+            | InboundEvent::Knock {
+                sender_identity_key,
+                sender_username,
+            }
+            | InboundEvent::CallOfferedV2 {
+                sender_identity_key,
+                sender_username,
+                ..
+            }
+            | InboundEvent::GroupCallOfferedV2 {
+                sender_identity_key,
+                sender_username,
+                ..
+            }
+            | InboundEvent::CallTerminalV2 {
+                sender_identity_key,
+                sender_username,
+                ..
+            } => Some((sender_identity_key, sender_username)),
+            InboundEvent::GroupCallTerminalV2 {
+                sender_identity_key,
+                coordinator_username,
+                coordinator_identity_key,
+                ..
+            } if sender_identity_key == coordinator_identity_key => {
+                Some((sender_identity_key, coordinator_username))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_call_signal(&self) -> bool {
+        matches!(
+            self,
+            InboundEvent::CallOfferedV2 { .. }
+                | InboundEvent::CallAnswerClaimedV2 { .. }
+                | InboundEvent::CallWinnerV2 { .. }
+                | InboundEvent::CallBusyV2 { .. }
+                | InboundEvent::CallTerminalV2 { .. }
+                | InboundEvent::GroupCallOfferedV2 { .. }
+                | InboundEvent::GroupCallAnswerClaimedV2 { .. }
+                | InboundEvent::GroupCallWinnerV2 { .. }
+                | InboundEvent::GroupCallTerminalV2 { .. }
+                | InboundEvent::SelfCallTerminalV2 { .. }
+        )
+    }
+
     /// The authenticated sender (ratchet identity key) of any inbound event — the value
     /// block lists key on.
     pub fn sender_identity_key(&self) -> &str {
@@ -431,23 +561,39 @@ impl InboundEvent {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::CallOffered {
+            | InboundEvent::CallOfferedV2 {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::CallAnswered {
+            | InboundEvent::CallAnswerClaimedV2 {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::CallEnded {
+            | InboundEvent::CallWinnerV2 {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::GroupCallOffered {
+            | InboundEvent::CallBusyV2 {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::GroupCallEnded {
+            | InboundEvent::CallTerminalV2 {
+                sender_identity_key,
+                ..
+            }
+            | InboundEvent::GroupCallOfferedV2 {
+                sender_identity_key,
+                ..
+            }
+            | InboundEvent::GroupCallAnswerClaimedV2 {
+                sender_identity_key,
+                ..
+            }
+            | InboundEvent::GroupCallWinnerV2 {
+                sender_identity_key,
+                ..
+            }
+            | InboundEvent::GroupCallTerminalV2 {
                 sender_identity_key,
                 ..
             }
@@ -463,7 +609,7 @@ impl InboundEvent {
                 sender_identity_key,
                 ..
             }
-            | InboundEvent::SelfCallHandled {
+            | InboundEvent::SelfCallTerminalV2 {
                 sender_identity_key,
                 ..
             }

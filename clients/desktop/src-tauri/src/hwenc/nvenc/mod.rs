@@ -90,11 +90,9 @@ impl Encoder {
         let api = api::api().map_err(|e| OpenFailure::Permanent(e.to_string()))?;
         let cuda = Context::shared().map_err(OpenFailure::Permanent)?;
         // Only an opening size: `encode` rebuilds for whatever the capture actually
-        // produces, including after the governor steps it down.
-        let dims = match content {
-            video::Content::Camera => (640, 480),
-            video::Content::Screen => (1920, 1080),
-        };
+        // produces, including after the governor steps it down. Shared with the probe
+        // (see `super::open_dims`) so what gets proven is what gets used.
+        let dims = super::open_dims(content);
         let session = Session::open(api, cuda.clone(), content, dims)?;
         Ok(Encoder {
             cuda,

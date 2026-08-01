@@ -69,6 +69,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/account/delete", post(account::delete_account))
         .route("/v1/push/register", post(push::push_register))
         .route("/v1/push/unregister", post(push::push_unregister))
+        .route("/v1/callkey", post(push::publish_call_key))
+        .route("/v1/callkey/{hash}", get(push::fetch_call_key))
         .route("/v1/gif/search", get(gif::gif_search))
         .route("/v1/gif/trending", get(gif::gif_trending))
         .route("/v1/gif/proxy", get(gif::gif_proxy))
@@ -146,12 +148,9 @@ fn client_key(headers: &HeaderMap, state: &AppState) -> Option<String> {
 // mailbox (signed single-use challenge), otherwise an attacker could subscribe to a
 // victim's message *timing*.
 
-/// Constant wake body. Deliberately identical for every user and every message.
-const WAKE_BODY: &str = "wake";
-
-/// Constant call-class wake body — lets a locked-vault device ring generically without
-/// decrypting anything. Still identical for every user and every call.
-const WAKE_BODY_CALL: &str = "wake-call";
+// The constant wake bodies live on `WakeClass::wake_body` in `protocol-types`: they are
+// deliberately identical for every user and every message, and the Android UnifiedPush
+// receiver parses them back into a wake class, so relay and client read one definition.
 
 /// Wake POST timeout — a slow push provider must not pile up tasks.
 const WAKE_TIMEOUT_SECS: u64 = 10;

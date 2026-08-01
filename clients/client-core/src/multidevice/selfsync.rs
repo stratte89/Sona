@@ -760,135 +760,206 @@ impl Client {
         }
         Ok(msg_id)
     }
-    /// (Caller) Sealed copies of a call offer for every device of `contact` **except**
-    /// the one already signaled directly (`contact.identity_key`). Empty when the
-    /// contact is single-device.
-    pub async fn extra_call_offer_envelopes(
+    /// Sealed copies of one v2 call offer for every other verified device of `contact`.
+    /// Every copy reuses the logical IDs and deadlines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extra_call_offer_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
         contact: &Contact,
+        call_instance_id: &str,
+        offer_id: &str,
         call_id: &str,
         key_b64: &str,
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
+        caller_device_id: &str,
+        resume_of: &str,
     ) -> Result<Vec<Envelope>> {
-        self.extra_call_offer_envelopes_full(account, history, contact, call_id, key_b64, "")
-            .await
-    }
-    /// [`extra_call_offer_envelopes`](Self::extra_call_offer_envelopes) with a
-    /// `reconnect_of` marker. Devices that were not in the dropped call ignore a
-    /// reconnect offer entirely, so fanning it to the whole roster is safe — it is the
-    /// only way to reach the in-call device when that device is a linked one.
-    pub async fn extra_call_offer_envelopes_full(
-        &self,
-        account: &mut Account,
-        history: &mut History,
-        contact: &Contact,
-        call_id: &str,
-        key_b64: &str,
-        reconnect_of: &str,
-    ) -> Result<Vec<Envelope>> {
-        let payload = ChatPayload::CallOffer {
+        let reply_to_mailbox = self.device_mailbox(account.account_id(), caller_device_id)?;
+        let payload = ChatPayload::CallOfferV2 {
+            call_instance_id: call_instance_id.to_string(),
+            offer_id: offer_id.to_string(),
             call_id: call_id.to_string(),
             key_b64: key_b64.to_string(),
-            ts: now(),
+            created_at,
+            ring_expires_at,
+            expires_at,
             from: account.account_id().to_string(),
+            caller_device_id: caller_device_id.to_string(),
+            reply_to_mailbox,
             caps: crate::media::local_caps(),
-            reconnect_of: reconnect_of.to_string(),
+            resume_of: resume_of.to_string(),
         };
         self.extra_signal_envelopes(account, history, contact, payload)
-            .await
     }
     /// (Group caller/joiner) Sealed copies of a group-call pair-leg offer for every
     /// device of `contact` except the directly-signaled one — the same ticket to every
     /// device (only one of them answers and joins the two-member pair room, exactly as
     /// in a 1:1 ring-all). Same fail-open-safe roster rules as the 1:1 offer fan.
     #[allow(clippy::too_many_arguments)]
-    pub async fn extra_group_call_offer_envelopes(
+    pub fn extra_group_call_offer_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
         contact: &Contact,
         group_id: &str,
-        call_instance: &str,
+        call_instance_id: &str,
+        ring_id: &str,
+        offer_id: &str,
         call_id: &str,
         key_b64: &str,
+        created_at: u64,
+        ring_expires_at: u64,
+        expires_at: u64,
+        caller_device_id: &str,
+        coordinator_username: &str,
+        coordinator_identity_key: &str,
+        coordinator_device_id: &str,
+        coordinator_reply_to_mailbox: &str,
+        resume: bool,
     ) -> Result<Vec<Envelope>> {
-        let payload = ChatPayload::GroupCallOffer {
+        let payload = ChatPayload::GroupCallOfferV2 {
             group_id: group_id.to_string(),
-            call_instance: call_instance.to_string(),
+            call_instance_id: call_instance_id.to_string(),
+            ring_id: ring_id.to_string(),
+            offer_id: offer_id.to_string(),
             call_id: call_id.to_string(),
             key_b64: key_b64.to_string(),
-            ts: now(),
+            created_at,
+            ring_expires_at,
+            expires_at,
             from: account.account_id().to_string(),
+            caller_device_id: caller_device_id.to_string(),
+            coordinator_username: coordinator_username.to_string(),
+            coordinator_identity_key: coordinator_identity_key.to_string(),
+            coordinator_device_id: coordinator_device_id.to_string(),
+            coordinator_reply_to_mailbox: coordinator_reply_to_mailbox.to_string(),
+            resume,
         };
         self.extra_signal_envelopes(account, history, contact, payload)
-            .await
     }
-    /// (Group leaver/decliner) Sealed copies of a group-call leave/decline for every
-    /// device of `contact` except the directly-signaled one.
-    pub async fn extra_group_call_end_envelopes(
+    /// Sealed copies of one explicit group terminal/leave outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extra_group_call_terminal_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
         contact: &Contact,
         group_id: &str,
-        call_instance: &str,
+        call_instance_id: &str,
+        ring_id: &str,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: &str,
+        coordinator_username: &str,
+        coordinator_identity_key: &str,
+        coordinator_device_id: &str,
+        expires_at: u64,
     ) -> Result<Vec<Envelope>> {
-        let payload = ChatPayload::GroupCallEnd {
+        let payload = ChatPayload::GroupCallTerminalV2 {
             group_id: group_id.to_string(),
-            call_instance: call_instance.to_string(),
+            call_instance_id: call_instance_id.to_string(),
+            ring_id: ring_id.to_string(),
+            reason,
+            actor_device_id: actor_device_id.to_string(),
+            coordinator_username: coordinator_username.to_string(),
+            coordinator_identity_key: coordinator_identity_key.to_string(),
+            coordinator_device_id: coordinator_device_id.to_string(),
+            expires_at,
         };
         self.extra_signal_envelopes(account, history, contact, payload)
-            .await
     }
-    /// (Caller) Sealed copies of a hangup/cancel for every device of `contact` except
-    /// the directly-signaled one, so every ringing device stops. Idempotent per device.
-    pub async fn extra_call_end_envelopes(
+    /// Sealed copies of one coordinator winner acknowledgement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extra_group_call_winner_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
         contact: &Contact,
-        call_id: &str,
+        group_id: &str,
+        call_instance_id: &str,
+        ring_id: &str,
+        claim_nonce: &str,
+        winner_device_id: &str,
+        expires_at: u64,
     ) -> Result<Vec<Envelope>> {
-        let payload = ChatPayload::CallEnd {
-            call_id: call_id.to_string(),
+        let payload = ChatPayload::GroupCallWinnerV2 {
+            group_id: group_id.to_string(),
+            call_instance_id: call_instance_id.to_string(),
+            ring_id: ring_id.to_string(),
+            claim_nonce: claim_nonce.to_string(),
+            winner_device_id: winner_device_id.to_string(),
+            expires_at,
         };
         self.extra_signal_envelopes(account, history, contact, payload)
-            .await
     }
-    /// (Callee) Sealed copies of an accept/decline for the caller's other devices. The
-    /// direct 1:1 answer lands in the caller's ACCOUNT mailbox — which only the primary
-    /// drains — so when the call came from a **linked** device, the fan copy on that
-    /// device's own mailbox is the only answer it can ever receive.
-    pub async fn extra_call_answer_envelopes(
+    /// Sealed copies of a final call outcome for every other verified peer device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extra_call_terminal_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
         contact: &Contact,
-        call_id: &str,
-        accept: bool,
-        busy: bool,
+        call_instance_id: &str,
+        offer_id: &str,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: &str,
+        expires_at: u64,
     ) -> Result<Vec<Envelope>> {
-        let payload = ChatPayload::CallAnswer {
-            call_id: call_id.to_string(),
-            accept,
-            caps: crate::media::local_caps(),
-            busy,
+        let payload = ChatPayload::CallTerminalV2 {
+            call_instance_id: call_instance_id.to_string(),
+            offer_id: offer_id.to_string(),
+            reason,
+            from: account.account_id().to_string(),
+            actor_device_id: actor_device_id.to_string(),
+            expires_at,
         };
         self.extra_signal_envelopes(account, history, contact, payload)
-            .await
     }
-    pub(crate) async fn extra_signal_envelopes(
+    /// Sealed copies of the caller's winner acknowledgement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extra_call_winner_envelopes_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
+        history: &History,
+        contact: &Contact,
+        call_instance_id: &str,
+        offer_id: &str,
+        claim_nonce: &str,
+        winner_device_id: &str,
+        expires_at: u64,
+    ) -> Result<Vec<Envelope>> {
+        let payload = ChatPayload::CallWinnerV2 {
+            call_instance_id: call_instance_id.to_string(),
+            offer_id: offer_id.to_string(),
+            claim_nonce: claim_nonce.to_string(),
+            winner_device_id: winner_device_id.to_string(),
+            expires_at,
+        };
+        self.extra_signal_envelopes(account, history, contact, payload)
+    }
+    /// Sealed copies of one call signal for every OTHER verified device of `contact`.
+    ///
+    /// **Network-free**, deliberately: call signaling is latency-critical and shells hold
+    /// their session lock across preparation, so this addresses the roster that is already
+    /// KT-verified and anti-rollback-pinned locally, and only devices we already have a
+    /// ratchet session with. Keeping that view fresh is
+    /// [`warm_account_routes`](Client::warm_account_routes)'s job, which a shell runs
+    /// off-lock before a call. A device missing from the pin (or without a session yet)
+    /// is simply not addressed — never addressed with an unverified key.
+    pub(crate) fn extra_signal_envelopes(
+        &self,
+        account: &mut Account,
+        history: &History,
         contact: &Contact,
         payload: ChatPayload,
     ) -> Result<Vec<Envelope>> {
-        let rec = self
-            .resolve_account_devices(history, &contact.username)
-            .await?;
-        if rec.devices.len() <= 1 {
+        let Some(pin) = history.pinned_roster(&contact.username) else {
+            return Ok(Vec::new()); // single-device account, or never resolved
+        };
+        if pin.devices.len() <= 1 {
             return Ok(Vec::new());
         }
         let rec_hash = IdentityHash::from_identifier(&contact.username)
@@ -896,7 +967,7 @@ impl Client {
             .to_string();
         let msg_id = random_msg_id();
         let mut out = Vec::new();
-        for d in &rec.devices {
+        for d in &pin.devices {
             // The direct 1:1 copy travels to the ACCOUNT mailbox, which only the
             // primary device drains — so the primary is the only device the direct
             // copy can reach, and only when it is also the key the copy was sealed to.
@@ -907,9 +978,10 @@ impl Client {
             if d.device_id == PRIMARY_DEVICE_ID && d.identity_key == contact.identity_key {
                 continue;
             }
+            if !account.ratchet_ref().has_session(&d.identity_key) {
+                continue;
+            }
             let mailbox = self.device_mailbox_from_hash(&rec_hash, &d.device_id)?;
-            self.ensure_device_session(account, &mailbox, &d.identity_key)
-                .await?;
             out.push(seal_payload_to(
                 account,
                 &mailbox,
@@ -920,41 +992,48 @@ impl Client {
         }
         Ok(out)
     }
-    /// (Callee) Tell our OWN other devices this ring was answered/declined here, so they
-    /// stop ringing. Posted immediately (a ring is already a simultaneous, relay-visible
-    /// event — the answering device's call-room join happens at the same instant, so
-    /// this adds no new correlation signal). Cheap no-op for single-device accounts.
-    pub async fn call_handled_selfsync(
+    /// Tell our own verified sibling devices one explicit terminal outcome. The
+    /// recipient may persist a tombstone before its delayed offer arrives.
+    ///
+    /// Network-free for the same reason as
+    /// [`extra_signal_envelopes`](Self::extra_signal_envelopes): our own pinned roster and
+    /// established sessions only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_terminal_selfsync_v2(
         &self,
         account: &mut Account,
-        history: &mut History,
-        call_id: &str,
+        history: &History,
+        call_instance_id: &str,
+        offer_id: &str,
+        reason: crate::callstate::CallTerminalReason,
+        actor_device_id: &str,
+        expires_at: u64,
     ) -> Result<Vec<Envelope>> {
         let my_username = account.account_id().to_string();
-        if history.pinned_roster(&my_username).is_none() {
-            return Ok(Vec::new()); // never linked a device — skip the network entirely
-        }
-        let me = self.resolve_account_devices(history, &my_username).await?;
+        let Some(me) = history.pinned_roster(&my_username) else {
+            return Ok(Vec::new()); // never linked a device
+        };
         if me.devices.len() <= 1 {
             return Ok(Vec::new());
         }
-        history.set_self_primary_key(&me.primary_key);
         let my_hash = IdentityHash::from_identifier(&my_username)
             .as_str()
             .to_string();
         let my_device = history.self_device_id();
-        let payload = ChatPayload::SelfCallHandled {
-            call_id: call_id.to_string(),
+        let payload = ChatPayload::SelfCallTerminalV2 {
+            call_instance_id: call_instance_id.to_string(),
+            offer_id: offer_id.to_string(),
+            reason,
+            actor_device_id: actor_device_id.to_string(),
+            expires_at,
         };
         let msg_id = random_msg_id();
         let mut out = Vec::new();
         for d in &me.devices {
-            if d.device_id == my_device {
+            if d.device_id == my_device || !account.ratchet_ref().has_session(&d.identity_key) {
                 continue;
             }
             let mailbox = self.device_mailbox_from_hash(&my_hash, &d.device_id)?;
-            self.ensure_device_session(account, &mailbox, &d.identity_key)
-                .await?;
             out.push(seal_payload_to(
                 account,
                 &mailbox,

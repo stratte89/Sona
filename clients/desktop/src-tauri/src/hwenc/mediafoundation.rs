@@ -21,16 +21,44 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use super::annexb::ParameterSets;
 
-/// Media Foundation is process-wide and must be started exactly once.
+/// Media Foundation itself is process-wide and must be started exactly once.
 static MF_INIT: Once = Once::new();
 
-fn mf_startup() {
-    MF_INIT.call_once(|| {
-        // SAFETY: both are the documented process-wide initialisers, called once. The
-        // apartment may already be initialised by the webview — that returns a non-fatal
-        // "already initialised" HRESULT, which is why the result is deliberately ignored.
+thread_local! {
+    /// COM apartments are **per thread**, and that is the whole point of this.
+    ///
+    /// `CoInitializeEx` was being called once for the process, on whichever thread first
+    /// opened an encoder. Every thread that touches a COM object afterwards has to have
+    /// entered an apartment of its own, and the encoder does not stay on one thread: it
+    /// lives on a tokio task, and tokio moves tasks between worker threads whenever it
+    /// pleases. So the second a task migrated, every `IMFTransform` call was being made
+    /// from a thread that had never initialised COM — undefined behaviour, and the kind
+    /// that corrupts a heap rather than failing cleanly.
+    ///
+    /// It went unnoticed because this code did not *run* until hardware encoding started
+    /// working, and the crashes appeared in the same release that made it work: an
+    /// access violation inside `ntdll` with a FaultTolerantHeap event beside it, which is
+    /// what heap corruption looks like from the outside.
+    static COM_THREAD: () = {
+        // SAFETY: the documented per-thread apartment initialiser. Deliberately never
+        // paired with `CoUninitialize`: a tokio worker outlives any encoder on it, and
+        // leaving the apartment while another task on the same thread still holds COM
+        // objects would be the same bug pointing the other way.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+    };
+}
+
+/// Enter a COM apartment on this thread (idempotent) and start Media Foundation once.
+///
+/// Called at the top of every entry point that touches the MFT, not just at open, because
+/// "this thread" is not the same thread each time.
+fn mf_startup() {
+    COM_THREAD.with(|_| ());
+    MF_INIT.call_once(|| {
+        // SAFETY: process-wide initialiser, called once, after COM is up on this thread.
+        unsafe {
             let _ = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
         }
     });
@@ -39,6 +67,13 @@ fn mf_startup() {
 /// A hardware H.264 encoder MFT, plus the NV12 staging buffer feeding it.
 pub(super) struct Encoder {
     mft: IMFTransform,
+    /// The MFT's own event queue — the only legal way to drive an asynchronous MFT, which
+    /// is what every hardware encoder is. See [`Encoder::pump`].
+    events: IMFMediaEventGenerator,
+    /// Unspent `METransformNeedInput` requests. The MFT decides when it wants a frame;
+    /// feeding one it did not ask for is `E_UNEXPECTED`, so they are banked here and a
+    /// frame that arrives with none outstanding is dropped rather than forced in.
+    need_input: u32,
     /// `true` when the MFT allocates its own output samples (hardware ones normally do).
     mft_allocates: bool,
     /// Size the MFT was configured for; a differently-sized frame rebuilds the encoder.
@@ -57,26 +92,82 @@ pub(super) struct Encoder {
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    pub(super) fn open(content: video::Content) -> Result<Encoder, String> {
+    /// Open the first hardware encoder on this machine that will actually take the job.
+    ///
+    /// *Every* candidate gets tried, not just the one Media Foundation puts first. A
+    /// laptop with an Intel iGPU and a discrete GPU registers an encoder MFT for each, and
+    /// the preferred-first ordering has no idea which of them will accept the resolution
+    /// being asked for — Intel's Quick Sync MFT in particular is the fussiest of the three
+    /// vendors about frame size. Stopping at the first candidate meant one picky encoder
+    /// could mask a perfectly good one sitting next to it and send the whole call to the
+    /// software path.
+    ///
+    /// `skip` candidates are passed over first, so the caller can come back for the next
+    /// encoder when the one it got failed a test this layer cannot perform — the probe in
+    /// [`super::factory`] decodes the output, which is the check that catches an encoder
+    /// that configures happily and then emits something unusable.
+    pub(super) fn open(content: video::Content, skip: usize) -> Result<Encoder, String> {
+        // Only an initial configuration: `encode` rebuilds for whatever the capture
+        // actually produces, including when the governor changes it. Shared with the
+        // probe (see `super::open_dims`) so what gets proven is what gets used.
+        let (w, h) = super::open_dims(content);
+        Encoder::open_at(content, w, h, skip)
+    }
+
+    /// As [`Encoder::open`], for a size the caller already knows — the resize path, which
+    /// needs the same "try every candidate" search rather than a second, weaker one.
+    fn open_at(content: video::Content, w: u32, h: u32, skip: usize) -> Result<Encoder, String> {
         mf_startup();
-        let (w, h) = match content {
-            // Only an initial configuration: `encode` reconfigures to whatever the
-            // capture actually produces, including when the governor changes it.
-            video::Content::Camera => (640, 480),
-            video::Content::Screen => (1920, 1080),
-        };
-        let mut enc = Encoder {
-            mft: find_hardware_encoder()?,
-            mft_allocates: false,
-            dims: (0, 0),
-            content,
-            clock: 0,
-            frame_ticks: 0,
-            nv12: Vec::new(),
-            params: ParameterSets::default(),
-        };
-        enc.configure(w, h)?;
-        Ok(enc)
+        let candidates = hardware_encoders()?;
+        if skip >= candidates.len() {
+            return Err(format!(
+                "no further hardware H.264 encoder ({} on this machine)",
+                candidates.len()
+            ));
+        }
+        let candidates = &candidates[skip..];
+        let mut last_err = String::from("no hardware H.264 encoder could be configured");
+        for act in candidates {
+            // SAFETY: activating a registered MFT; a failure is this candidate's problem,
+            // not the machine's, so it is recorded and the next one is tried.
+            let mft = match unsafe { act.ActivateObject::<IMFTransform>() } {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = format!("ActivateObject: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = unlock_async(&mft) {
+                last_err = e;
+                continue;
+            }
+            // Every hardware MFT exposes this; a candidate that does not cannot be driven
+            // and is skipped rather than guessed at.
+            let events = match mft.cast::<IMFMediaEventGenerator>() {
+                Ok(g) => g,
+                Err(e) => {
+                    last_err = format!("no IMFMediaEventGenerator: {e}");
+                    continue;
+                }
+            };
+            let mut enc = Encoder {
+                mft,
+                events,
+                need_input: 0,
+                mft_allocates: false,
+                dims: (0, 0),
+                content,
+                clock: 0,
+                frame_ticks: 0,
+                nv12: Vec::new(),
+                params: ParameterSets::default(),
+            };
+            match enc.configure(w, h) {
+                Ok(()) => return Ok(enc),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     /// Point the MFT at a frame size. Output type first, then input — encoders reject an
@@ -88,6 +179,10 @@ impl Encoder {
         };
         let fps = fps.round().max(1.0) as u32;
         self.frame_ticks = 10_000_000 / fps as i64;
+
+        // Before the types: an encoder configured for a file is no use to a call, and
+        // `ICodecAPI` properties are read when the output type is set.
+        tune_for_calls(&self.mft, bitrate);
 
         let out = media_type(
             &MFVideoFormat_H264,
@@ -125,10 +220,48 @@ impl Encoder {
         Ok(())
     }
 
-    /// Drain whatever the MFT is willing to give us right now.
-    fn pull(&mut self) -> Result<Vec<u8>, String> {
+    /// Consume every event the MFT has queued right now, without waiting.
+    ///
+    /// This is the half of the asynchronous MFT contract that was missing, and its absence
+    /// is why hardware encoding failed on every Windows machine with the same
+    /// `ProcessOutput: 0x8000FFFF` (`E_UNEXPECTED`) on all three of a test box's encoders.
+    /// An async MFT — which every hardware encoder is — does not accept being driven like
+    /// a synchronous one once it has been unlocked: input may only be delivered against a
+    /// `METransformNeedInput` it has issued, and `ProcessOutput` may only be called after
+    /// a `METransformHaveOutput`. Calling either on spec is `E_UNEXPECTED`, every time, on
+    /// every vendor's driver — which is exactly what the logs showed, three for three.
+    ///
+    /// Non-blocking on purpose. `encode` is called from the engine's encode task on a
+    /// frame deadline; blocking in `GetEvent` for an output the encoder has not finished
+    /// yet would turn a pipelined encoder into a stall. Requests to feed are banked in
+    /// [`Encoder::need_input`] and output arrives on whichever call it is ready for, which
+    /// the caller already handles — an empty access unit means "nothing this frame".
+    fn pump(&mut self) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         loop {
+            // SAFETY: the event generator belongs to this MFT; NO_WAIT makes this a poll,
+            // and `MF_E_NO_EVENTS_AVAILABLE` is the documented "queue empty".
+            let ev = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(ev) => ev,
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(out),
+                Err(e) => return Err(format!("GetEvent: {e}")),
+            };
+            // SAFETY: a live event object; `GetType` is an accessor.
+            let kind = unsafe { ev.GetType() }.map_err(|e| format!("event type: {e}"))?;
+            match MF_EVENT_TYPE(kind as i32) {
+                METransformNeedInput => self.need_input += 1,
+                METransformHaveOutput => self.take_output(&mut out)?,
+                // Drain finished, or the MFT wants its types renegotiated. Neither is
+                // fatal here: the caller's configuration is what it already asked for, so
+                // stop reading and let the probe or the resize path decide.
+                _ => return Ok(out),
+            }
+        }
+    }
+
+    /// One `ProcessOutput` against a `METransformHaveOutput` that has already arrived.
+    fn take_output(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        {
             let sample = if self.mft_allocates {
                 None
             } else {
@@ -158,36 +291,72 @@ impl Encoder {
             unsafe { std::mem::ManuallyDrop::drop(&mut buffers[0].pEvents) };
             match r {
                 Ok(()) => {}
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(out),
-                // The MFT wants its types renegotiated. Not fatal, but the caller's
-                // configuration is what it already asked for, so treat it as an error and
-                // let the probe/fallback decide.
+                // The event promised output, so this should not happen — but if the MFT
+                // changes its mind it is not worth failing the encoder over.
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
             let Some(sample) = produced else {
-                return Ok(out);
+                return Ok(());
             };
-            append_sample(&sample, &mut out)?;
+            append_sample(&sample, out)?;
         }
+        Ok(())
     }
 }
 
 impl video::H264Encode for Encoder {
     fn encode(&mut self, frame: &video::Frame) -> Result<Vec<u8>, String> {
+        // This may not be the thread that opened the encoder: the encode task is a tokio
+        // task and tokio moves those between workers. COM has to be up on *this* thread
+        // before any of the calls below.
+        mf_startup();
         if !frame.valid() {
             return Err("invalid frame".into());
         }
         let (w, h) = (frame.width as u32, frame.height as u32);
         if (w, h) != self.dims {
             // The governor stepped the capture down (or the shared window resized).
-            // Renegotiating mid-stream is legal; the MFT emits a fresh IDR after it.
-            // SAFETY: draining before a type change is what the MFT expects.
+            //
+            // A whole new MFT, not a renegotiated one. Setting fresh types on a streaming
+            // hardware MFT is legal on paper and unreliable in practice — the same
+            // `SetOutputType` that refuses an unexpected resolution outright is the one
+            // being asked to change its mind mid-stream, and when it refuses here the
+            // error propagates as an encode failure, the engine drops the encoder, the
+            // factory hands back a new one configured for the *old* size, and the next
+            // frame fails identically: a per-frame rebuild loop for the rest of the call.
+            // Building a new MFT for the new size cannot get into that state, and the
+            // governor changes resolution rarely enough that the cost is irrelevant.
+            // SAFETY: draining tells the outgoing MFT no more input is coming, so it
+            // releases what it was holding before its last reference goes away.
             unsafe {
                 let _ = self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             }
-            let _ = self.pull();
-            self.configure(w, h)?;
+            let _ = self.pump();
+            // Built through the same candidate search as the first one, at the new size:
+            // whichever encoder accepts 960-wide is not necessarily the one that accepted
+            // 1920-wide. A new MFT also means new parameter sets, and the remembered ones
+            // must not be prepended to its stream — a fresh `Encoder` gets that for free.
+            let clock = self.clock;
+            *self = Encoder::open_at(self.content, w, h, 0)?;
+            // Sample times must keep moving forward across the swap; an MFT handed a
+            // timeline that restarts at zero is entitled to treat it as a discontinuity.
+            self.clock = clock;
         }
+        // Collect whatever the encoder has to say before deciding anything: this banks
+        // `METransformNeedInput` requests and harvests finished frames.
+        let mut out = self.pump()?;
+        if self.need_input == 0 {
+            // The encoder has not asked for a frame. Feeding one anyway is `E_UNEXPECTED`,
+            // so this frame is dropped — the same "latency beats completeness" call the
+            // software path makes when the socket is backlogged.
+            return Ok(if out.is_empty() {
+                out
+            } else {
+                self.params.apply(out)
+            });
+        }
+
         i420_to_nv12(frame, &mut self.nv12);
 
         let len = self.nv12.len() as u32;
@@ -219,26 +388,29 @@ impl video::H264Encode for Encoder {
         };
         self.clock += self.frame_ticks;
 
-        // SAFETY: stream 0, a sample the MFT will copy or reference-count itself.
+        // SAFETY: stream 0, a sample the MFT will copy or reference-count itself. Spending
+        // a banked request is what makes this call legal on an asynchronous MFT.
         match unsafe { self.mft.ProcessInput(0, &sample, 0) } {
-            Ok(()) => {}
-            // Encoder is holding frames: drain and drop this one rather than queueing.
-            // Latency beats completeness for a live share, exactly as the software path
-            // drops frames when the socket is backlogged.
-            Err(e) if e.code() == MF_E_NOTACCEPTING => return self.pull(),
+            Ok(()) => self.need_input -= 1,
+            // Should not happen while a request is outstanding, but if it does the frame
+            // is dropped rather than retried — the request stays banked for the next one.
+            Err(e) if e.code() == MF_E_NOTACCEPTING => {}
             Err(e) => return Err(format!("ProcessInput: {e}")),
         }
-        let au = self.pull()?;
-        Ok(if au.is_empty() {
-            au
+        // The encode may already be finished (or may not — hardware pipelines). Either way
+        // this call returns what exists now; the rest arrives on a later frame.
+        out.extend(self.pump()?);
+        Ok(if out.is_empty() {
+            out
         } else {
-            self.params.apply(au)
+            self.params.apply(out)
         })
     }
 
     fn force_keyframe(&mut self) {
-        // Best effort: an encoder without ICodecAPI still emits periodic IDRs, and the
-        // peer's request is re-sent if it goes unanswered.
+        mf_startup(); // same reason as `encode`
+                      // Best effort: an encoder without ICodecAPI still emits periodic IDRs, and the
+                      // peer's request is re-sent if it goes unanswered.
         if let Ok(codec) = self.mft.cast::<ICodecAPI>() {
             let one = windows::Win32::System::Variant::VARIANT::from(1i32);
             // SAFETY: the GUID and a VT_I4 variant are exactly what this property takes.
@@ -249,12 +421,13 @@ impl video::H264Encode for Encoder {
     }
 }
 
-/// First hardware H.264 encoder MFT the system offers.
+/// Every hardware H.264 encoder MFT the system offers, preferred first.
 ///
 /// `MFT_ENUM_FLAG_HARDWARE` is the whole point: without it this returns Microsoft's
 /// software H.264 encoder, which is no better than the one already built in and would
-/// quietly replace it. `SORTANDFILTER` puts the preferred device first.
-fn find_hardware_encoder() -> Result<IMFTransform, String> {
+/// quietly replace it. `SORTANDFILTER` puts the preferred device first — a preference,
+/// not a verdict, which is why the caller gets the whole list and tries them in turn.
+fn hardware_encoders() -> Result<Vec<IMFActivate>, String> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
@@ -279,18 +452,9 @@ fn find_hardware_encoder() -> Result<IMFTransform, String> {
     }
     // SAFETY: `activate` points to `count` initialised optional interfaces.
     let list = unsafe { std::slice::from_raw_parts(activate, count as usize) };
-    let mut chosen = None;
-    let mut last_err = String::from("no hardware H.264 encoder could be activated");
-    for entry in list.iter() {
-        let Some(act) = entry.as_ref() else { continue };
-        if chosen.is_none() {
-            // SAFETY: activating a registered MFT; failure is reported, not fatal.
-            match unsafe { act.ActivateObject::<IMFTransform>() } {
-                Ok(t) => chosen = Some(t),
-                Err(e) => last_err = format!("ActivateObject: {e}"),
-            }
-        }
-    }
+    // Clone each interface out (an AddRef we own) before the array is torn down, so the
+    // candidates outlive MF's allocation and the caller can try them at its leisure.
+    let picked: Vec<IMFActivate> = list.iter().flatten().cloned().collect();
     // SAFETY: dropping our references to every entry, then the array MF allocated.
     unsafe {
         for entry in list.iter() {
@@ -300,7 +464,76 @@ fn find_hardware_encoder() -> Result<IMFTransform, String> {
         }
         windows::Win32::System::Com::CoTaskMemFree(Some(activate as *const _));
     }
-    chosen.ok_or(last_err)
+    if picked.is_empty() {
+        return Err("no hardware H.264 encoder could be activated".into());
+    }
+    Ok(picked)
+}
+
+/// Unlock a hardware encoder MFT so its `IMFTransform` methods can be called at all.
+///
+/// **This is why hardware encoding never engaged on Windows.** Every hardware encoder MFT
+/// is an *asynchronous* MFT (it reports `MF_TRANSFORM_ASYNC`), and an async MFT ships
+/// locked: until the client sets `MF_TRANSFORM_ASYNC_UNLOCK`, every `IMFTransform` call —
+/// including the very first `SetOutputType` — fails with `MF_E_TRANSFORM_ASYNC_LOCKED`.
+/// So `Encoder::open` failed on every machine, the probe wrote the backend off as
+/// permanently unavailable, and the gear icon correctly reported software encoding on a
+/// box with a perfectly good encoder sitting idle. Enumerating with
+/// `MFT_ENUM_FLAG_HARDWARE` and then driving the result like a plain synchronous MFT
+/// cannot work, and this is the missing half.
+///
+/// Unlocking also opts into the async *contract*, and that contract is not optional —
+/// which is worth stating plainly because assuming otherwise cost a whole extra release.
+/// An unlocked async MFT does **not** accept being driven synchronously: `ProcessOutput`
+/// called without a `METransformHaveOutput` in hand answers `E_UNEXPECTED` (`0x8000FFFF`),
+/// and it did so on all three encoders of the first machine to try it. The event pump in
+/// [`Encoder::pump`] is the other half of this function, not a refinement of it.
+fn unlock_async(mft: &IMFTransform) -> Result<(), String> {
+    // SAFETY: `GetAttributes` hands back the MFT's own attribute store (or fails on an
+    // MFT that has none, which is then not an async MFT and needs no unlocking).
+    let attrs = match unsafe { mft.GetAttributes() } {
+        Ok(a) => a,
+        Err(_) => return Ok(()),
+    };
+    // SAFETY: both are documented UINT32 attributes on an MFT attribute store.
+    unsafe {
+        // A synchronous MFT leaves this unset; unlocking one is meaningless, not harmful,
+        // but there is no reason to touch an attribute store the MFT did not ask for.
+        if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 1 {
+            return Ok(());
+        }
+        attrs
+            .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+            .map_err(|e| format!("MF_TRANSFORM_ASYNC_UNLOCK: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Ask for the lowest latency the encoder can give, and for the rate control a live call
+/// needs. Best effort: an MFT without `ICodecAPI` (or without a given property) still
+/// encodes, just with defaults tuned for files rather than calls.
+///
+/// Low-latency mode is the property that matters most. Left at its default, a hardware
+/// H.264 encoder is free to hold several frames for lookahead and B-frame reordering —
+/// which is exactly the latency a screen share cannot pay, and it would have made a
+/// working hardware encoder *feel* worse than the software one it replaced.
+fn tune_for_calls(mft: &IMFTransform, bitrate: u32) {
+    let Ok(codec) = mft.cast::<ICodecAPI>() else {
+        return;
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    // SAFETY: each GUID is paired with the variant type its property documents —
+    // VT_BOOL for the latency flag, VT_UI4 for the two rate-control values.
+    unsafe {
+        let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+        let _ = codec.SetValue(
+            &CODECAPI_AVEncCommonRateControlMode,
+            // VT_UI4, which is what this property takes — the generated constant is an
+            // i32 newtype, so the cast is the conversion and not a widening.
+            &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
+        );
+        let _ = codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate));
+    }
 }
 
 /// An `IMFMediaType` for one video format. `rate_profile` is set for the encoder's

@@ -25,6 +25,16 @@
 //!    with the call, so it averages out of the estimate instead of biasing it.
 //! 4. Subtract, and overlap-add back to PCM.
 //!
+//! The one thing this cannot survive is an echo that arrives from outside
+//! [`suppress::MAX_LAG_SAMPLES`], and for a long time on Linux it did. The share capture
+//! opened its monitor with `BufferSize::Default`, which PulseAudio reads as "server, you
+//! decide" and answers in seconds: the echo sat at a rock-steady 2.012 s against a 512 ms
+//! search. Nothing in this module was wrong; it was being asked to find a signal four
+//! times outside the range it looks in, and four rewrites of the estimator went into that
+//! gap. The capture now asks for a 20 ms buffer (see `media_shell::sysaudio`) and the same
+//! unchanged estimator locks at 32 ms and removes 36.8 dB. **Measure the delay before
+//! touching anything here.**
+//!
 //! Nothing here attenuates the shared audio on suspicion, and nothing decides per bin
 //! which of two signals to keep — both of those cost far more of the content than they
 //! save in echo, which is what the tests at the bottom of this file measure. Every
@@ -36,12 +46,25 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod delay;
 mod suppress;
 
 pub use suppress::EchoSuppressor;
 use suppress::MAX_LAG_SAMPLES;
 
 // ── Reference ring (playout mixer → capture side) ───────────────────────────────────
+
+/// What one [`RefReader::pull_detail`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pull {
+    /// Continued where the last pull left off — the lockstep the suppressor needs.
+    Aligned,
+    /// Reader had overtaken the writer: playout is not producing.
+    ReseatAhead,
+    /// Reader had fallen out of the search range behind the writer: capture frames were
+    /// lost, or the two clocks have drifted a long way apart.
+    ReseatBehind,
+}
 
 /// Reference ring capacity in samples (~1.4 s at 48 kHz). Only ever read within
 /// [`MAX_LAG_SAMPLES`] of the write head, so this is pure headroom.
@@ -126,13 +149,13 @@ impl Reference {
         }
     }
 
-    fn wpos(&self) -> u64 {
+    pub(crate) fn wpos(&self) -> u64 {
         self.inner.lock().map(|s| s.wpos).unwrap_or(0)
     }
 
     /// Copy `out.len()` samples starting at absolute index `from`. Anything outside the
     /// ring's live window reads as silence.
-    fn read(&self, from: u64, out: &mut [f32]) {
+    pub(crate) fn read(&self, from: u64, out: &mut [f32]) {
         let Ok(s) = self.inner.lock() else {
             out.fill(0.0);
             return;
@@ -161,24 +184,51 @@ impl RefReader {
     /// samples. Returns `false` when the cursor had to be re-seated (first block, or
     /// the two streams drifted out of the searchable range) — the caller must drop its
     /// alignment estimate, since the index space just moved under it.
+    /// Is a full block of reference available at the cursor yet?
+    ///
+    /// The capture side arrives in bursts — a monitor source hands over several frames at
+    /// once — while the playout publishes steadily in real time. Consuming a burst in
+    /// lockstep therefore overtakes the writer for a few milliseconds, every burst. Left
+    /// to `pull`, each of those looked like lost alignment and reset everything learned
+    /// about the echo path, so the estimate never survived long enough to converge. It is
+    /// not lost alignment; it is arriving early. The caller waits instead.
+    pub fn ready(&self, r: &Reference, n: usize) -> bool {
+        match self.cursor {
+            Some(c) => c + n as u64 <= r.wpos(),
+            None => true, // nothing seated yet; `pull` will seat against the write head
+        }
+    }
+
     pub fn pull(&mut self, r: &Reference, out: &mut [f32]) -> bool {
+        matches!(self.pull_detail(r, out), Pull::Aligned)
+    }
+
+    /// As [`RefReader::pull`], saying *which way* alignment was lost when it was.
+    ///
+    /// The two are different faults with different fixes and they were indistinguishable
+    /// in the logs: running ahead means the playout stopped publishing (a dead or idle
+    /// output stream), running behind means capture frames went missing (a full queue).
+    /// One round of field logs spent narrowing that down is one round too many.
+    pub fn pull_detail(&mut self, r: &Reference, out: &mut [f32]) -> Pull {
         let n = out.len() as u64;
         let wpos = r.wpos();
         // Seat the cursor on the newest reference: the sound in this capture block was
         // played BEFORE now, so its reference lies at or behind the write head and the
         // lag the suppressor searches for is non-negative by construction.
         let seat = wpos.saturating_sub(n);
-        let (cursor, aligned) = match self.cursor {
-            // Reader past the writer (playout stalled) or so far behind that the true
-            // lag has left the search range — re-seat rather than feed the suppressor a
-            // reference it can never line up.
-            Some(c) if c + n > wpos || wpos - (c + n) > MAX_LAG_SAMPLES as u64 => (seat, false),
-            Some(c) => (c, true),
-            None => (seat, false),
+        let (cursor, how) = match self.cursor {
+            // Reader past the writer: the playout is not publishing as fast as the capture
+            // is consuming, so there is no reference for this block yet.
+            Some(c) if c + n > wpos => (seat, Pull::ReseatAhead),
+            // So far behind that the true lag has left the search range — re-seat rather
+            // than feed the suppressor a reference it can never line up.
+            Some(c) if wpos - (c + n) > MAX_LAG_SAMPLES as u64 => (seat, Pull::ReseatBehind),
+            Some(c) => (c, Pull::Aligned),
+            None => (seat, Pull::ReseatBehind),
         };
         r.read(cursor, out);
         self.cursor = Some(cursor + n);
-        aligned
+        how
     }
 }
 

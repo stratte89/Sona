@@ -35,6 +35,7 @@
 //! by rebuilding both streams, so it is auditable immediately instead of "next call".
 
 mod devices;
+pub mod probe;
 mod resample;
 
 #[cfg(not(target_os = "android"))]
@@ -67,6 +68,40 @@ const PLAYOUT_PREFILL: usize = 2;
 /// [`crate::android_media::set_voice_noise_suppression`].
 pub static NOISE_SUPPRESSION: AtomicBool = AtomicBool::new(true);
 
+/// How loud to play the **peer's shared system audio**, in percent, and whether the
+/// listener has muted it outright.
+///
+/// Not the same thing as the peer's voice, and not persisted: a share is a thing that
+/// happens during one call, so the control resets with it. The default is deliberately
+/// half — shared audio is a whole desktop's output arriving next to one person talking,
+/// and at unity it buries them. Mute is separate from the level so that un-muting
+/// returns to where the slider was rather than to the default.
+///
+/// Same 0-200 % range and the same curve as a voice
+/// ([`client_core::call::gain_factor`]): a share can be too quiet as easily as too
+/// loud, and one scale for both is one thing to learn.
+pub static SHARE_AUDIO_GAIN: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SHARE_AUDIO_DEFAULT);
+pub static SHARE_AUDIO_MUTED: AtomicBool = AtomicBool::new(false);
+/// Half. See [`SHARE_AUDIO_GAIN`].
+pub const SHARE_AUDIO_DEFAULT: u32 = 50;
+
+/// The gain the mixer should actually apply to shared audio right now.
+pub fn share_audio_gain() -> u32 {
+    if SHARE_AUDIO_MUTED.load(Ordering::Relaxed) {
+        0
+    } else {
+        SHARE_AUDIO_GAIN.load(Ordering::Relaxed)
+    }
+}
+
+/// Reset the share controls to their defaults. Called when a call ends: these are
+/// per-call by design, and a level left over from the last call would be a surprise.
+pub fn reset_share_audio() {
+    SHARE_AUDIO_GAIN.store(SHARE_AUDIO_DEFAULT, Ordering::Relaxed);
+    SHARE_AUDIO_MUTED.store(false, Ordering::Relaxed);
+}
+
 /// Pinned capture/playout devices, as [`cpal::DeviceId`] strings (`"host:id"`, which is
 /// what `DeviceId`'s `Display` produces and what the UI round-trips). `None` — the
 /// default — means "whatever the platform calls the default", including following it
@@ -91,13 +126,23 @@ static DEVICE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub(crate) struct FrameRing<T> {
     q: Mutex<VecDeque<T>>,
     cap: usize,
+    /// Where this ring's traffic and its evictions are counted (see [`probe`]). An
+    /// eviction here is audio nobody ever hears, and it used to be entirely silent.
+    pushed: &'static probe::Counter,
+    dropped: &'static probe::Counter,
 }
 
 impl<T> FrameRing<T> {
-    fn new(cap: usize) -> Arc<Self> {
+    fn new(
+        cap: usize,
+        pushed: &'static probe::Counter,
+        dropped: &'static probe::Counter,
+    ) -> Arc<Self> {
         Arc::new(Self {
             q: Mutex::new(VecDeque::with_capacity(cap)),
             cap,
+            pushed,
+            dropped,
         })
     }
 
@@ -105,8 +150,10 @@ impl<T> FrameRing<T> {
     /// from the engine task; the critical section is a move of one 20 ms frame.
     pub(crate) fn push(&self, frame: T) {
         if let Ok(mut q) = self.q.lock() {
+            self.pushed.bump();
             while q.len() >= self.cap {
                 q.pop_front();
+                self.dropped.bump();
             }
             q.push_back(frame);
         }
@@ -245,9 +292,9 @@ pub(crate) use build_for_format;
 /// not connect and sit silent. The caller runs this on a blocking task concurrently
 /// with the room join, so the wait costs nothing.
 pub fn start() -> Result<(ShellAudio, AuxSink), String> {
-    let cap = FrameRing::new(RING_FRAMES);
-    let play = FrameRing::new(RING_FRAMES);
-    let aux = FrameRing::new(RING_FRAMES);
+    let cap = FrameRing::new(RING_FRAMES, &probe::CAP_PUSH, &probe::CAP_DROP);
+    let play = FrameRing::new(RING_FRAMES, &probe::PLAY_PUSH, &probe::PLAY_DROP);
+    let aux = FrameRing::new(RING_FRAMES, &probe::AUX_PUSH, &probe::AUX_DROP);
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -316,6 +363,11 @@ fn audio_thread(
     // Open once, then supervise: hold the streams until the call ends, rebuilding them
     // in place whenever the user pins a different microphone or output.
     let mut epoch = DEVICE_EPOCH.load(Ordering::SeqCst);
+    let mut last_health = std::time::Instant::now();
+    let mut health_base = probe::snapshot();
+    // Has a single decoded frame ever arrived this session? Until it has, the peer simply
+    // is not in the room yet and silence from them is not a fault.
+    let mut heard_peer = false;
     let mut streams = match open_streams(&cap, &play, &aux, &stop) {
         Ok(s) => {
             let _ = ready.send(Ok(()));
@@ -338,8 +390,17 @@ fn audio_thread(
                 // Nothing to fall back to that hasn't already been tried (the last
                 // attempt inside open_streams ignores the pin) — stay silent and retry
                 // on the next change rather than kill a live call.
-                Err(e) => eprintln!("[call] audio device switch failed: {e}"),
+                Err(e) => crate::diag!("[call] audio device switch failed: {e}"),
             }
+        }
+        if last_health.elapsed() >= std::time::Duration::from_secs(5) {
+            last_health = std::time::Instant::now();
+            // Only speaks up when a direction is dead, so a healthy call stays silent in
+            // the log and a broken one names which half broke.
+            if let Some(line) = probe::voice_health_since(&health_base, &mut heard_peer) {
+                crate::diag!("[call] {line}");
+            }
+            health_base = probe::snapshot();
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -383,6 +444,34 @@ fn open_streams(
     } else {
         errors.join("; ")
     })
+}
+
+/// On the PulseAudio host, name the buffer size rather than letting the server pick it.
+///
+/// `BufferSize::Default` reaches PulseAudio as a `BufferAttr` of all-`u32::MAX` — the
+/// protocol's "server, you decide" — and PulseAudio decides in *seconds*. That is why
+/// [`call_hosts`] prefers ALSA in the first place, but Pulse is still the fallback for a
+/// box with no working ALSA `default`, and there it welds seconds of latency onto the
+/// call. Measured on the share-capture path, which had no such fallback and so wore the
+/// whole fault for six releases: a rock-steady 2.012 s, cut to 32 ms by asking for one
+/// frame. See [`crate::media_shell::sysaudio`] for the full measurement.
+///
+/// Deliberately *only* that host. The ALSA path already runs ~10 ms periods, Windows and
+/// macOS were never affected, and a working low-latency path is not worth disturbing to
+/// fix one that is not on it.
+#[cfg(not(target_os = "android"))]
+fn host_config(
+    #[allow(unused_mut)] mut cfg: cpal::StreamConfig,
+    host: cpal::HostId,
+) -> cpal::StreamConfig {
+    // `HostId::PulseAudio` only exists where cpal builds that host at all.
+    #[cfg(target_os = "linux")]
+    if host == cpal::HostId::PulseAudio {
+        cfg.buffer_size = cpal::BufferSize::Fixed(SAMPLES_PER_FRAME as u32);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = host;
+    cfg
 }
 
 /// Build and start capture + playout on the pinned devices, falling back to this
@@ -448,7 +537,7 @@ fn build_duplex(
                         cap.push(frame);
                     }
                 },
-                |e| eprintln!("[call] capture error: {e}"),
+                |e| crate::diag!("[call] capture error: {e}"),
                 None,
             )
             .map_err(|e| format!("capture: {e}"))
@@ -486,6 +575,9 @@ fn build_duplex(
                 cfg,
                 move |data: &mut [T], _| {
                     let needed = data.len() / out_ch;
+                    probe::PLAYOUT_CB.bump();
+                    probe::PLAYOUT_DEMAND
+                        .add((needed as f64 * SAMPLE_RATE as f64 / out_rate as f64) as u64);
                     owed += needed as f64 * SAMPLE_RATE as f64 / out_rate as f64;
                     if !armed {
                         armed = play.len() >= PLAYOUT_PREFILL || aux.len() >= PLAYOUT_PREFILL;
@@ -496,26 +588,44 @@ fn build_duplex(
                         let voice = play.pop();
                         let aux_frame = aux.pop();
                         if voice.is_none() && aux_frame.is_none() {
+                            probe::PLAYOUT_UNDERRUN.bump();
                             armed = false; // underrun → pad with silence, re-cushion
                             break;
                         }
+                        if voice.is_some() {
+                            probe::PLAY_POP.bump();
+                        }
+                        if aux_frame.is_some() {
+                            probe::AUX_POP.bump();
+                        }
                         frame48.clear();
+                        // The listener's volume for the shared audio, applied to the aux
+                        // contribution only — the peer's voice is a separate control and
+                        // must not move when someone turns a screen share down.
+                        //
+                        // Read once per 20 ms frame rather than per sample: this runs in
+                        // an audio callback, and it is the same value for the whole frame.
+                        // The same curve the voice path uses, so a percentage means the
+                        // same loudness change wherever it is shown.
+                        let share = client_core::call::gain_factor(share_audio_gain());
                         for i in 0..SAMPLES_PER_FRAME {
                             let v = voice.map_or(0.0, |f| f[i] as f32 / 32768.0);
                             let a = aux_frame.map_or(0.0, |f| {
                                 (f[2 * i] as f32 + f[2 * i + 1] as f32) / 2.0 / 32768.0
                             });
-                            frame48.push((v + a).clamp(-1.0, 1.0));
+                            frame48.push((v + a * share).clamp(-1.0, 1.0));
                         }
                         // Publish before the device resampler: this is exactly what the
                         // machine is about to play, in the engine's own 48 kHz domain.
                         reference.publish(token, &frame48);
+                        probe::REF_REAL.add(frame48.len() as u64);
                         owed -= SAMPLES_PER_FRAME as f64;
                         rs.process(&frame48, SAMPLE_RATE, out_rate, &mut updev);
                         queue.extend_from_slice(&updev);
                     }
                     if owed >= 1.0 {
                         reference.publish_silence(token, owed as usize);
+                        probe::REF_SILENCE.add(owed as u64);
                         owed -= owed.floor();
                     }
                     for (i, frame) in data.chunks_mut(out_ch).enumerate() {
@@ -527,7 +637,7 @@ fn build_duplex(
                     let consumed = needed.min(queue.len());
                     queue.drain(..consumed);
                 },
-                |e| eprintln!("[call] playout error: {e}"),
+                |e| crate::diag!("[call] playout error: {e}"),
                 None,
             )
             .map_err(|e| format!("playout: {e}"))
@@ -549,13 +659,51 @@ fn build_duplex(
     let out_cfg = output
         .default_output_config()
         .map_err(|e| format!("output config: {e}"))?;
+    // Name the device the call actually plays into, and at what rate.
+    //
+    // This is half of a comparison: the screen-share capture logs the source it monitors
+    // (see `media_shell::sysaudio`). If the two are not the same device, the echo
+    // canceller is being handed a reference for one signal and asked to find it in
+    // another — which is indistinguishable, from inside the canceller, from an echo that
+    // simply is not there, and a whole test round was spent unable to tell those apart.
+    // The microphone too, for the same reason and one more: "I couldn't hear him" and "he
+    // couldn't hear me" are different faults on different machines, and with only the
+    // playout device logged a one-directional call could not be attributed at all. A
+    // capture device that opens and delivers silence looks, from every other vantage point,
+    // exactly like a peer who is not sending.
+    {
+        use cpal::traits::DeviceTrait;
+        let name = input
+            .id()
+            .map(|i| i.id().to_string())
+            .unwrap_or_else(|_| "<unnamed>".into());
+        crate::diag!(
+            "[media] call capture device: {name} @ {} Hz, {} ch",
+            in_cfg.sample_rate(),
+            in_cfg.channels()
+        );
+    }
+    {
+        use cpal::traits::DeviceTrait;
+        let name = output
+            .id()
+            .map(|i| i.id().to_string())
+            .unwrap_or_else(|_| "<unnamed>".into());
+        crate::diag!(
+            "[media] call playout device: {name} @ {} Hz, {} ch",
+            out_cfg.sample_rate(),
+            out_cfg.channels()
+        );
+    }
+
+    let framed = |cfg: &cpal::SupportedStreamConfig| host_config((*cfg).into(), host.id());
 
     let in_stream = build_for_format!(
         in_cfg.sample_format(),
         build_capture,
         (
             &input,
-            in_cfg.into(),
+            framed(&in_cfg),
             in_cfg.channels() as usize,
             in_cfg.sample_rate(),
             cap.clone(),
@@ -566,7 +714,7 @@ fn build_duplex(
         build_playout,
         (
             &output,
-            out_cfg.into(),
+            framed(&out_cfg),
             out_cfg.channels() as usize,
             out_cfg.sample_rate(),
             play.clone(),
@@ -606,6 +754,11 @@ fn audio_thread(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let session = VOICE_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut last_health = std::time::Instant::now();
+    let mut health_base = probe::snapshot();
+    // Has a single decoded frame ever arrived this session? Until it has, the peer simply
+    // is not in the room yet and silence from them is not a fault.
+    let mut heard_peer = false;
     crate::android_media::set_voice_capture(true);
     crate::android_media::set_voice_playout(true);
     // The bridge's start calls are best-effort "ensure alive" (the watchdog below
@@ -645,6 +798,16 @@ fn audio_thread(
             }
             crate::android_media::push_playout_frame(&mixed);
         }
+        if last_health.elapsed() >= std::time::Duration::from_secs(5) {
+            last_health = std::time::Instant::now();
+            // Same report as the desktop path, and the same counters: the Kotlin bridge
+            // pushes into these very rings, so a dead microphone or a silent playout is
+            // visible here too. Quiet while both directions are moving.
+            if let Some(line) = probe::voice_health_since(&health_base, &mut heard_peer) {
+                crate::diag!("[call] {line}");
+            }
+            health_base = probe::snapshot();
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     // A newer session is already running its own mic/playout — leaving them alive is
@@ -659,9 +822,42 @@ fn audio_thread(
 mod tests {
     use super::*;
 
+    /// The regression guard for the two-day screen-share echo bug.
+    ///
+    /// `BufferSize::Default` on the PulseAudio host means "server, you decide", and the
+    /// server decides in seconds — 2.012 s, measured. Anything that searches for an echo,
+    /// or simply expects a call to be answerable in real time, is dead at that latency.
+    /// If this test ever fails because the line was tidied away, read
+    /// [`host_config`] before changing it back.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn the_pulse_host_is_never_left_to_pick_its_own_buffer_size() {
+        let base = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: SAMPLE_RATE,
+            buffer_size: cpal::BufferSize::Default,
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let pulse = host_config(base.clone(), cpal::HostId::PulseAudio);
+            assert_eq!(
+                pulse.buffer_size,
+                cpal::BufferSize::Fixed(SAMPLES_PER_FRAME as u32),
+                "the Pulse host was left to choose its own buffer size, which is how the \
+                 screen-share echo ended up 2.012 s away from a 512 ms search"
+            );
+            // The low-latency host is deliberately untouched.
+            let alsa = host_config(base.clone(), cpal::HostId::Alsa);
+            assert_eq!(alsa.buffer_size, cpal::BufferSize::Default);
+        }
+        // Rate and channel count must survive either way.
+        let out = host_config(base, cpal::default_host().id());
+        assert_eq!((out.channels, out.sample_rate), (2, SAMPLE_RATE));
+    }
+
     #[test]
     fn ring_drops_the_oldest_frame_not_the_newest() {
-        let ring = FrameRing::<u8>::new(3);
+        let ring = FrameRing::<u8>::new(3, &probe::CAP_PUSH, &probe::CAP_DROP);
         for i in 0..5u8 {
             ring.push(i);
         }

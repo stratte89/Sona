@@ -47,6 +47,7 @@ mod bio;
 mod call;
 mod cmd;
 mod delivery_service;
+mod diag;
 pub(crate) mod engine;
 mod hw_attest;
 // Hardware H.264 encoding, desktop only: Android already encodes on the device's media
@@ -58,29 +59,51 @@ mod jni_entry;
 mod media_shell;
 mod notif;
 pub(crate) mod notifier;
+mod outbox;
 mod push;
 mod runtime;
 mod state;
+mod telecom;
 mod update;
 mod views;
 pub(crate) use attr_heal::*;
+pub(crate) use call::accept::*;
+pub(crate) use call::capsule::*;
+pub(crate) use call::capsule_apply::*;
+pub(crate) use call::capsule_send::*;
+pub(crate) use call::claim::*;
 pub(crate) use call::cmd::*;
 pub(crate) use call::engine::*;
 pub(crate) use call::group::*;
+pub(crate) use call::group_end::*;
+pub(crate) use call::identity::*;
+pub(crate) use call::reconnect::*;
+pub(crate) use call::route::*;
+pub(crate) use call::self_signal::*;
 pub(crate) use call::signal::*;
+pub(crate) use call::store::*;
+pub(crate) use call::store_locked::*;
+// Reached from `jni_entry` (Android only); the desktop build has no platform call
+// events to route.
+#[cfg_attr(not(target_os = "android"), allow(unused_imports))]
+pub(crate) use call::system::*;
+pub(crate) use call::unlock::*;
 pub(crate) use cmd::chat::*;
 pub(crate) use cmd::files::*;
 pub(crate) use cmd::groups::*;
 pub(crate) use cmd::security::*;
 pub(crate) use cmd::setup::*;
 pub(crate) use notif::*;
+pub(crate) use outbox::*;
 pub(crate) use push::*;
 pub(crate) use runtime::*;
 pub(crate) use state::{
-    detect_capabilities, device_key, device_key_or_create, eng, AppState, CallCtl, GroupCallCtl,
-    PendingGroupOffer, PendingOffer, PendingReconnect, Prefs, RelayConfig, Session,
-    LEG_REOFFER_DELAY_MS, MAX_GROUP_CALL_MEMBERS, MAX_LEG_REOFFERS, MAX_PIN_ATTEMPTS,
-    PRESENCE_WINDOW_SECS, RECONNECT_GRACE_MS, RECONNECT_WINDOW_SECS,
+    detect_capabilities, device_key, device_key_or_create, eng, AppState, BufferedClaim,
+    CallBindings, CallCtl, GroupCallCtl, GroupCoordinator, GroupRingDeadline, OutgoingSetup,
+    PendingClaim, PendingGroupClaim, PendingGroupOffer, PendingOffer, PendingReconnect,
+    PendingUnlock, Prefs, RelayConfig, Session, LEG_REOFFER_DELAY_MS, MAX_BUFFERED_CLAIMS,
+    MAX_GROUP_CALL_MEMBERS, MAX_LEG_REOFFERS, MAX_PIN_ATTEMPTS, PRESENCE_WINDOW_SECS,
+    RECONNECT_GRACE_MS, RECONNECT_WINDOW_SECS, UNLOCK_TO_ANSWER_SECS,
 };
 pub(crate) use views::*;
 
@@ -302,13 +325,13 @@ async fn attachment_ref(
 // ---------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------
-// Voice calls. Signaling rides the ratchet (CallOffer/Answer/End); media is the
+// Voice calls. V2 offer/claim/winner/terminal signaling rides the ratchet; media is the
 // client-core engine over the relay's blind rooms; audio is cpal (audio.rs). Design
 // rationale lives in client-core/src/call.rs and crates/server/src/call.rs.
 // ---------------------------------------------------------------------------------------
 
 /// How long an unanswered ring lasts, both directions.
-const RING_TIMEOUT_SECS: u64 = 45;
+const RING_TIMEOUT_SECS: u64 = client_core::callstate::CALL_RING_TIMEOUT_SECS;
 
 // ---------------------------------------------------------------------------------------
 // Group calls. A full mesh of the 1:1 blind pair rooms — one room + one fresh key per
@@ -416,8 +439,19 @@ fn allow_microphone(_app: &tauri::AppHandle) {}
 /// Android drops a process's stdout/stderr on the floor, which makes every `eprintln`
 /// diagnostic in the Rust tree invisible in release builds. Bridge them to logcat
 /// (tag `SonaRust`) so on-device failures are debuggable at all.
+/// Idempotent, and reachable from the headless entry points as well as from [`run`].
+///
+/// It used to be installed only by `run`, the Tauri **activity** entry point. A push-woken
+/// drain does not go through that — it arrives at `nativeWake` → `init_data_dir` — so on
+/// exactly the path whose failures are hardest to see, and which E-9 exists to make
+/// visible, every `eprintln` went to the closed stdout Android gives a process and was
+/// lost. The bridge has to be up before the first line, wherever the process came from.
 #[cfg(target_os = "android")]
-fn redirect_stdio_to_logcat() {
+pub(crate) fn redirect_stdio_to_logcat() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return; // already bridged: a second dup2 would orphan the first reader thread
+    }
     unsafe extern "C" {
         fn __android_log_write(prio: i32, tag: *const u8, text: *const u8) -> i32;
     }
@@ -716,6 +750,7 @@ pub fn run() {
             cmd::files::clipboard_image,
             cmd::delivery::app_background,
             call::cmd::call_status,
+            call::unlock::answer_with_app_credential,
             call::cmd::call_start,
             call::cmd::call_accept,
             call::cmd::call_decline,
@@ -724,13 +759,71 @@ pub fn run() {
             call::cmd::call_set_camera,
             call::cmd::call_set_screen,
             call::cmd::call_set_screen_audio,
+            call::volume::call_voice_volume,
+            call::volume::call_set_voice_gain,
+            call::volume::call_set_voice_muted,
+            call::volume::call_share_volume,
+            call::volume::call_set_share_gain,
+            call::volume::call_set_share_muted,
             call::cmd::call_media_channel,
+            call::cmd::call_frame_ack,
             call::group::group_call_start,
             call::group::group_call_accept,
-            call::group::group_call_decline,
-            call::group::group_call_hangup,
-            call::group::group_call_set_muted,
+            call::group_end::group_call_decline,
+            call::group_end::group_call_hangup,
+            call::group_end::group_call_set_muted,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Sona");
+        .build(tauri::generate_context!())
+        .expect("error while running Sona")
+        .run(|_app, _event| {
+            // E-16. **Android must never run `exit()`'s finalizers.**
+            //
+            // Destroying the activity (a swipe out of recents, or the system reclaiming it)
+            // takes the last window with it, and `tauri-runtime-wry` answers a window
+            // destroyed with no windows left by raising `ExitRequested`; unprevented, that
+            // sets `ControlFlow::Exit`, `tao`'s Android `run` returns, and it finishes with
+            // `std::process::exit`. That is a **libc** exit: it runs `__cxa_finalize`, which
+            // runs the static destructors of every shared object in the process — including
+            // `libhwui.so`, which the zygote loaded and which is still running its own
+            // `hwuiTask` pool. Those threads then lock a mutex that finalization has already
+            // destroyed:
+            //
+            // ```
+            // wm_on_destroy_called: MainActivity performDestroy
+            // F/libc (8053, tid 8216 hwuiTask0): FORTIFY: pthread_mutex_lock called on a
+            //                                    destroyed mutex (0x7f16c03718)
+            // F/libc (8053, tid 8217 hwuiTask1): …same address…
+            // am_proc_died: app.sona.messenger
+            // ```
+            //
+            // Measured 2026-08-01: six of twenty activity destroys aborted this way — it only
+            // fires when an `hwuiTask` happens to be mid-work during finalization, which is
+            // what made it look like a call bug. The address is identical in every process
+            // because a zygote-loaded library is mapped at the same place in every fork.
+            //
+            // So the process must not finalize. What it must **not** do instead is keep
+            // running: `prevent_exit` was tried first and black-screens the app, because the
+            // only thing that ever builds the webview is `WryLifecycleObserver`, a singleton
+            // registered against `ProcessLifecycleOwner` — re-adding the same instance for a
+            // second activity is a no-op, so a surviving process gets a MainActivity with no
+            // webview in it. Tauri's Android runtime is built on the process dying; keeping it
+            // alive needs the webview rebuilt, which is not this fix's to do.
+            //
+            // `_exit` is: it ends the process at once and skips `__cxa_finalize` entirely, so
+            // no destructor runs and there is no destroyed mutex for `libhwui`'s threads to
+            // find. Nothing is lost by skipping the destructors — the call store is sealed
+            // through `write_atomic` (write, `sync_all`, rename) on every change, and the
+            // vault the same way, so everything that must outlive the process is already on
+            // disk before this point. The old path ran those destructors and then aborted
+            // ~30% of the time, which is strictly worse.
+            //
+            // What this deliberately does not fix: the process still ends when the activity
+            // does, taking the delivery engine and any live call with it. That is the same
+            // behaviour as every release so far, it is wrong, and the fix for it is a
+            // separate-process engine (`android:process`), not an exit hook.
+            #[cfg(target_os = "android")]
+            if let tauri::RunEvent::ExitRequested { .. } = &_event {
+                unsafe { libc::_exit(0) };
+            }
+        });
 }

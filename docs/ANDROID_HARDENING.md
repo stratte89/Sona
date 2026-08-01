@@ -116,12 +116,34 @@ cargo tauri android init          # needs the Android SDK/NDK toolchain
      content out of the shade.
    * **Delivery modes** — **Connection** (the `specialUse` foreground service +
      hardened socket: read watchdog, client keepalive pings, jittered backoff,
-     connectivity-callback reconnect; Google-free, the default), **Push only**
+     connectivity-callback reconnect; Google-free), **Push only**
      (no persistent service; the relay sends a content-free FCM wake and the app
      drains the mailbox in a shortService burst), or **Connection + push fallback**
      (the relay wakes only when it sees no live subscriber — self-healing when an
-     OEM kills the service). Wake metadata is documented in `docs/THREAT_MODEL.md`;
-     the default remains no-third-party.
+     OEM kills the service). Wake metadata is documented in `docs/THREAT_MODEL.md`.
+     The default is **resolved per device**: connection + push fallback where a wake
+     transport is actually usable, connection alone where it is not, never push-only.
+     Firebase is initialized only when `com.google.android.gms` is installed in the
+     profile (with the manifest `<queries>` visibility that check needs), so a
+     de-Googled phone loads no FCM class and is never told it has a transport it
+     does not have.
+9. **Core-Telecom call lifecycle** (`TelecomBridge.kt`, `androidx.core:core-telecom`
+   pinned exactly, plus `MANAGE_OWN_CALLS` / `FOREGROUND_SERVICE_PHONE_CALL` and keep
+   rules). Sona registers with `CallsManager` in `Application.onCreate` and adds every
+   call to the platform, so ringing/answered/active/held/disconnected are system states
+   that survive the Activity and reach watches, headsets and cars. Telecom owns the
+   audio route; `MediaBridge` keeps capture, playout and platform AEC/NS but stops
+   calling `setCommunicationDevice`/SCO while Telecom holds it, so the two cannot fight.
+   Hold and streaming are not advertised — Sona does not implement their state
+   semantics. The Kotlin Gradle plugin is bumped to 2.x by the script because
+   Core-Telecom ships Kotlin 2.1 metadata a 1.9 compiler cannot read.
+10. **Locked call control** (`docs/PROTOCOL.md` § Locked call
+   delivery). A scoped call-only identity — sealed under the device key, not the vault
+   seal key — lets a locked phone drain its own call-control mailbox, present a generic
+   ring, cancel one that is over, and decline. It carries no media capability and can
+   open nothing the vault protects. Its bounded store is excluded from Android backup
+   and destroyed on account deletion or KT-verified revocation; answering still costs a
+   real unlock (`Require app unlock to answer calls`, default on).
 
 Re-run the script whenever the project is regenerated; it detects an already-hardened
 tree and does nothing. If `MainActivity.kt` has drifted from the pristine template the
