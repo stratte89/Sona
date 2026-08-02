@@ -1559,6 +1559,8 @@ dependencies = [
  "crypto-core",
  "futures-util",
  "hex",
+ "hkdf",
+ "hmac",
  "kt-log",
  "protocol-types",
  "quinn",

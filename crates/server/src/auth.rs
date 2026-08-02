@@ -10,6 +10,16 @@
 //! Because nonces are single-use and short-lived, a captured signature cannot be
 //! replayed — so the auth scheme does not even rely on TLS to stay unforgeable (TLS is
 //! still required for metadata confidentiality; see the server docs).
+//!
+//! Replay is only half of it. The **relay chooses the challenge bytes**, and the key
+//! signing them is the account's long-term identity key, so the challenge is also a
+//! potential blind signing oracle: serve another context's signing payload as the
+//! "nonce" and the client hands back a genuine signature over it (SP-01). That is why
+//! the client never signs the nonce directly — it signs
+//! [`protocol_types::ws_auth_signing_message`], which is domain-separated from every
+//! other signing context and bound to the mailbox being authenticated. `issue` mints
+//! exactly [`protocol_types::WS_AUTH_NONCE_LEN`] random bytes and both sides refuse
+//! anything else, so no longer structure can ride the challenge field either.
 
 use std::collections::HashMap;
 
@@ -35,57 +45,123 @@ pub fn verify(signing_key_b64: &str, message: &[u8], signature_b64: &str) -> boo
 }
 
 /// Single-use, TTL-bound login nonces, keyed by identity hash.
+///
+/// Each hash holds a small **set** of live nonces, not one slot (SP-07). With one slot,
+/// every issue overwrote the previous one — and `GET /v1/challenge?hash=…` is
+/// unauthenticated with a publicly computable hash, so anyone could poll a victim's hash
+/// and overwrite whatever nonce that victim had just fetched, in the multi-step window
+/// between fetching it and sending the `Auth` frame. The victim's `Auth` then always
+/// presented a stale nonce and always failed. At 20/min per source IP that is a poison
+/// every three seconds from one address, trivially multiplied — a targeted denial of
+/// authentication against any named user, which also took out push register/unregister,
+/// call-key publish, and account deletion (same store). It was very likely also the cause
+/// of self-inflicted intermittent auth failures when one account opened two authenticated
+/// sockets on the same mailbox concurrently.
 #[derive(Default)]
 pub struct ChallengeStore {
-    // hash -> (nonce_b64, expires_at_unix)
-    nonces: HashMap<String, (String, u64)>,
+    // hash -> [(nonce_b64, expires_at_unix); at most MAX_NONCES_PER_HASH], oldest first
+    nonces: HashMap<String, Vec<(String, u64)>>,
 }
 
 /// How long a login nonce is valid. Short window bounds the replay/relay surface.
 pub const NONCE_TTL_SECS: u64 = 60;
 
+/// Live nonces one identity hash may hold at once.
+///
+/// The set must be bounded, or the fix would only move the DoS from "poison one nonce"
+/// to "exhaust memory issuing nonces for one hash" — so over the cap the **oldest** live
+/// entry is dropped. That leaves a residual: an attacker who can push this many fresh
+/// challenges for the victim's hash *inside the victim's few-second auth window* still
+/// rolls the victim's nonce out. The bound is therefore sized against that window rather
+/// than against real client concurrency (a client has at most a handful of sockets in
+/// flight). At the 20/min per-IP `auth_rate`, evicting a specific in-flight nonce takes
+/// on the order of this many distinct source addresses acting inside a window of
+/// seconds, instead of the single poll that used to be enough — and the victim's retry
+/// re-arms with a fresh nonce that has to be pushed out all over again.
+///
+/// It cannot be closed completely at this layer: `/v1/challenge` is unauthenticated by
+/// design and addressed by a publicly computable hash, so *some* per-hash resource is
+/// always reachable. Raising the cost and removing the "one request, one poisoning"
+/// primitive is the available win.
+pub const MAX_NONCES_PER_HASH: usize = 64;
+
 /// Hard ceiling on outstanding nonces. A live nonce is at most [`NONCE_TTL_SECS`] old,
 /// so a rate-limited `/challenge` cannot accumulate more than a bounded set — but cap it
-/// anyway as a fail-safe against unbounded memory growth (M-3).
+/// anyway as a fail-safe against unbounded memory growth (M-3). Counted across all
+/// hashes, so the per-hash set cannot be used to slip past it either.
 pub const MAX_NONCES: usize = 100_000;
 
 impl ChallengeStore {
-    /// Issue a fresh 32-byte random nonce for `hash`, replacing any prior one. Prunes any
-    /// nonces that have already expired first, so the map cannot grow without bound when
-    /// many distinct hashes each request a challenge (M-3).
+    /// Issue a fresh [`protocol_types::WS_AUTH_NONCE_LEN`]-byte random nonce for `hash`,
+    /// **adding** it to that hash's live set rather than replacing it (SP-07) — a
+    /// concurrent challenge for the same hash, whoever asked for it, must not invalidate
+    /// one already in flight. The length is a wire contract, not an implementation
+    /// detail: both sides reject an off-length nonce (SP-01). Prunes any nonces that have
+    /// already expired first, so the map cannot grow without bound when many distinct
+    /// hashes each request a challenge (M-3).
     pub fn issue(&mut self, hash: &str, now: u64) -> String {
         // Only sweep once we are actually carrying some backlog, to keep the common path
         // cheap; the ceiling is the fail-safe if a sweep can't keep up.
-        if self.nonces.len() >= 1024 {
+        if self.live() >= 1024 {
             self.sweep(now);
         }
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; protocol_types::WS_AUTH_NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let nonce = vodozemac::base64_encode(buf);
         // Fail-safe: if we are still at the ceiling after sweeping (a flood of live,
         // un-expired nonces), refuse to grow further — an existing hash may still refresh
-        // its own slot, but no new hash gets one until the pressure drains.
-        if self.nonces.len() >= MAX_NONCES && !self.nonces.contains_key(hash) {
+        // its own set, but no new hash gets one until the pressure drains.
+        if self.live() >= MAX_NONCES && !self.nonces.contains_key(hash) {
             return nonce; // handed back but never stored ⇒ unusable, self-limiting
         }
-        self.nonces
-            .insert(hash.to_string(), (nonce.clone(), now + NONCE_TTL_SECS));
+        let set = self.nonces.entry(hash.to_string()).or_default();
+        set.retain(|(_, expires)| now < *expires);
+        // Bounded per hash: a challenge flood against one hash rolls its own oldest
+        // entries out instead of growing memory. Eight is far more than any real client
+        // has in flight, so this only ever bites an attacker.
+        if set.len() >= MAX_NONCES_PER_HASH {
+            set.remove(0);
+        }
+        set.push((nonce.clone(), now + NONCE_TTL_SECS));
         nonce
     }
 
-    /// Consume the nonce for `hash` if it matches and has not expired. Single-use:
-    /// a successful (or expired) check removes it so it can never be replayed.
+    /// Consume `nonce` for `hash` if it is in that hash's live set and has not expired.
+    /// Single-use: the matched entry is removed so it can never be replayed. Only the
+    /// matched nonce is removed — the other in-flight challenges for that hash survive,
+    /// which is the point of the set.
     pub fn consume(&mut self, hash: &str, nonce: &str, now: u64) -> bool {
-        match self.nonces.remove(hash) {
-            Some((stored, expires)) => stored == nonce && now < expires,
-            None => false,
+        let Some(set) = self.nonces.get_mut(hash) else {
+            return false;
+        };
+        let Some(i) = set.iter().position(|(stored, _)| stored == nonce) else {
+            // No match: also a good moment to shed this hash's expired entries, so a
+            // failed attempt cannot be used to pin them for the full TTL.
+            set.retain(|(_, expires)| now < *expires);
+            if set.is_empty() {
+                self.nonces.remove(hash);
+            }
+            return false;
+        };
+        let (_, expires) = set.remove(i);
+        if set.is_empty() {
+            self.nonces.remove(hash);
         }
+        now < expires
     }
 
     /// Drop every expired nonce. Called opportunistically on issue and periodically by the
     /// relay's reaper so abandoned challenges never pin memory.
     pub fn sweep(&mut self, now: u64) {
-        self.nonces.retain(|_, (_, expires)| now < *expires);
+        self.nonces.retain(|_, set| {
+            set.retain(|(_, expires)| now < *expires);
+            !set.is_empty()
+        });
+    }
+
+    /// Total live nonces across every hash — what [`MAX_NONCES`] bounds.
+    fn live(&self) -> usize {
+        self.nonces.values().map(Vec::len).sum()
     }
 }
 
@@ -247,6 +323,60 @@ mod tests {
         // Well past the TTL: a sweep clears the map so it can't grow without bound (M-3).
         cs.sweep(1000 + NONCE_TTL_SECS + 1);
         assert!(!cs.consume("a", "anything", 1000 + NONCE_TTL_SECS + 2));
+        assert!(cs.nonces.is_empty());
+    }
+
+    /// SP-07: `/v1/challenge` is unauthenticated and the hash is public, so anyone can
+    /// ask for a challenge on someone else's mailbox. Doing so must not invalidate the
+    /// nonce that mailbox already has in flight — with one slot per hash it did, which
+    /// is a targeted denial of authentication against any named user.
+    #[test]
+    fn a_concurrent_challenge_does_not_poison_one_already_in_flight() {
+        let mut cs = ChallengeStore::default();
+        let victim = cs.issue("victim", 1000);
+        // One attacker address can spend its whole 20/min `auth_rate` budget on the
+        // victim's hash and still not touch the nonce already in flight.
+        for _ in 0..20 {
+            cs.issue("victim", 1000);
+        }
+        assert!(
+            cs.consume("victim", &victim, 1010),
+            "the victim's own nonce must still authenticate"
+        );
+        // Still single-use.
+        assert!(!cs.consume("victim", &victim, 1010));
+    }
+
+    /// The set is bounded, or the fix would trade one DoS for another: unbounded growth
+    /// per hash. Over the cap the oldest live nonce rolls out.
+    #[test]
+    fn the_per_hash_nonce_set_is_bounded() {
+        let mut cs = ChallengeStore::default();
+        let issued: Vec<String> = (0..MAX_NONCES_PER_HASH * 3)
+            .map(|_| cs.issue("bob", 1000))
+            .collect();
+        assert_eq!(cs.nonces["bob"].len(), MAX_NONCES_PER_HASH);
+        // The newest MAX_NONCES_PER_HASH survive; the oldest are gone.
+        assert!(!cs.consume("bob", &issued[0], 1010));
+        assert!(cs.consume("bob", issued.last().unwrap(), 1010));
+    }
+
+    /// Two concurrent sockets on the same mailbox — the everyday version of the same bug.
+    #[test]
+    fn two_sockets_on_one_mailbox_can_both_authenticate() {
+        let mut cs = ChallengeStore::default();
+        let a = cs.issue("me", 1000);
+        let b = cs.issue("me", 1000);
+        assert!(cs.consume("me", &a, 1001));
+        assert!(cs.consume("me", &b, 1002));
+    }
+
+    /// A failed consume must not leave the hash's expired entries pinned for the TTL.
+    #[test]
+    fn a_failed_consume_sheds_expired_entries() {
+        let mut cs = ChallengeStore::default();
+        cs.issue("bob", 1000);
+        assert!(!cs.consume("bob", "wrong", 1000 + NONCE_TTL_SECS + 1));
         assert!(cs.nonces.is_empty());
     }
 

@@ -48,8 +48,14 @@ pub(crate) fn call_log_enabled() -> bool {
 /// Enough to follow one call across a few lines during a debugging session, far too little to
 /// reconstruct the 128-bit capability it comes from — and the room id is the only thing here
 /// that could pair two parties.
-pub(crate) fn room_tag(call_id: &str) -> &str {
-    &call_id[..call_id.len().min(8)]
+/// Boundary-safe on purpose (SP-17): this is called on the **raw path parameter**,
+/// before `valid_call_id` has had a chance to reject it (see `handle_call_socket`), so
+/// the input is arbitrary attacker-supplied UTF-8. A byte slice at index 8 panics on
+/// anything multibyte — `"€€€"` is 9 bytes and index 8 lands mid-character — which is a
+/// remote panic in exactly the mode an operator turns on to debug a live incident.
+/// Taking 8 *characters* cannot land off a boundary.
+pub(crate) fn room_tag(call_id: &str) -> String {
+    call_id.chars().take(8).collect()
 }
 
 /// Hard cap per media frame: the largest media-v2 wire cell,
@@ -180,6 +186,14 @@ pub struct CallRoom {
 #[derive(Default)]
 pub struct CallRooms {
     rooms: HashMap<String, CallRoom>,
+    /// Which pseudonymized client CREATED each live room, and how many each currently
+    /// holds (SP-11). `MAX_ROOMS` alone was a global counter one actor could exhaust:
+    /// ~2048 paired sockets, held so the rooms survive the lonely reap, cost about 35
+    /// IP-minutes at 60 joins/min — and every call on the relay is then refused for up
+    /// to `MAX_ROOM_AGE_SECS`, six hours. Charging creation to the creating client caps
+    /// how much of the shared pool one address can claim.
+    room_owner: HashMap<String, String>,
+    owned: HashMap<String, usize>,
 }
 
 impl CallRooms {
@@ -188,23 +202,51 @@ impl CallRooms {
     /// socket being closed — so holding a connection open cannot pin a slot past
     /// [`LONELY_ROOM_TTL_SECS`] (M-4). Called lazily on every join and by the reaper.
     pub fn gc(&mut self, t: u64) {
-        self.rooms.retain(|_, r| {
+        let owner = &mut self.room_owner;
+        let owned = &mut self.owned;
+        self.rooms.retain(|id, r| {
             let lonely_expired =
                 r.members.len() < 2 && t.saturating_sub(r.created_at) > LONELY_ROOM_TTL_SECS;
             let too_old = t.saturating_sub(r.created_at) > MAX_ROOM_AGE_SECS;
-            !(lonely_expired || too_old)
+            let keep = !(lonely_expired || too_old);
+            if !keep {
+                release_room(owner, owned, id);
+            }
+            keep
         });
+    }
+
+    /// Rooms this client currently holds. Test/diagnostic accessor.
+    pub fn owned_by(&self, client: &str) -> usize {
+        self.owned.get(client).copied().unwrap_or(0)
+    }
+}
+
+/// Give a reaped room's slot back to whoever created it.
+fn release_room(
+    owner: &mut HashMap<String, String>,
+    owned: &mut HashMap<String, usize>,
+    call_id: &str,
+) {
+    if let Some(client) = owner.remove(call_id) {
+        if let Some(n) = owned.get_mut(&client) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                owned.remove(&client);
+            }
+        }
     }
 }
 
 /// Join a room over either transport: enforce caps, notify the earlier member, send
 /// the `joined` message to the newcomer. Returns the member id, or `None` when the
 /// join is refused (relay full / room full).
-pub fn join_room(state: &AppState, call_id: &str, member: Member) -> Option<u64> {
+pub fn join_room(state: &AppState, call_id: &str, member: Member, client: &str) -> Option<u64> {
     let mut calls = state.calls.lock().unwrap();
     let t = now();
     calls.gc(t);
-    if calls.rooms.len() >= state.config.max_rooms && !calls.rooms.contains_key(call_id) {
+    let is_new = !calls.rooms.contains_key(call_id);
+    if calls.rooms.len() >= state.config.max_rooms && is_new {
         if call_log_enabled() {
             eprintln!(
                 "[room] {} join REFUSED: relay at max_rooms",
@@ -212,6 +254,25 @@ pub fn join_room(state: &AppState, call_id: &str, member: Member) -> Option<u64>
             );
         }
         return None; // relay full — caller retries or gives up
+    }
+    // Per-client share of the shared room pool (SP-11). Charged on CREATION only —
+    // joining a room someone else opened is the second leg of a real call and must never
+    // be refused for a quota the caller does not control.
+    if is_new {
+        let held = calls.owned.get(client).copied().unwrap_or(0);
+        if held >= state.config.max_rooms_per_client {
+            if call_log_enabled() {
+                eprintln!(
+                    "[room] {} create REFUSED: client at its room quota",
+                    room_tag(call_id)
+                );
+            }
+            return None;
+        }
+        calls
+            .room_owner
+            .insert(call_id.to_string(), client.to_string());
+        *calls.owned.entry(client.to_string()).or_insert(0) += 1;
     }
     let room = calls
         .rooms
@@ -284,6 +345,12 @@ pub fn leave_room(state: &AppState, call_id: &str, my_id: u64) {
             .get(call_id)
             .and_then(|room| room.members.iter().find(|m| m.id != my_id).cloned());
         calls.rooms.remove(call_id);
+        // Give the creating client its room slot back (SP-11) — otherwise the quota
+        // leaks on every normal hang-up and legitimate callers run out.
+        let CallRooms {
+            room_owner, owned, ..
+        } = &mut *calls;
+        release_room(room_owner, owned, call_id);
         peer
     };
     // The other side of the join line: a room dissolving early is what would leave the next
@@ -339,7 +406,12 @@ pub(crate) fn valid_call_id(id: &str) -> bool {
 /// Drive one member's WebSocket: join the room, forward its binary frames to the peer,
 /// relay join/leave notices, tear down on close. (The QUIC twin lives in
 /// [`crate::quic`]; both share the room/join/leave/budget logic above.)
-pub async fn handle_call_socket(socket: WebSocket, state: AppState, call_id: String) {
+pub async fn handle_call_socket(
+    socket: WebSocket,
+    state: AppState,
+    call_id: String,
+    client: String,
+) {
     // Both refusals below drop a socket that has **already upgraded**, so the client's
     // `join_call` has returned Ok and it believes it is in the room. It then waits for a peer
     // who, from the relay's side, is sharing a room with nobody. That is the fault the
@@ -359,7 +431,7 @@ pub async fn handle_call_socket(socket: WebSocket, state: AppState, call_id: Str
     let (tx, mut rx) = unbounded_channel::<Message>();
 
     // ── Join ──
-    let Some(my_id) = join_room(&state, &call_id, Member::new(MemberTx::Ws(tx))) else {
+    let Some(my_id) = join_room(&state, &call_id, Member::new(MemberTx::Ws(tx)), &client) else {
         if call_log_enabled() {
             eprintln!(
                 "[room] {} REFUSED after upgrade: join_room declined — the client believes it \

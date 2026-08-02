@@ -53,11 +53,13 @@ async fn client_replenishes_its_own_one_time_keys() {
     let pinned = Client::fetch_kt_pubkey(&base, None).await.unwrap();
     let client = Client::new(&base, &ws, &pinned);
 
-    // Bob registers with only 1 one-time key, then tops himself up to 10.
+    // Bob registers with only 1 one-time key, then tops himself up. The relay answers a
+    // coarse bucket rather than an exact count (SP-10), so the client uploads a whole
+    // batch instead of a computed difference — the relay dedups and caps.
     let (mut bob, _) = create_account_with_username("bob", "Bob-Password-456!").unwrap();
     client.register(&mut bob, 1).await.unwrap();
-    let added = client.replenish_own_keys(&mut bob, 10).await.unwrap();
-    assert_eq!(added, 9);
+    let added = client.replenish_own_keys(&mut bob, 20).await.unwrap();
+    assert_eq!(added, 20);
 
     // A fresh contact can now start a session (consumes one of Bob's keys).
     let (mut alice, _) = create_account_with_username("alice", "Alice-Password-123!").unwrap();
@@ -65,7 +67,8 @@ async fn client_replenishes_its_own_one_time_keys() {
     let bob_contact = client.add_contact(&mut alice, "bob").await.unwrap();
     assert_eq!(bob_contact.identity_key, bob.ratchet_ref().identity_key());
 
-    // Already at/above target (9 left ≥ 5) → replenish is a no-op.
+    // Stock is comfortably above the relay's watermark → the next replenish is a no-op,
+    // so a healthy client is not re-uploading (and re-sealing its vault) every cycle.
     let added2 = client.replenish_own_keys(&mut bob, 5).await.unwrap();
     assert_eq!(added2, 0);
 }
@@ -390,17 +393,20 @@ async fn reopening_a_chat_does_not_burn_one_time_keys() {
     let (mut alice, _) = create_account_with_username("alice", "Alice-Password-123!").unwrap();
     let (mut bob, _) = create_account_with_username("bob", "Bob-Password-456!").unwrap();
     client.register(&mut alice, 5).await.unwrap();
-    client.register(&mut bob, 10).await.unwrap();
+    client.register(&mut bob, 11).await.unwrap();
     let bob_hash = bob.identity_hash().as_str().to_string();
 
-    let remaining = |base: String, hash: String| async move {
+    // The relay publishes a coarse bucket, never an exact count (SP-10). Bob is
+    // registered with watermark+1 keys, so "low" means exactly one key was burned and
+    // "none" would mean the re-opens burned the rest — enough to tell the two apart.
+    let level = |base: String, hash: String| async move {
         let v: serde_json::Value = reqwest::get(format!("{base}/v1/keys/count/{hash}"))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        v["remaining"].as_u64().unwrap()
+        v["level"].as_str().unwrap().to_string()
     };
 
     // First contact consumes exactly one key.
@@ -412,7 +418,7 @@ async fn reopening_a_chat_does_not_burn_one_time_keys() {
         ContactOutcome::New(c) => c,
         other => panic!("expected New, got {other:?}"),
     };
-    assert_eq!(remaining(base.clone(), bob_hash.clone()).await, 9);
+    assert_eq!(level(base.clone(), bob_hash.clone()).await, "low");
 
     // Ten re-opens (known key + live session) consume none.
     for _ in 0..10 {
@@ -425,7 +431,11 @@ async fn reopening_a_chat_does_not_burn_one_time_keys() {
             other => panic!("expected Unchanged, got {other:?}"),
         }
     }
-    assert_eq!(remaining(base.clone(), bob_hash.clone()).await, 9);
+    assert_eq!(
+        level(base.clone(), bob_hash.clone()).await,
+        "low",
+        "ten re-opens must burn no keys — \"none\" here would mean they did"
+    );
 
     // And the session those re-opens preserved still delivers.
     client

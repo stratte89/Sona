@@ -140,6 +140,24 @@ pub enum RosterAudit {
     },
 }
 
+/// Result of [`Client::audit_own_leaves`] — the SP-13 self-audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeafAudit {
+    /// Every leaf under our username is one we recognize, and each one's inclusion proof
+    /// verifies against a head signed by the pinned KT key.
+    Ok { leaves: usize },
+    /// At least one leaf is signed with our account key but describes something we never
+    /// authorized. This is what a blind-signing-oracle injection looks like from the
+    /// victim's side: genuinely signed, inclusion-proven, and not ours.
+    Unrecognized {
+        /// Human-readable "leaf N: what is wrong with it", one per finding.
+        findings: Vec<String>,
+    },
+    /// The relay served a leaf whose inclusion proof does not verify against the head it
+    /// also served, or a head not signed by the pinned key. Either is equivocation.
+    BadProof,
+}
+
 /// Result of [`Client::verify_device_revocation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevocationCheck {

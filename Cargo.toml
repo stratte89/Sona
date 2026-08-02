@@ -24,8 +24,11 @@ rand = "0.8"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
-# HKDF-SHA256 mixes the Argon2id output with the OS-keyring device key (vault v2).
+# HKDF-SHA256 mixes the Argon2id output with the OS-keyring device key (vault v2), and
+# derives the relay's at-rest blind-index key from STORAGE_KEY.
 hkdf = "0.12"
+# HMAC-SHA256 — the relay's deterministic at-rest index over mailbox-hash columns (SP-04).
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
 # Audited (Least Authority, 2022) pure-Rust Olm Double Ratchet — our E2EE engine.

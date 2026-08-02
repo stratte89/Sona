@@ -161,6 +161,23 @@ async fn multi_device_link_fanout_and_self_sync_end_to_end() {
         1,
         "one self-sync copy to the linked device"
     );
+    // SP-06: the recipient learns the shared logical id from their own copy, and our
+    // device mailboxes are derivable from the public KT roster — so if the SELF-SYNC
+    // envelopes reused that id, a hostile recipient could post junk under it into each
+    // of our device mailboxes inside the self-sync jitter window, win the relay's
+    // first-writer-wins dedup, and have every real self-sync copy silently discarded.
+    // The envelope id must therefore be unpredictable; the logical id lives in the
+    // (encrypted) payload, which is what devices actually dedup and thread on.
+    for env in &fan.deferred {
+        assert_ne!(
+            env.msg_id, fan.msg_id,
+            "a self-sync envelope must not reuse the id the recipient can see"
+        );
+    }
+    for env in &fan.immediate {
+        assert_ne!(env.msg_id, "", "recipient copies still carry a routable id");
+    }
+
     client.post_envelopes(&fan.immediate).await.unwrap();
     client.post_envelopes(&fan.deferred).await.unwrap();
 

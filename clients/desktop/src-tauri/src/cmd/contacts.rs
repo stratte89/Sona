@@ -118,12 +118,15 @@ pub async fn set_my_avatar(
     s.history.set_my_avatar(avatar);
     // Re-read the sanitized value so recipients get exactly what we stored (never raw input).
     let stored = s.history.my_avatar().map(str::to_string);
-    // Skip blocked contacts — we drop their traffic and refuse sends, so they get no picture.
+    // Skip blocked contacts — we drop their traffic and refuse sends, so they get no
+    // picture. Pending requests too: an unaccepted stranger is not someone to broadcast
+    // a profile picture to, and their row is keyed by identity key, not a username the
+    // send path could resolve (SP-02).
     let notify: Vec<(String, String)> = s
         .history
         .contacts()
         .into_iter()
-        .filter(|(_, p)| !p.blocked)
+        .filter(|(_, p)| !p.blocked && p.request.is_none())
         .map(|(u, p)| (u, p.identity_key))
         .collect();
     let multi = s.multi_device;

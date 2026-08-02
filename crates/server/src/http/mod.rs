@@ -44,10 +44,14 @@ mod push;
 mod sync;
 mod ws;
 pub use account::{ChallengeQuery, RegisterRequest};
-pub use blobs::MAX_BLOB_BYTES;
+pub use blobs::{MAX_BLOB_BYTES, STORAGE_RESERVE_PER_CLIENT};
 pub use gif::{warm_gif_trending, GifProxyParams, GifSearchParams};
-pub use keys::{OneTimeKeysRequest, MAX_ONE_TIME_KEYS};
-pub use kt::ConsistencyQuery;
+pub use keys::{
+    OneTimeKeysRequest, MAX_ONE_TIME_KEYS, OTK_DRAIN_PER_WINDOW, OTK_DRAIN_RESERVE,
+    OTK_DRAIN_WINDOW_SECS,
+};
+pub use kt::{ConsistencyQuery, KtLeavesRequest};
+pub use msg::CONTROL_WAKE_BURST;
 pub use push::{PushRegisterRequest, PushUnregisterRequest};
 pub use sync::MAX_SYNC_BLOB_BYTES;
 use ws::ServerFrame;
@@ -86,6 +90,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/capabilities", get(account::capabilities))
         .route("/v1/kt/roster", post(kt::publish_roster))
         .route("/v1/kt/roster/{hash}", get(kt::kt_roster))
+        // Owner-gated per-user leaf enumeration (SP-13) — challenge-signed, not public.
+        .route("/v1/kt/leaves", post(kt::kt_leaves))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     // Attachment blobs (opaque, already E2E-encrypted) get a larger cap.
@@ -136,6 +142,30 @@ fn client_key(headers: &HeaderMap, state: &AppState) -> Option<String> {
         None if state.config.prod => None,
         None => Some(auth::pseudonymize("unknown", &state.config.rate_salt)),
     }
+}
+
+/// Meter a read endpoint per client: fail-closed on an untrusted address, then charge
+/// `bucket` on the 60/min limiter. `None` = admitted.
+///
+/// Applied to the KT/directory reads that were unmetered (SP-19), which is also the
+/// enumeration surface for the fact that a mailbox hash is a reversible SHA-256 of a
+/// human-chosen username (SP-04): `/v1/kt/proof/{hash}`, `/v1/kt/roster/{hash}` and
+/// `/v1/callkey/{hash}` all answer 404-vs-200 on existence, and on an open relay an
+/// unmetered one lets an outsider walk a wordlist and enumerate the whole user base.
+/// They are also Merkle-proof constructions performed **inside the global state mutex**,
+/// so an unmetered loop keeps that lock hot and degrades all traffic.
+///
+/// 60/min per client is far above any legitimate cadence — the auditor and roster
+/// refresh poll on the order of minutes — so this bounds a walk without touching them.
+fn metered(headers: &HeaderMap, state: &AppState, bucket: &str) -> Option<Response> {
+    let Some(key) = client_key(headers, state) else {
+        return Some((StatusCode::FORBIDDEN, "no trusted client address").into_response());
+    };
+    let mut inner = state.inner.lock().unwrap();
+    if !inner.rate.check(&format!("{bucket}:{key}"), now()) {
+        return Some((StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response());
+    }
+    None
 }
 
 // ─────────────────────────── REST: push (content-free wake) ───────────────────────────

@@ -165,8 +165,7 @@ async fn message_and_state_survive_a_restart() {
 
     let (_, challenge) = get_json(&state, &format!("/v1/challenge?hash={bob_hash}")).await;
     let nonce = challenge["nonce"].as_str().unwrap();
-    let nonce_bytes = vodozemac::base64_decode(nonce).unwrap();
-    let sig = bob.sign(&nonce_bytes);
+    let sig = bob.sign(&protocol_types::ws_auth_signing_message(&bob_hash, nonce));
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
         .await

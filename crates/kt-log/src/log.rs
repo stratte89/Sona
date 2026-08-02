@@ -266,6 +266,39 @@ impl KtLog {
             .copied()
     }
 
+    /// **Every** leaf index under a username — bindings and roster epochs together, in
+    /// log order (SP-13).
+    ///
+    /// The auditor verifies only that the STH is signed and that growth is
+    /// consistency-proof-clean, which catches a *rewritten* log but not a log that grows
+    /// correctly while containing a leaf the named account never authorized. Detecting
+    /// that needs the leaf set for one account, so the account can check each one against
+    /// what it actually signed. Serving it is gated to the owner — see the relay's
+    /// `/v1/kt/leaves`, which is challenge-signed precisely because "all leaves for this
+    /// username" handed to anyone would be a fresh enumeration oracle.
+    pub fn all_indices_for(&self, username_hash: &str) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .by_user
+            .get(username_hash)
+            .into_iter()
+            .flatten()
+            .chain(
+                self.rosters_by_user
+                    .get(username_hash)
+                    .into_iter()
+                    .flatten(),
+            )
+            .copied()
+            .collect();
+        idx.sort_unstable();
+        idx
+    }
+
+    /// The record at `index`, whichever kind it is.
+    pub fn record(&self, index: usize) -> Option<&KtRecord> {
+        self.records.get(index)
+    }
+
     /// The latest roster-epoch index for a username, if it has published one.
     pub fn latest_roster_index_for(&self, username_hash: &str) -> Option<usize> {
         self.rosters_by_user

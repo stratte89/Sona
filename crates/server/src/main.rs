@@ -32,6 +32,10 @@
 //! * `IP_ALLOWLIST`     — optional comma-separated CIDRs; only these addresses may use
 //!   the relay. Empty/unset = off. Independent of `ACCESS_MODE`.
 //! * `MAX_WS_PER_IP`    — max concurrent delivery sockets per client address (default 16).
+//! * `CALL_WAKES_PER_HOUR`    — ring wakes per recipient mailbox per hour (default 120).
+//! * `CONTROL_WAKES_PER_HOUR` — call-control wakes per recipient per hour (default 900).
+//! * `MAX_CALL_WS_PER_IP` — max concurrent call sockets per client address (default 64).
+//! * `MAX_ROOMS_PER_IP` — max concurrent call ROOMS one address may create (default 64).
 //! * `MAX_STORAGE_BYTES` — global ceiling on stored attachment + sync bytes (default
 //!   10 GiB). Uploads over it get `507`; TTL expiry frees space.
 //! * `BLOB_TTL_DAYS`   — hard attachment retention cap in days (default 30). Blobs are
@@ -143,6 +147,17 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(Config::default().wake_debounce_secs);
+    // Per-recipient ceilings on the two high-priority wake classes (SP-09). Counters,
+    // not rates: the first offer still rings instantly, only a sustained flood is capped.
+    let call_wakes_per_hour = std::env::var("CALL_WAKES_PER_HOUR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Config::default().call_wakes_per_hour);
+    let control_wakes_per_hour = std::env::var("CONTROL_WAKES_PER_HOUR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Config::default().control_wakes_per_hour);
+
     let call_wake_min_secs = std::env::var("CALL_WAKE_MIN_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -215,10 +230,21 @@ async fn main() {
         );
     }
 
+    // Per-client share of the shared room pool (SP-11).
+    let max_rooms_per_client = std::env::var("MAX_ROOMS_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Config::default().max_rooms_per_client);
+
     let max_ws_per_client = std::env::var("MAX_WS_PER_IP")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(Config::default().max_ws_per_client);
+
+    let max_call_ws_per_client = std::env::var("MAX_CALL_WS_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Config::default().max_call_ws_per_client);
 
     let max_storage_bytes = std::env::var("MAX_STORAGE_BYTES")
         .ok()
@@ -259,15 +285,19 @@ async fn main() {
         allowed_origins,
         rate_salt,
         max_rooms,
+        max_rooms_per_client,
         giphy_key,
         release_grace_secs,
         wake_debounce_secs,
         call_wake_min_secs,
         control_wake_min_secs,
+        call_wakes_per_hour,
+        control_wakes_per_hour,
         access_mode,
         access_token_hashes,
         ip_allowlist,
         max_ws_per_client,
+        max_call_ws_per_client,
         max_storage_bytes,
         blob_ttl_secs,
         registration_code_hashes,
@@ -381,6 +411,7 @@ async fn main() {
                     inner.challenges.sweep(t);
                     inner.rate.sweep(t);
                     inner.auth_rate.sweep(t);
+                    inner.otk_drain_rate.sweep(t);
                     inner.upload_bytes.sweep(t);
                     inner.download_bytes.sweep(t);
                     inner.sync_blobs.retain(|_, (_, exp)| *exp > t);

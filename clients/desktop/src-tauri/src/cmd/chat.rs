@@ -411,10 +411,10 @@ pub(crate) async fn send_inner(
     };
 
     // Delivered to the relay: record it in history. Sending to a pending requester is
-    // consent — their request clears and the chat surfaces on every device (the
-    // self-sync copy applies the same rule on our other devices).
+    // consent — the request clears and the chat surfaces on every device (self-sync
+    // applies the same rule there). By KEY: pending rows key on identity key (SP-02).
     let mut s = inner.lock().await;
-    s.history.accept_request(&contact_username);
+    s.history.accept_request_for_key(&peer);
     let verified = s.history.contact_verified(&contact_username);
     s.history.pin_contact(&contact_username, &peer, verified);
     s.history.record_full(

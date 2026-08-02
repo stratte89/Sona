@@ -22,14 +22,45 @@ All base64 is standard alphabet, **no padding** (matches vodozemac).
 | Identity / signatures | Curve25519 (identity), Ed25519 (signing) |
 | Key Transparency log | SHA-256 RFC 6962 Merkle tree (ct-merkle); Ed25519-signed tree heads |
 
+## Signing domains
+
+One Ed25519 identity key signs many different things, so **every signed payload carries a
+distinct byte prefix**. The property that has to hold is *prefix-freeness*: no context's
+message may ever be a valid message in another context, or a signature harvested in one
+place is a forgery in another. That is not a style rule — it is what stops a hostile relay
+from turning any signing surface into an oracle for the rest (see the WebSocket section).
+
+| Prefix | Signs |
+|---|---|
+| `sona-register-v1\|` | registration: hash + identity key + signing key |
+| `sona-kt-entry-v1` | `KtEntry` — a username↔key binding, and its rotation chain |
+| `sona-kt-roster-v1` | `KtRosterEntry` — an account's device roster epoch |
+| `sona-kt-device-v1` | `DeviceRecord` proof-of-possession |
+| `sona-kt-sth-v1` | signed tree heads (the relay's KT key, not an account's) |
+| `sona-kt-leaves-v1\|` | owner-gated leaf enumeration: hash + nonce |
+| `sona-ws-auth-v1\|` | WebSocket/mailbox login: mailbox hash + nonce |
+| `sona-otk-upload-v1\|` | one-time-key upload: hash + keys |
+| `sona-push-register-v1\|` / `sona-push-unregister-v1\|` | push endpoint (de)registration |
+| `sona-account-delete-v1\|` | account deletion: hash + alias hashes + nonce |
+| `sona-call-key-publish-v1\|` | publishing a device's call-control key binding |
+| `sona-call-key-v1` | `CallKeyBinding` — the binding itself, by the device's roster key |
+| `sona-call-capsule-v1` | `CallCapsule` — offer/terminal, by the call-control key |
+| `sona-group-epoch-v1` | `GroupEpoch` — membership, by the admin key |
+| `sona-kt-leaf-roster-v1\|` | not a signature — the **Merkle leaf** prefix for roster leaves, so a roster leaf can never be read as a binding leaf in the tree |
+
+`crates/crypto-core/tests/signing_domain_separation.rs` holds the registry and proves
+pairwise disjointness. **A new signing context must be added there**, or the proof
+silently stops covering the tree — the failure mode is that nobody notices until a
+collision is found by someone else.
+
 ## REST endpoints (`/v1`)
 
 | Method | Path | Body / Query | Purpose |
 |---|---|---|---|
 | POST | `/register` | `{ entry: KtEntry, one_time_keys: [b64], fallback_key: b64 }` | Publish a KT binding + seed one-time keys + a reusable fallback key |
-| GET | `/bundle/{hash}` | — | Fetch + consume one of a peer's one-time keys → `PreKeyBundle` |
+| GET | `/bundle/{hash}` | — | Fetch + consume one of a peer's one-time keys → `PreKeyBundle`. Rate-limited per client, and per **recipient mailbox** once that mailbox's stock is low: over that floor the reusable fallback key is served instead of consuming a fresh one, so a drain spread over many addresses cannot empty a stock |
 | POST | `/onetimekeys` | `{ identity_hash, one_time_keys, signature }` | Replenish your own one-time keys (signed by your identity key) |
-| GET | `/keys/count/{hash}` | — | How many one-time keys an identity has left (so its client knows when to top up) |
+| GET | `/keys/count/{hash}` | — | Whether an identity still has fresh one-time keys, as a coarse bucket (`{ level: plenty\|low\|none, low_watermark }`) — **never an exact count**, which would be a first-contact activity oracle |
 | POST | `/messages` | `Envelope` | Relay an opaque message (sealed sender) |
 | GET | `/challenge?hash=` | — | Get a single-use login nonce |
 | POST | `/account/delete` | `{ hash, alias_hashes, nonce, signature }` | Delete the account from the relay: directory records, device mailboxes, queued messages, push subscriptions; live sockets get a terminal `revoked` frame. Alias (former-username) mailboxes are honored only if their record carries the **same signing key** — the signature can never widen deletion to someone else's mailbox. The KT log is deliberately untouched (append-only, public); the client unbinds the username separately with a signed release entry |
@@ -41,6 +72,7 @@ All base64 is standard alphabet, **no padding** (matches vodozemac).
 | GET | `/kt/sth` | — | Current `SignedTreeHead` |
 | GET | `/kt/proof/{hash}` | — | `{ entry, index, proof_b64, sth }` — latest binding + inclusion proof |
 | GET | `/kt/consistency?from=` | — | `{ proof_b64, sth }` — append-only proof from an earlier size |
+| POST | `/kt/leaves` | `{ hash, nonce, signature }` | **Owner-gated**: every leaf published under one username — bindings *and* device rosters — each with an inclusion proof against one head. Challenge-signed with the account's own key, deliberately not public: "all leaves for this username" served to anyone would be an activity-enumeration oracle (who registered, when, how often they rotate, how many devices). Feeds `Client::audit_own_leaves` — see `KEY_TRANSPARENCY.md` |
 | GET | `/capabilities` | — | Optional surfaces this relay supports (`multi-device-v1`, `history-sync-v1`, `push-webhook-v1`, plus `gif-search-v1` / `push-fcm-v1` / `invite-register-v1` when configured); old relays 404 |
 | GET | `/gif/search?q=&pos=` | — | GIF search via the relay privacy proxy (`GIPHY_API_KEY` set): `{ results: [{url, preview, width, height}], next }`. The provider sees only the relay, never the client |
 | GET | `/gif/trending?pos=` | — | Trending GIFs through the same proxy (relay-side cached) |
@@ -65,13 +97,30 @@ sealed sender by re-identifying senders). See `DEPLOYMENT.md`.
 
 1. Client connects.
 2. **First frame must be auth**: `{ "type":"auth", "hash", "nonce", "signature" }` where
-   `signature` is Ed25519 over the base64-decoded `nonce` bytes, by the hash's signing
-   key. The server consumes the nonce (single-use) and verifies against the registered
-   key. On a bad nonce/signature it sends `{ "type":"auth_failed" }` (retryable — get a
-   fresh nonce) and closes. If the nonce was live but the hash has **no directory
-   record** — the device was revoked from its account's roster, or the account is
-   gone — it sends `{ "type":"revoked" }` and closes: **terminal**, the client must
-   unlink locally (lock the UI, offer relink) and never retry.
+   `signature` is Ed25519, by the hash's signing key, over the **domain-separated**
+   message — never over the raw nonce:
+
+   ```
+   "sona-ws-auth-v1|" || mailbox_hash || "|" || nonce_b64
+   ```
+
+   The decoded nonce must be exactly 32 bytes (`WS_AUTH_NONCE_LEN`); both sides reject
+   any other length. The server consumes the nonce (single-use) and verifies against the
+   registered key. On a bad nonce/signature it sends `{ "type":"auth_failed" }`
+   (retryable — get a fresh nonce) and closes. If the nonce was live but the hash has
+   **no directory record** — the device was revoked from its account's roster, or the
+   account is gone — it sends `{ "type":"revoked" }` and closes: **terminal**, the client
+   must unlink locally (lock the UI, offer relink) and never retry.
+
+   > **Why the prefix is not optional.** The relay chooses the challenge bytes, and the
+   > key signing them is the account's long-term identity key — the same key that signs
+   > KT bindings, device rosters, device proofs-of-possession, group epochs, and every
+   > `*_signing_message` below. Signing the *raw* nonce made the login a blind signing
+   > oracle: a hostile relay could serve another context's signing payload as the "nonce"
+   > and harvest a genuine signature over it, one per reconnect. Binding the mailbox hash
+   > in matters too — with `prefix || nonce` alone, one victim's signature would
+   > authenticate a different mailbox. The same message covers the call-key socket, which
+   > signs with the device's call-control key.
 3. On success the server flushes queued messages as `{ "type":"message", "envelope": … }`,
    then `{ "type":"ready" }`, then streams live messages as they arrive.
 4. Client acks delivery with `{ "type":"ack", "msg_id": … }`; the server then drops it.
@@ -161,13 +210,34 @@ captured frame cannot be replayed.
 
 ## Storage at rest
 
-The relay persists to SQLite (env `DB_PATH`; in-memory if unset). Message envelopes are
-stored as an AEAD blob (XChaCha20-Poly1305) keyed by `STORAGE_KEY` — kept **off the data
-disk**. Plaintext columns are only what delivery/pruning require: `target_hash` (one-way),
-`msg_id`, `expires_at`. The directory and KT log are stored plaintext (public by design).
+The relay persists to SQLite (env `DB_PATH`; in-memory if unset). Message envelopes, push
+endpoints, directory records and call-key bindings are stored as AEAD blobs
+(XChaCha20-Poly1305) keyed by `STORAGE_KEY` — kept **off the data disk**.
+
+Mailbox hashes are never stored as such. The relay has to *look up* by hash on every
+route, so those columns hold a **keyed blind index** instead — `HMAC-SHA256(index_key,
+table_tag | hash)`, `index_key` derived from the same `STORAGE_KEY`. Equality queries work
+unchanged; the mapping is a PRF to anyone without the key. `messages.msg_id` is keyed
+jointly with the target hash for the same reason: it is chosen by the *sender*, so a
+plaintext copy would let anyone who ever messaged a user find that user's row and
+re-identify every other row they own. `expires_at` stays in the clear (the pruner needs
+it).
+
+This matters because `target_hash` is an *unsalted* `SHA-256(username)` and is deliberately
+sender-computable, so it is **not** secret against an offline dictionary. The blind index
+does not hide who has an account — the KT log does that for the attacker — it makes the
+stored rows unattributable to one. See the disk-theft section of `THREAT_MODEL.md` for
+exactly what that does and does not buy.
+
+The **KT log stays plaintext** (`kt_entries`): an independent auditor must be able to read
+it, and that identity leak is inherent to Key Transparency. Attachment and history-sync
+blobs are opaque client ciphertext under random capability ids, addressed by no mailbox.
+
 On boot, the KT log is rebuilt by replaying entries in append order (re-validated), and
 the message queue + directory are reloaded. The KT signing key persists via
-`KT_SIGNING_KEY` so the pinned public key is stable across restarts.
+`KT_SIGNING_KEY` so the pinned public key is stable across restarts. A database written
+before the blind index is migrated in place on first open (one transaction, then a
+`VACUUM` so the freed pages stop holding the old plaintext).
 
 ## Local history & disappearing messages
 

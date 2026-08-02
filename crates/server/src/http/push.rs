@@ -348,8 +348,12 @@ pub(crate) async fn publish_call_key(
 /// fetcher's KT-roster verification is what makes it trustworthy.
 pub(crate) async fn fetch_call_key(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Response {
+    if let Some(denied) = metered(&headers, &state, "kt") {
+        return denied;
+    }
     if IdentityHash::from_hex(&hash).is_none() {
         return (StatusCode::BAD_REQUEST, "malformed hash").into_response();
     }

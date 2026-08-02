@@ -10,12 +10,20 @@ struct BlobUploadResponse {
     blob_id: String,
 }
 
-/// Would adding `add` bytes to the object stores (attachments + sync blobs) exceed the
-/// global ceiling? The per-client budgets bound one address; this bounds the SUM, so
-/// spreading uploads across many addresses still can't fill the disk. Fail-closed: a
-/// storage-size query error counts as full.
-pub(crate) fn storage_full(inner: &Inner, config: &crate::state::Config, add: usize) -> bool {
-    let used = match &inner.db {
+/// Fraction of the global storage ceiling above which uploads are rationed per client
+/// rather than served first-come-first-served (SP-11), as (numerator, denominator).
+pub(crate) const STORAGE_PRESSURE: (u64, u64) = (9, 10);
+
+/// Per-client window allowance once the pool is under pressure. Deliberately above one
+/// full history sync (`MAX_SYNC_BLOB_BYTES`, 32 MiB) so device linking — the operation
+/// that breaks most visibly and most permanently — still completes on a nearly-full
+/// relay. Below the normal `UPLOAD_BYTES_PER_WINDOW`, which is the point.
+pub const STORAGE_RESERVE_PER_CLIENT: u64 = 64 * 1024 * 1024;
+
+/// Bytes currently held across the object stores (attachments + sync blobs).
+/// Fail-closed: a storage-size query error reports the ceiling, i.e. "full".
+fn storage_used(inner: &Inner) -> u64 {
+    match &inner.db {
         Some(db) => db.storage_bytes().unwrap_or(u64::MAX),
         None => {
             inner
@@ -29,8 +37,44 @@ pub(crate) fn storage_full(inner: &Inner, config: &crate::state::Config, add: us
                     .map(|(d, _)| d.len() as u64)
                     .sum::<u64>()
         }
-    };
-    used.saturating_add(add as u64) > config.max_storage_bytes
+    }
+}
+
+/// Would adding `add` bytes exceed the global ceiling? The per-client budgets bound one
+/// address; this bounds the SUM, so spreading uploads across many addresses still can't
+/// fill the disk. Fail-closed.
+pub(crate) fn storage_full(inner: &Inner, config: &crate::state::Config, add: usize) -> bool {
+    storage_used(inner).saturating_add(add as u64) > config.max_storage_bytes
+}
+
+/// Ration the **last slice** of the shared pool per client (SP-11).
+///
+/// The global ceiling alone made object storage a resource one actor could exhaust for
+/// everyone: sealed-sender uploads cannot be attributed to anyone, so there is no early
+/// reclamation, and once full every user loses attachments *and* device linking until
+/// blobs age out — up to `BLOB_TTL_DAYS`, 30 days. Filling it took only ~40 client
+/// windows, i.e. one address for a few hours or forty at once.
+///
+/// Below the pressure line nothing changes. Above it, an individual client gets a bounded
+/// slice per window instead of whatever is left, so the tail of the pool is shared rather
+/// than claimed. `true` = refuse this upload.
+///
+/// This does not make the ceiling unreachable — a wide enough botnet still fills it —
+/// but it removes the cheap single-actor version and keeps a nearly-full relay usable
+/// for everyone else.
+pub(crate) fn storage_rationed(
+    inner: &mut Inner,
+    config: &crate::state::Config,
+    key: &str,
+    add: usize,
+    t: u64,
+) -> bool {
+    let (num, den) = STORAGE_PRESSURE;
+    let line = config.max_storage_bytes / den * num;
+    if storage_used(inner) < line {
+        return false;
+    }
+    !inner.storage_reserve.charge(key, add as u64, t)
 }
 
 /// Store an opaque attachment blob (already encrypted end-to-end by the sender with a key
@@ -61,6 +105,15 @@ pub(crate) async fn upload_blob(
     }
     if storage_full(&inner, &state.config, body.len()) {
         return (StatusCode::INSUFFICIENT_STORAGE, "relay storage full").into_response();
+    }
+    // Near the ceiling the remaining pool is rationed per client (SP-11) so one actor
+    // cannot claim the tail and wedge attachments + device linking for everyone.
+    if storage_rationed(&mut inner, &state.config, &key, body.len(), t) {
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "relay storage nearly full — per-client reserve exceeded",
+        )
+            .into_response();
     }
     match &inner.db {
         Some(db) => {

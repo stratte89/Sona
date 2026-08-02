@@ -166,6 +166,21 @@ pub fn start(state: AppState, port: u16) -> Result<QuicInfo, String> {
 /// Drive one member's QUIC connection: control-stream join, then forward datagrams and
 /// stream groups to the room peer until the connection dies.
 async fn handle_connection(conn: quinn::Connection, state: AppState) {
+    // ── Perimeter first (SP-14). `access::check` does both the IP allowlist and the
+    //    token, but it only runs as axum middleware, which the UDP endpoint never
+    //    traverses — so `ACCESS_MODE=open` + `IP_ALLOWLIST=…` (the documented "only these
+    //    addresses may use the relay" posture) left this port answering anyone, who could
+    //    then fingerprint the relay by ALPN and create rooms up to MAX_ROOMS. Checked
+    //    before any read so an off-allowlist peer costs nothing.
+    //
+    //    QUIC is published straight to clients, so the socket peer address IS the client:
+    //    use `remote_address()`, never the proxy header the HTTP path trusts. Enforced
+    //    unconditionally — the HTTP path's dev bypass exists only because a missing proxy
+    //    header is ambiguous, and here there is always a real address.
+    if !crate::access::ip_allowed(&state.config, conn.remote_address().ip()) {
+        conn.close(5u32.into(), b"address not allowed");
+        return;
+    }
     // ── Join: the client's first bidi stream carries the 32-hex call id. ──
     let Ok(Ok((ctrl_send, mut ctrl_recv))) =
         tokio::time::timeout(JOIN_TIMEOUT, conn.accept_bi()).await
@@ -235,12 +250,12 @@ async fn handle_connection(conn: quinn::Connection, state: AppState) {
     // WS leg keys on the proxy's `X-Real-IP`; QUIC is published straight to the client, so
     // the socket peer address *is* the client — pseudonymize it under the same salt and
     // charge the same `call:` bucket so neither transport is an un-throttled way in.
+    let peer_key = crate::auth::pseudonymize(
+        &conn.remote_address().ip().to_string(),
+        &state.config.rate_salt,
+    );
     {
-        let peer = crate::auth::pseudonymize(
-            &conn.remote_address().ip().to_string(),
-            &state.config.rate_salt,
-        );
-        let key = format!("call:{peer}");
+        let key = format!("call:{peer_key}");
         let mut inner = state.inner.lock().unwrap();
         if !inner.rate.check(&key, crate::state::now()) {
             conn.close(3u32.into(), b"rate limited");
@@ -264,7 +279,7 @@ async fn handle_connection(conn: quinn::Connection, state: AppState) {
         conn: conn.clone(),
         ctrl: ctrl_tx,
     }));
-    let Some(my_id) = join_room(&state, &call_id, member) else {
+    let Some(my_id) = join_room(&state, &call_id, member, &peer_key) else {
         conn.close(2u32.into(), b"room full");
         writer.abort();
         return;

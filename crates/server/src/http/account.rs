@@ -45,6 +45,12 @@ pub(crate) async fn register(
     if !inner.auth_rate.check(&format!("register:{key}"), now()) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
+    // Permanent-growth backstop on top of the per-minute limiter (SP-11): every accepted
+    // leaf is replayed and re-verified at every boot, so a per-minute rate cannot bound
+    // what only ever grows.
+    if !inner.kt_growth_rate.check(&format!("kt:{key}"), now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
     // Username-change backstop: a release is the rename's signature move, so cap
     // releases per key and rolling week. Budget is keyed by the key that SIGNED the
     // entry (the authorizing/previous key) and the signature is verified before any

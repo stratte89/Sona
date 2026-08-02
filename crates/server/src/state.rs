@@ -54,6 +54,20 @@ pub struct PushSub {
     /// unbounded stream of them is a silent battery DoS.
     pub last_wake_control: u64,
     pub control_wake_debt: u32,
+    /// Rolling-window ceilings on the two **high-priority** classes, per recipient
+    /// mailbox (SP-09). `(window_start, count)` each.
+    ///
+    /// The per-class shapes above bound the *interval* between wakes; these bound the
+    /// *total per hour*, which is what a battery drain actually is. `Call` alone was a
+    /// 2-second min-interval — 30 wakes a minute, forever — and `CallControl` a 1-second
+    /// refill, i.e. 60 a minute. Each one costs the victim a `startForegroundService`, a
+    /// TLS handshake, a signed challenge, and a mailbox drain, all invisible to them; the
+    /// only symptom is a phone that dies by lunchtime. `Envelope.wake` is attacker-chosen
+    /// JSON and sealed sender means the "sender" is anyone who can spell the username, so
+    /// there is no relationship to require and no per-sender key to budget against — the
+    /// budget has to be per *recipient*.
+    pub call_window: (u64, u32),
+    pub control_window: (u64, u32),
 }
 
 /// Everything behind the global lock.
@@ -69,6 +83,28 @@ pub struct Inner {
     /// `/challenge`). These grow permanent/at-rest state, so they get their own tighter
     /// budget independent of the message-send limiter (M-3).
     pub auth_rate: RateLimiter,
+    /// KT growth backstop (SP-11): new **leaves** appended per client per rolling day.
+    ///
+    /// `auth_rate` bounds registrations to 20/min per address, but the KT log is
+    /// unbounded, in-memory, never pruned, and **replayed and re-verified from the DB at
+    /// every boot** — so each accepted leaf is permanent, restart time grows with the
+    /// flood, and `mem_limit: 1g` eventually turns it into an OOM loop. A per-minute
+    /// limiter alone cannot bound something that only ever grows; this bounds the daily
+    /// total, well above any real client (a person registers once, renames rarely, and
+    /// publishes a roster per device change) and far below what a sustained 20/min could
+    /// append. `REGISTRATION_CODES` remains the strong control for an open relay; this is
+    /// the backstop for relays that do not use it.
+    pub kt_growth_rate: RateLimiter,
+    /// One-time-key drain floor (SP-10): fresh keys handed out of one **recipient**
+    /// mailbox per window, once that mailbox's stock is inside
+    /// [`crate::http::OTK_DRAIN_RESERVE`].
+    ///
+    /// Keyed by recipient hash, not by client: `rate` already bounds one address to 60/min
+    /// on `bundle:{key}`, which a drain spread over many addresses walks straight past.
+    /// Over the floor the bundle endpoint serves the reusable fallback key instead of
+    /// consuming a fresh one, so nothing fails — see [`crate::http::OTK_DRAIN_RESERVE`] for
+    /// why bounding the drain is the fix and rotating the fallback key is not.
+    pub otk_drain_rate: RateLimiter,
     /// Username-change backstop: release entries per **signing key** (a release is the
     /// rename's signature move), capped per rolling week. The client enforces the same
     /// product limit locally; this stops a modified client from spamming the log.
@@ -91,12 +127,22 @@ pub struct Inner {
     /// Live delivery-socket count per pseudonymized client, capped at
     /// [`Config::max_ws_per_client`] so one address cannot hold thousands of sockets.
     pub ws_count: HashMap<String, usize>,
+    /// Live **call**-socket count per pseudonymized client (SP-08). Counted separately
+    /// from `ws_count`: a device in a call legitimately holds a delivery socket *and* one
+    /// call socket per mesh room, so sharing one budget would make a group call evict the
+    /// delivery socket that rings it. Capped at [`Config::max_call_ws_per_client`].
+    pub call_ws_count: HashMap<String, usize>,
     /// Byte budget for blob/sync **uploads** per client (the request-count limiter alone
     /// would still allow a multi-GiB/min disk fill).
     pub upload_bytes: ByteBudget,
     /// Byte budget for blob/sync **downloads** per client (bounds egress amplification:
     /// upload once, hammer downloads).
     pub download_bytes: ByteBudget,
+    /// Per-client allowance for the **last slice** of the global storage pool (SP-11).
+    /// Only consulted once total usage crosses `blobs::STORAGE_PRESSURE`; below that,
+    /// uploads are served first-come-first-served as before. Sized above one full
+    /// history sync so device linking still completes on a nearly-full relay.
+    pub storage_reserve: ByteBudget,
     /// Published call-control key bindings, keyed by the device's mailbox hash. Public,
     /// self-authenticating material: each binding is signed by the device's own roster
     /// key, and a fetcher verifies it against the KT roster before sealing anything to it.
@@ -131,8 +177,32 @@ pub struct Config {
     /// stream of silent high-priority wakes from becoming a battery DoS the user can only
     /// observe as drain.
     pub control_wake_min_secs: u64,
+    /// Ceiling on `WakeClass::Call` wakes to one recipient mailbox per rolling hour
+    /// (`CALL_WAKES_PER_HOUR`). The ring path is the one an attacker reaches for — it is
+    /// guaranteed to start a foreground service on a sleeping phone — and no human
+    /// receives anything close to two incoming calls a minute, so this is ~60× real use
+    /// and still cuts the sustained drain 15× from what a 2-second min-interval allowed.
+    ///
+    /// A *ceiling*, not a rate: the window is a counter, so the first offer still rings
+    /// instantly through Doze. Only the sustained flood is capped, which is the property
+    /// that must not regress.
+    pub call_wakes_per_hour: u32,
+    /// Ceiling on `WakeClass::CallControl` wakes to one recipient mailbox per rolling
+    /// hour (`CONTROL_WAKES_PER_HOUR`). Deliberately far looser than the ring ceiling:
+    /// dropping a ring costs a missed call, but dropping a control can leave a phone
+    /// ringing with nothing to stop it — the exact failure the call-reliability round
+    /// spent weeks fixing. One answered call is at most a burst of
+    /// [`crate::http::msg::CONTROL_WAKE_BURST`], so this is above 100 calls an hour.
+    pub control_wakes_per_hour: u32,
     /// Max concurrent call rooms (M-4). Configurable via the `MAX_ROOMS` env var.
     pub max_rooms: usize,
+    /// Max concurrent rooms one client may have **created** (`MAX_ROOMS_PER_IP`, SP-11).
+    /// `max_rooms` alone was a global counter one actor could exhaust: ~2048 paired
+    /// sockets, held so the rooms survive the lonely reap, cost about 35 IP-minutes at
+    /// 60 joins/min — and every call on the relay was then refused for up to six hours.
+    /// Charged on creation only; joining a room someone else opened is the second leg of
+    /// a real call and is never refused for a quota the caller does not control.
+    pub max_rooms_per_client: usize,
     /// Giphy API key for the GIF-search privacy proxy (`/v1/gif/*`). `None` disables
     /// both endpoints and drops the capability advert — clients then hide the GIF UI.
     /// The relay proxies search AND media so user IPs never reach the GIF provider.
@@ -152,6 +222,12 @@ pub struct Config {
     /// Max concurrent delivery sockets per client address (`MAX_WS_PER_IP`). Generous —
     /// several devices/tabs share one NAT address — while stopping a socket-hoard DoS.
     pub max_ws_per_client: usize,
+    /// Max concurrent **call** sockets per client address (`MAX_CALL_WS_PER_IP`). The
+    /// call path had no concurrency cap at all — only the 60/min join limiter — while a
+    /// paired room lives up to 6 h, so sockets accumulated (SP-08). Sized for the real
+    /// worst case: a group call is a mesh of 1:1 rooms capped at 8 members, so one device
+    /// holds up to 7, and several devices share one NAT address.
+    pub max_call_ws_per_client: usize,
     /// Global ceiling on stored blob + sync bytes (`MAX_STORAGE_BYTES`, default 10 GiB).
     /// The per-client byte budgets bound one address; this bounds the sum — a botnet
     /// spreading uploads across many addresses must not fill the disk. Uploads over the
@@ -181,13 +257,20 @@ impl Default for Config {
             wake_debounce_secs: 30,
             call_wake_min_secs: 2,
             control_wake_min_secs: 1,
+            call_wakes_per_hour: 120,
+            control_wakes_per_hour: 900,
             max_rooms: crate::call::DEFAULT_MAX_ROOMS,
+            // Generous for the many-devices-behind-one-NAT case (a group call is a mesh
+            // of 1:1 rooms capped at 8 members, so one device creates up to 7), while
+            // still needing dozens of addresses to claim the whole pool.
+            max_rooms_per_client: 64,
             giphy_key: None,
             release_grace_secs: kt_log::RELEASE_GRACE_SECS,
             access_mode: AccessMode::Open,
             access_token_hashes: Vec::new(),
             ip_allowlist: Vec::new(),
             max_ws_per_client: 16,
+            max_call_ws_per_client: 64,
             max_storage_bytes: 10 * 1024 * 1024 * 1024,
             blob_ttl_secs: 30 * 24 * 3600,
             registration_code_hashes: Vec::new(),
@@ -315,14 +398,26 @@ impl AppState {
                 // Registration/challenge are rarer and grow permanent state — 20/min per
                 // client is plenty for real logins while blunting a mass-claim flood.
                 auth_rate: RateLimiter::new(20, 60),
+                // KT leaves one client may append per rolling day (SP-11). A real
+                // client appends on registration, on a rename, and on each device
+                // roster change; 50 is far above that and far below 20/min sustained.
+                kt_growth_rate: RateLimiter::new(50, 86400),
                 // 5 username changes (= releases) per key per rolling week.
                 rename_rate: RateLimiter::new(5, 7 * 86400),
+                // Fresh one-time keys one mailbox may hand out per window while its stock
+                // is low (SP-10). Engages only inside the reserve band, so the common path
+                // never touches it.
+                otk_drain_rate: RateLimiter::new(
+                    crate::http::OTK_DRAIN_PER_WINDOW,
+                    crate::http::OTK_DRAIN_WINDOW_SECS,
+                ),
                 kt,
                 db,
                 blobs: HashMap::new(),
                 push: HashMap::new(),
                 sync_blobs: HashMap::new(),
                 ws_count: HashMap::new(),
+                call_ws_count: HashMap::new(),
                 call_keys: HashMap::new(),
                 // Byte budgets (10-minute windows). Uploads: 256 MiB — dozens of max-size
                 // attachments or several full history syncs, but no multi-GiB disk fill.
@@ -330,6 +425,10 @@ impl AppState {
                 // unmetered egress drain.
                 upload_bytes: ByteBudget::new(UPLOAD_BYTES_PER_WINDOW, BYTE_WINDOW_SECS),
                 download_bytes: ByteBudget::new(DOWNLOAD_BYTES_PER_WINDOW, BYTE_WINDOW_SECS),
+                storage_reserve: ByteBudget::new(
+                    crate::http::STORAGE_RESERVE_PER_CLIENT,
+                    BYTE_WINDOW_SECS,
+                ),
                 used_invites: std::collections::HashSet::new(),
             })),
             config: Arc::new(config),

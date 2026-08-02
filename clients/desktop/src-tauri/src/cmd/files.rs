@@ -156,8 +156,10 @@ pub(crate) async fn send_attachment_inner(
     };
 
     let mut s = state.inner.lock().await;
-    // Sending an attachment to a pending requester is consent, same as a text.
-    s.history.accept_request(&contact.username);
+    // Sending an attachment to a pending requester is consent, same as a text. By KEY:
+    // a pending row is keyed by the requester's identity key, not the name they claimed
+    // (SP-02), so the username would not find it.
+    s.history.accept_request_for_key(&contact.identity_key);
     let verified = s.history.contact_verified(&contact.username);
     s.history
         .pin_contact(&contact.username, &contact.identity_key, verified);

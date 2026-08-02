@@ -37,6 +37,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 base64 = { workspace = true }
 chacha20poly1305 = { workspace = true }
+# At-rest column blinding (db.rs): HKDF derives an index key from STORAGE_KEY, HMAC-SHA256
+# is the deterministic index itself. Same RustCrypto family as the vault's KDF.
+hkdf = { workspace = true }
+hmac = { workspace = true }
 # FCM wake adapter (push.rs): the service-account OAuth JWT is RS256, which none of the
 # messenger's own (Ed25519/X25519) crypto covers. ring is already in the tree (rustls,
 # quinn) and its RSA signing is constant-time — unlike the pure-Rust `rsa` crate

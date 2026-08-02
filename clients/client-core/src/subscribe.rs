@@ -52,10 +52,23 @@ impl Client {
         let nonce = challenge["nonce"]
             .as_str()
             .ok_or_else(|| ClientError::Protocol("missing nonce".into()))?;
+        // SP-01: NEVER sign the raw nonce. The relay picks these bytes and the signer is
+        // the account identity key (or the call-control key) — signing them unstructured
+        // is a blind signing oracle: a hostile relay serves another context's signing
+        // payload as the "nonce" and gets a genuine signature over it, one per reconnect.
+        // Sign the domain-separated, mailbox-bound message instead, and refuse any nonce
+        // that is not exactly the 32 random bytes the relay is supposed to issue.
         let nonce_bytes = STANDARD_NO_PAD
             .decode(nonce)
             .map_err(|e| ClientError::Protocol(format!("bad nonce: {e}")))?;
-        let signature = sign(&nonce_bytes);
+        if nonce_bytes.len() != protocol_types::WS_AUTH_NONCE_LEN {
+            return Err(ClientError::Protocol(format!(
+                "bad nonce: expected {} bytes, got {}",
+                protocol_types::WS_AUTH_NONCE_LEN,
+                nonce_bytes.len()
+            )));
+        }
+        let signature = sign(&protocol_types::ws_auth_signing_message(hash, nonce));
 
         let mut ws = self
             .ws_connect(self.ws_request(&self.ws_url)?)

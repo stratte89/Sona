@@ -28,6 +28,40 @@ fn gif_media_host_ok(host: &str) -> bool {
         .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
 }
 
+/// Media types the proxy may echo back, as an exact allowlist rather than an
+/// `image/`/`video/` prefix test (SP-21). A prefix test passed `image/svg+xml` straight
+/// through, and SVG is a script-bearing document, not a raster image — served
+/// same-origin from the relay's own domain, with only the (strict) upstream host
+/// allowlist standing between "GIF proxy" and "arbitrary attacker-controlled response
+/// with an attacker-influenced Content-Type". Not exploitable as written — the client
+/// relabels the bytes as a local `data:image/gif` inside an `<img>` — but this is the
+/// layer that should not have to depend on that. Matching by exact subtype means a new
+/// SVG-ish media type cannot quietly undo the fix.
+const ALLOWED_MEDIA_TYPES: &[&str] = &[
+    "image/gif",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/avif",
+    "video/mp4",
+    "video/webm",
+];
+
+/// Constrain an upstream `Content-Type` to [`ALLOWED_MEDIA_TYPES`], defaulting to
+/// `image/gif`. Parameters (`; charset=…`) are stripped and case normalized first.
+fn proxy_content_type(upstream: Option<&str>) -> String {
+    upstream
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|ct| ALLOWED_MEDIA_TYPES.contains(&ct.as_str()))
+        .unwrap_or_else(|| "image/gif".to_string())
+}
+
 /// Shared client for provider calls: no redirects (an allowlisted host redirecting
 /// elsewhere would reopen SSRF), tight timeout.
 fn gif_client() -> &'static reqwest::Client {
@@ -275,13 +309,11 @@ pub(crate) async fn gif_proxy(
     {
         return (StatusCode::PAYLOAD_TOO_LARGE, "gif too large").into_response();
     }
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .filter(|ct| ct.starts_with("image/") || ct.starts_with("video/"))
-        .unwrap_or("image/gif")
-        .to_string();
+    let content_type = proxy_content_type(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
     // Read capped even when Content-Length lied.
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -296,12 +328,58 @@ pub(crate) async fn gif_proxy(
             Err(_) => return (StatusCode::BAD_GATEWAY, "gif media read failed").into_response(),
         }
     }
-    ([(header::CONTENT_TYPE, content_type)], out).into_response()
+    // `nosniff` so a browser cannot second-guess the type we just constrained, and an
+    // attachment disposition so nothing here is ever treated as a navigable document.
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_DISPOSITION, "attachment".to_string()),
+        ],
+        out,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::gif_media_host_ok;
+
+    /// SP-21: the proxy used to echo any upstream `Content-Type` starting `image/` or
+    /// `video/` — which includes `image/svg+xml`, a script-bearing document rather than
+    /// a raster image, served same-origin from the relay's own domain. Allowlisted by
+    /// exact subtype now; real GIF/video types must keep working.
+    #[test]
+    fn proxied_content_types_are_an_exact_raster_video_allowlist() {
+        for good in [
+            "image/gif",
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/avif",
+            "video/mp4",
+            "video/webm",
+        ] {
+            assert_eq!(super::proxy_content_type(Some(good)), good);
+        }
+        // Parameters are stripped and case normalized before matching.
+        assert_eq!(
+            super::proxy_content_type(Some("IMAGE/GIF; charset=binary")),
+            "image/gif"
+        );
+        // Anything else — script-bearing, novel, or absent — falls back to image/gif.
+        for bad in [
+            "image/svg+xml",
+            "image/svg",
+            "text/html",
+            "application/javascript",
+            "video/x-anything",
+            "image/",
+        ] {
+            assert_eq!(super::proxy_content_type(Some(bad)), "image/gif");
+        }
+        assert_eq!(super::proxy_content_type(None), "image/gif");
+    }
 
     #[test]
     fn gif_media_allowlist_is_strict() {

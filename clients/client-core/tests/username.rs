@@ -23,6 +23,10 @@ async fn username_change_re_registers_renames_at_peers_and_keeps_old_mailbox() {
         .await
         .unwrap();
     let mut bob_history = History::new();
+    // Open messaging: this test is about renames, not the message-request gate. With the
+    // gate on (the default) a first-contact stranger is a pending request keyed by their
+    // identity key and is deliberately NOT in the address book yet (SP-02).
+    bob_history.set_request_prefs(false, false);
     for e in client.fetch_inbox(&mut bob).await.unwrap() {
         bob_history.apply(&e);
     }

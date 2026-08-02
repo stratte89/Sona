@@ -357,6 +357,42 @@ async fn quic_join_requires_access_token_in_token_mode() {
     assert!(line.contains("joined"), "expected join, got {line}");
 }
 
+/// SP-14: `access::check` runs only as axum middleware, which the UDP endpoint never
+/// traverses — so an `ACCESS_MODE=open` relay with an `IP_ALLOWLIST` (the documented
+/// "only these addresses may use the relay" posture) answered anyone on udp/4443. The
+/// allowlist is now enforced on the QUIC connection itself, against the real peer
+/// address rather than a proxy header.
+#[tokio::test]
+async fn quic_join_is_refused_off_the_ip_allowlist() {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+
+    // Open mode + an allowlist that does not contain loopback: the documented posture,
+    // and exactly the combination that used to leave this port open.
+    let blocked = AppState::new(server::Config {
+        ip_allowlist: vec![server::access::Cidr::parse("203.0.113.0/24").unwrap()],
+        ..server::Config::default()
+    });
+    let info = server::quic::start(blocked.clone(), 0).expect("quic endpoint");
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], info.port));
+    let hash = STANDARD_NO_PAD.decode(&info.cert_sha256_b64).unwrap();
+    let mut leg = quic_join(addr, &hash, CALL_ID).await;
+    let line = next_line(&mut leg.ctrl).await;
+    assert!(line.starts_with("<closed"), "expected refusal, got {line}");
+
+    // Same relay, allowlist that does contain loopback — including in its IPv4-mapped
+    // IPv6 form, which must not be a way around the check.
+    let allowed = AppState::new(server::Config {
+        ip_allowlist: vec![server::access::Cidr::parse("127.0.0.0/8").unwrap()],
+        ..server::Config::default()
+    });
+    let info = server::quic::start(allowed.clone(), 0).expect("quic endpoint");
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], info.port));
+    let hash = STANDARD_NO_PAD.decode(&info.cert_sha256_b64).unwrap();
+    let mut leg = quic_join(addr, &hash, CALL_ID).await;
+    let line = next_line(&mut leg.ctrl).await;
+    assert!(line.contains("joined"), "expected join, got {line}");
+}
+
 async fn quic_join_token(
     addr: std::net::SocketAddr,
     cert_hash: &[u8],

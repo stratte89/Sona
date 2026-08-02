@@ -577,3 +577,107 @@ async fn a_malformed_or_absent_call_key_is_refused_not_guessed() {
         StatusCode::BAD_REQUEST
     );
 }
+
+/// SP-09: `Envelope.wake` is attacker-chosen JSON, sealed sender means the "sender" is
+/// anyone who can spell the username, and each `Call` wake buys the victim a
+/// foreground-service start plus a full TLS + challenge handshake. A 2-second
+/// min-interval allowed 30 of those a minute, forever, invisible to the user — the only
+/// symptom is a phone that dies by lunchtime.
+///
+/// Two properties must hold together: the FIRST offer still rings instantly (the ceiling
+/// is a counter, not a rate, so no latency is added to the event that matters), and the
+/// sustained flood is bounded.
+#[tokio::test]
+async fn a_ring_flood_is_bounded_per_recipient_without_delaying_the_first_ring() {
+    use protocol_types::WakeClass;
+    let state = AppState::new(Config {
+        wake_debounce_secs: 0,
+        call_wake_min_secs: 0, // isolate the hourly ceiling from the min-interval
+        call_wakes_per_hour: 5,
+        ..Config::default()
+    });
+    let (endpoint, hits) = mock_push_receiver().await;
+    let bob = RatchetEngine::new();
+    let bob_hash = register(&state, &bob, "bob-ring-flood").await;
+    let nonce = fresh_nonce(&state, &bob_hash).await;
+    let sig = bob.sign(&push_register_signing_message(&bob_hash, &endpoint, &nonce));
+    let (status, _) = post_json(
+        &state,
+        "/v1/push/register",
+        json!({ "hash": bob_hash, "endpoint": endpoint, "nonce": nonce, "signature": sig }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The first ring must wake the device with no budget delay at all.
+    let (status, _) = post_json(
+        &state,
+        "/v1/messages",
+        envelope_class(&bob_hash, "ring0", WakeClass::Call),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_for_hits(&hits, 1).await;
+
+    // Then the flood. Every send still succeeds — refusing them would tell the attacker
+    // it worked, and sealed sender means the relay cannot attribute the flood anyway.
+    for i in 1..40 {
+        let (status, _) = post_json(
+            &state,
+            "/v1/messages",
+            envelope_class(&bob_hash, &format!("ring{i}"), WakeClass::Call),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let n = hits.lock().unwrap().len();
+    assert_eq!(
+        n, 5,
+        "the ring flood is capped at the hourly ceiling, got {n}"
+    );
+}
+
+/// The other half of the care note: a real call's controls must ALL get through. One
+/// answered call fires several in the same second — winner, terminal, sibling
+/// self-terminal — and dropping any of them can leave an Android phone ringing with
+/// nothing to stop it, which is the precise failure the call-reliability round spent
+/// weeks fixing. The control ceiling therefore sits far above one call's worth.
+#[tokio::test]
+async fn one_calls_worth_of_controls_still_passes_under_the_ceiling() {
+    use protocol_types::WakeClass;
+    let state = AppState::new(Config {
+        wake_debounce_secs: 0,
+        ..Config::default()
+    });
+    let (endpoint, hits) = mock_push_receiver().await;
+    let bob = RatchetEngine::new();
+    let bob_hash = register(&state, &bob, "bob-ctl-burst").await;
+    let nonce = fresh_nonce(&state, &bob_hash).await;
+    let sig = bob.sign(&push_register_signing_message(&bob_hash, &endpoint, &nonce));
+    let (status, _) = post_json(
+        &state,
+        "/v1/push/register",
+        json!({ "hash": bob_hash, "endpoint": endpoint, "nonce": nonce, "signature": sig }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let burst = server::http::CONTROL_WAKE_BURST;
+    for i in 0..burst {
+        let (status, _) = post_json(
+            &state,
+            "/v1/messages",
+            envelope_class(&bob_hash, &format!("ctl{i}"), WakeClass::CallControl),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    wait_for_hits(&hits, burst as usize).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        burst as usize,
+        "every control in one call's burst must wake the device"
+    );
+}

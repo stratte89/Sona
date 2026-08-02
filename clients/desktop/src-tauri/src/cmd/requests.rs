@@ -8,6 +8,11 @@ use crate::*;
 /// One row in the requests list.
 #[derive(Serialize)]
 pub(crate) struct RequestView {
+    /// The contacts-map key to pass back to accept/decline — the requester's identity
+    /// key, NOT their claimed name. A stranger must not be addressable by a name they
+    /// merely claimed (SP-02).
+    pub(crate) key: String,
+    /// The name the requester claimed, for display only. Unverified until accepted.
     pub(crate) username: String,
     /// The requester's (attributed) conversation key — used to open the held thread
     /// after accepting.
@@ -61,8 +66,9 @@ pub async fn message_requests(
         .history
         .pending_requests()
         .into_iter()
-        .map(|(username, pin)| {
+        .map(|(key, pin)| {
             let req = pin.request.clone().unwrap_or_default();
+            let username = History::display_name(&key, &pin);
             let held = s.history.messages(&pin.identity_key);
             let preview = if allow_text {
                 held.iter()
@@ -91,6 +97,7 @@ pub async fn message_requests(
                 avatar: pin.avatar,
                 unseen: !req.seen,
                 username,
+                key,
             }
         })
         .collect();
@@ -115,16 +122,27 @@ pub async fn request_badge(state: tauri::State<'_, AppState>) -> Result<RequestB
 #[tauri::command]
 pub async fn accept_msg_request(
     state: tauri::State<'_, AppState>,
-    username: String,
+    key: String,
 ) -> Result<String, String> {
     let mut s = state.inner.lock().await;
-    let username = username.trim();
-    if !s.history.accept_request(username) {
-        return Err("no such request".into());
+    let key = key.trim();
+    // The name the row will be filed under once accepted — read before the accept,
+    // since the row moves from its identity-key slot to that name (SP-02).
+    let username = s
+        .history
+        .pending_requests()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(k, pin)| History::display_name(&k, &pin))
+        .ok_or("no such request")?;
+    if !s.history.accept_request(key) {
+        return Err(format!(
+            "can't accept: “{username}” is already another contact — rename or remove them first"
+        ));
     }
     let peer = s
         .history
-        .pinned_contact_key(username)
+        .pinned_contact_key(&username)
         .map(str::to_string)
         .unwrap_or_default();
     s.persist()?;
@@ -133,7 +151,7 @@ pub async fn accept_msg_request(
     drop(s);
     // Accepting made them a full contact — they messaged us, so a session exists: send
     // them our profile picture right away (they never saw our pre-existing one).
-    cmd::contacts::spawn_profile_reconcile(state.inner.clone(), username.to_string());
+    cmd::contacts::spawn_profile_reconcile(state.inner.clone(), username);
     Ok(peer)
 }
 
@@ -142,11 +160,11 @@ pub async fn accept_msg_request(
 #[tauri::command]
 pub async fn decline_msg_request(
     state: tauri::State<'_, AppState>,
-    username: String,
+    key: String,
     block: bool,
 ) -> Result<(), String> {
     let mut s = state.inner.lock().await;
-    if !s.history.decline_request(username.trim(), block) {
+    if !s.history.decline_request(key.trim(), block) {
         return Err("no such request".into());
     }
     s.persist()?;

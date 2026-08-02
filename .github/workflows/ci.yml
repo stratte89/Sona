@@ -88,6 +88,24 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
       - run: cargo audit --file clients/Cargo.lock
+      # The Tauri shell is a DETACHED workspace with its own lock and the LARGEST
+      # dependency surface in the repo (Tauri, wry, WebKitGTK bindings, cpal, quinn, jni,
+      # hwenc, nokhwa). It was never audited (SP-12) — the gap was the finding, not any
+      # one advisory: a reachable vuln in cpal, quinn, jni, or a codec would have gone
+      # equally unnoticed.
+      #
+      # Two ignores, narrow and by ID. RUSTSEC-2026-0194/-0195 are quick-xml
+      # memory-exhaustion and quadratic-parse DoS (CVSS 7.5 each) reaching us on two
+      # BUILD-TIME paths that never see attacker-supplied XML at runtime:
+      #   quick-xml 0.39.4 ← plist ← tauri-utils   (Info.plist, macOS-shaped)
+      #   quick-xml 0.30.0 ← xcb                   (X11 protocol descriptions, build script)
+      # Neither can move — 0.x minor bumps are semver-breaking — so the real fix is a
+      # Tauri/xcb chain bump. Re-check on every Tauri bump and drop these the moment
+      # either chain moves. Do NOT widen this list; the yanked `spin` was BUMPED, not
+      # ignored, and anything new must be too.
+      - run: >
+          cargo audit --file clients/desktop/src-tauri/Cargo.lock
+          --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   deny:
     name: cargo deny (licenses & sources)
@@ -98,6 +116,11 @@ jobs:
       - run: cargo deny check
       - run: cargo deny check
         working-directory: clients
+      - run: cargo deny check
+        working-directory: clients/desktop/src-tauri
+      # Three policy copies is three things that can drift, and a policy that silently
+      # covers one workspace reads like coverage without being it.
+      - run: ./scripts/check-deny-sync.sh
 
   # The Android build is edge-to-edge: screen-anchored UI that forgets
   # env(safe-area-inset-*) ends up under the status bar / gesture bar. Keep that mechanical.

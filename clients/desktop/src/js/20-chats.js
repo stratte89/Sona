@@ -371,14 +371,14 @@ function rqRow(r) {
     mkBtn(`${icon('check')}<span>Approve</span>`, 'btn btn-sm req-accept', 'Approve request', async (b) => {
       busy(b, true, 'Accepting…');
       try {
-        const peer = await invoke('accept_msg_request', { username: r.username });
+        const peer = await invoke('accept_msg_request', { key: r.key });
         toast(`${r.username} can now message you`, 'ok');
         openThread(r.username, peer, r.username);
       } catch (e) { busy(b, false); toast(say(e), 'err'); loadRequests(); }
     }),
     mkBtn(icon('trash'), 'req-iconbtn', 'Delete request', async () => {
       try {
-        await invoke('decline_msg_request', { username: r.username, block: false });
+        await invoke('decline_msg_request', { key: r.key, block: false });
         toast('Request deleted — they aren’t told', 'ok');
         loadRequests();
       } catch (e) { toast(say(e), 'err'); }
@@ -388,7 +388,7 @@ function rqRow(r) {
         'The request disappears and everything they send is dropped silently. They aren’t told.',
         'Block'))) return;
       try {
-        await invoke('decline_msg_request', { username: r.username, block: true });
+        await invoke('decline_msg_request', { key: r.key, block: true });
         toast(`${r.username} blocked`, 'ok');
         loadRequests();
       } catch (e) { toast(say(e), 'err'); }

@@ -36,6 +36,13 @@ pub(crate) async fn upload_sync_blob(
     if !inner.upload_bytes.charge(&key, body.len() as u64, t) {
         return (StatusCode::TOO_MANY_REQUESTS, "upload byte budget exceeded").into_response();
     }
+    if blobs::storage_rationed(&mut inner, &state.config, &key, body.len(), t) {
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "relay storage nearly full — per-client reserve exceeded",
+        )
+            .into_response();
+    }
     if blobs::storage_full(&inner, &state.config, body.len()) {
         return (StatusCode::INSUFFICIENT_STORAGE, "relay storage full").into_response();
     }
@@ -81,6 +88,13 @@ pub(crate) async fn put_sync_blob(
     }
     if !inner.upload_bytes.charge(&key, body.len() as u64, t) {
         return (StatusCode::TOO_MANY_REQUESTS, "upload byte budget exceeded").into_response();
+    }
+    if blobs::storage_rationed(&mut inner, &state.config, &key, body.len(), t) {
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "relay storage nearly full — per-client reserve exceeded",
+        )
+            .into_response();
     }
     if blobs::storage_full(&inner, &state.config, body.len()) {
         return (StatusCode::INSUFFICIENT_STORAGE, "relay storage full").into_response();

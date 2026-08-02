@@ -294,7 +294,13 @@ impl Client {
     }
     /// Core fan-out: seal `recipient_payload` to every recipient device (immediate) and, if
     /// `self_payload` is given, a per-copy self-sync payload to each of the sender's own
-    /// other devices (deferred). All copies share one message id.
+    /// other devices (deferred).
+    ///
+    /// All copies share one **logical** message id — that is what devices dedup and thread
+    /// on, and what `Fanout::msg_id` returns. The self-sync copies carry it inside their
+    /// (encrypted) payload but get a fresh random id on the *envelope*, because the
+    /// envelope id is the relay's dedup token and the recipient of this message learns the
+    /// shared one (SP-06).
     #[allow(clippy::type_complexity)]
     pub(crate) async fn prepare_fanout(
         &self,
@@ -355,17 +361,35 @@ impl Client {
                     .to_string();
                 self.ensure_device_session(account, &mailbox, &d.identity_key)
                     .await?;
+                // The payload carries the SHARED logical id — that is what every device
+                // dedups and threads on, and it must not change.
                 let payload = build_self(
                     rec.primary_key.clone(),
                     contact.username.clone(),
                     msg_id.clone(),
                 );
+                // …but the ENVELOPE gets a fresh random id (SP-06). The relay's dedup is
+                // first-writer-wins on (mailbox, msg_id), and the recipient of this
+                // message learns the shared id from their own copy. Self-sync copies are
+                // deliberately delayed by up to SELF_SYNC_MAX_JITTER_SECS and drained
+                // from the outbox later, and our own device mailboxes are derivable from
+                // the public KT roster — so a hostile recipient could post junk under
+                // that id into each of our device mailboxes inside the jitter window,
+                // win the dedup, and have every real self-sync copy silently discarded.
+                // The relay answers 202, `outbox_ack` retires it as sent, and the message
+                // we sent from the phone simply never appears on the laptop: silent,
+                // permanent, unattributable, indistinguishable from a sync bug.
+                //
+                // A fresh 128-bit id per copy cannot be pre-empted by anyone who has not
+                // seen it. Idempotency is unaffected — a retry re-posts the same sealed
+                // envelope, so the relay still dedups it, and `outbox_ack` matches on
+                // (msg_id, to).
                 deferred.push(seal_payload_to(
                     account,
                     &mailbox,
                     &d.identity_key,
                     &payload,
-                    &msg_id,
+                    &random_msg_id(),
                 )?);
             }
         }

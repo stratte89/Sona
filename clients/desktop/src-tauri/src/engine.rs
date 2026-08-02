@@ -171,13 +171,35 @@ impl Engine {
             // whole capsule-path diagnostic (E-9) writes to a stdout Android has closed.
             #[cfg(target_os = "android")]
             crate::redirect_stdio_to_logcat();
-            let _ = std::fs::create_dir_all(&dir);
+            // 0700: the directory holding the vault, history, and quick-unlock blobs
+            // must not be listable by other local users either (SP-15).
+            let _ = crate::privfile::create_dir_private(&dir);
             // Diagnostics get a file from here on. This is the first moment there is
             // anywhere to put one, and on Windows it is the only way the lines ever reach
             // a human: those builds have no console, so stderr goes nowhere no matter what
             // it is redirected to.
             crate::diag::init(&dir);
             s.data_dir = dir;
+            // Upgrade path (SP-15): files an older build created 0644 keep that mode
+            // until something rewrites them, and some — the call-control secret, the
+            // screening index — are written once and then only read. Tighten what is
+            // already on disk, once, at the first moment the paths are known.
+            for path in [
+                s.vault_path(),
+                s.history_path(),
+                s.prefs_path(),
+                s.config_path(),
+                s.call_key_path(),
+                s.call_store_path(),
+                s.call_screen_path(),
+                s.quick_pin_path(),
+                s.quick_auto_path(),
+                s.quick_bio_path(),
+            ] {
+                if path.exists() {
+                    crate::privfile::harden_existing(&path);
+                }
+            }
             if let Ok(b) = std::fs::read(s.prefs_path()) {
                 if let Ok(p) = serde_json::from_slice(&b) {
                     s.prefs = p;

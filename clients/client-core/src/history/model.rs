@@ -312,8 +312,17 @@ pub enum InboundScreen {
 /// The message-request state of a not-yet-accepted contact. Present on a [`ContactPin`]
 /// ⇒ the contact is **pending**: hidden from the chat list, surfaced in the requests
 /// list instead, and everything they send is screened until the user accepts.
+///
+/// A pending pin is keyed in the contacts map by the requester's **identity key**, not
+/// by the name they claimed (SP-02) — a stranger must not be able to occupy a name and
+/// shadow the real owner's first message. [`claimed`](Self::claimed) carries the name
+/// for display, and only becomes the map key when the user accepts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRequest {
+    /// The username the requester claimed, for display only. It is attacker-chosen and
+    /// unverified until the user accepts — never use it as a map key or an authority.
+    #[serde(default)]
+    pub claimed: String,
     /// Unix time the request first appeared.
     pub since: u64,
     /// Unix time of the requester's latest activity.

@@ -91,6 +91,38 @@ Before starting a session with a contact, `verify_contact_binding`:
 Any failure returns a specific `KtCheck` (`BadTreeHead` / `NotInLog` / `WrongUsername` /
 `KeyMismatch`) and the client refuses to start the session.
 
+## Auditing your own name (`POST /v1/kt/leaves` → `Client::audit_own_leaves`)
+
+The checks above protect you when *you* look someone up. They do nothing about a leaf
+published under **your** name that you never authorized — and that is the attack Key
+Transparency exists to make loud. Two older tools each miss it:
+
+* `sona-auditor` verifies only that the head is signed by the pinned key and that every
+  growth step carries a valid RFC 6962 consistency proof. An injected leaf is a *genuine*
+  append, so append-only holds perfectly and the auditor stays quiet.
+* `audit_devices` asks the relay for your *current* roster — so a two-faced relay serves
+  you the pre-injection epoch and everyone else the injected one.
+
+`POST /v1/kt/leaves` returns **every** leaf under one username — bindings and device
+rosters together — each with an inclusion proof against one head. `audit_own_leaves` then
+checks each against what the account actually authorized: every proof against a
+pinned-signed head, every binding naming your own keys, every roster listing only devices
+you enrolled. Anything it does not recognize is named.
+
+It is **owner-gated by a signed challenge** (`sona-kt-leaves-v1|` + hash + nonce), not
+public. "All leaves for this username" served to anyone would be a fresh
+activity-enumeration oracle stacked on an already-reversible mailbox hash: who registered,
+when, how often they rotate, how many devices they run. Independent auditors keep the
+aggregate consistency view they already have, which is the part that does not need to name
+anyone.
+
+**Two limits, stated plainly.** Nothing schedules this yet — the caller decides when to
+run it. And it verifies leaves against the head *the relay served alongside them*, so a
+relay that is two-faced about the **head** as well is not caught by this alone; that
+requires the peer's head to arrive over the E2E channel (`send_head` /
+`compare_foreign_head`) and never be re-fetched from the relay, since two views of the
+same relay's answer is circular.
+
 ## The pinned key
 
 Trust is rooted in one value: the server's KT **public key**, distributed out-of-band

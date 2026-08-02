@@ -60,6 +60,7 @@ mod media_shell;
 mod notif;
 pub(crate) mod notifier;
 mod outbox;
+mod privfile;
 mod push;
 mod runtime;
 mod state;

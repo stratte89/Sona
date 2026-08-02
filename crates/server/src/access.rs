@@ -139,13 +139,37 @@ fn raw_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .trim()
         .parse()
         .ok()?;
+    Some(canonical_ip(ip))
+}
+
+/// Canonicalize an IPv4-mapped IPv6 address (`::ffff:1.2.3.4`) down to its v4 form, so a
+/// v4 allowlist entry matches however the address was rendered — and so a `::ffff:` form
+/// cannot slip past the allowlist.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => Some(IpAddr::V4(v4)),
-            None => Some(ip),
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
         },
-        v4 => Some(v4),
+        v4 => v4,
     }
+}
+
+/// Whether `ip` is admitted by the configured allowlist. An empty allowlist is "off",
+/// admitting everything.
+///
+/// Exposed for the QUIC media endpoint (SP-14), which never traverses the axum `gate`
+/// middleware, so `ACCESS_MODE=open` + `IP_ALLOWLIST=…` — the documented "only these
+/// addresses may use the relay" posture — left udp/4443 answering anyone. QUIC is
+/// published straight to clients and always has a real peer address, so it passes
+/// `conn.remote_address()` here rather than reading any proxy header, and there is no
+/// dev bypass to reintroduce.
+pub fn ip_allowed(config: &Config, ip: IpAddr) -> bool {
+    config.ip_allowlist.is_empty()
+        || config
+            .ip_allowlist
+            .iter()
+            .any(|c| c.contains(canonical_ip(ip)))
 }
 
 /// The deny response for this mode. Stealth is a bare `404` with an empty body —

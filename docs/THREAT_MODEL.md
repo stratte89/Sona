@@ -30,9 +30,17 @@ try to show different people different logs.
 * **Silent key swap → key-change detection.** `Client::add_contact_checked` compares the
   offered key against the pinned one and refuses to auto-start a session on a change —
   the user must compare the new safety number and accept first.
-* **One-time-key-drain DoS → fallback key.** An attacker fetching a victim's bundle
-  repeatedly can exhaust one-time keys; a reusable, signed **fallback key** is then served
-  so sessions still start. (Clients also replenish one-time keys.)
+* **One-time-key-drain DoS → fallback key + a per-recipient drain floor.** An attacker
+  fetching a victim's bundle repeatedly consumes one one-time key per call; a reusable,
+  signed **fallback key** is then served so sessions still start. (Clients also replenish
+  one-time keys.) Because pinning a victim on that one reusable key degrades forward
+  secrecy for every session started meanwhile, the *rate* is bounded per **recipient
+  mailbox** as well: once a mailbox's stock falls into the reserve band the relay hands out
+  only a few fresh keys per window and serves the fallback beyond that, so a drain spread
+  over many addresses — which the per-client limit cannot see — can no longer empty a
+  stock in minutes or empty an offline user's at all. It bounds the drain, not the race:
+  under a sustained flood new sessions still use the fallback key, but the stock survives
+  and recovers as soon as the flood stops.
 * **History rewrite → consistency proofs.** A pinned client detects any non-append-only
   change.
 * **Equivocation (split view) → gossip + independent auditors.** Clients witness the log
@@ -55,14 +63,37 @@ from the ratchet regardless of TLS.
 
 ### Server disk / backup theft (seizure, leaked backup)
 *Can:* read the relay's database at rest.
-*Defended:* message bodies are stored as an AEAD blob (XChaCha20-Poly1305) under a key
-held **off the data disk** (env/secrets manager), so a stolen DB is undecryptable; and the
-content was end-to-end encrypted before it ever reached the server anyway. What remains
-readable is the irreducible routing metadata a store-and-forward relay must keep:
-recipient **hashes** (one-way, not usernames), timing, and counts. The directory and KT
-log are stored as plaintext because they are public by design. This is "inability, not
-good faith": the operator cannot hand over message content or sender identities because
-the server never had them in a readable form.
+*Defended:* everything the relay stores except the public KT log is an AEAD blob
+(XChaCha20-Poly1305) under a key held **off the data disk** (env/secrets manager) — message
+bodies, push endpoints, directory records, call-key bindings — so a stolen DB is
+undecryptable; and the content was end-to-end encrypted before it ever reached the server
+anyway. **Mailbox hashes are not stored either**: every hash column holds a keyed blind
+index (`HMAC-SHA256` under a key derived from the same off-disk key), which answers the
+relay's equality lookups but is a PRF to anyone without the key. `messages.msg_id` is
+keyed jointly with the target hash, because a sender knows the ids it minted and could
+otherwise find one of its own rows and read off the victim's index.
+
+Be precise about what that does and does not buy. A mailbox address is an *unsalted*
+`SHA-256(username)`, and it cannot be salted — senders must be able to compute it from
+the username alone. SHA-256 is only one-way over unpredictable inputs, and usernames are
+short, human-chosen, and published on purpose (they are the discovery handle), so a
+thief recovers the membership list offline: a wordlist of real handles takes seconds, and
+the whole ≤8-character lowercase-alphanumeric space is under a minute on one GPU. Device
+mailboxes are no better — `device_mailbox_hash` mixes in a random device id, but rosters
+are published in the public KT log. **The blind index does not change that**, and it is
+not meant to: the KT log is plaintext by design, so *who has an account* is public
+regardless. What it changes is the **linkage** — the thief can no longer say which stored
+rows belong to which of those accounts, so per-user message counts and timing stop being
+attributable. Assume a disk thief learns *who has an account*, plus aggregate volume and
+timing they cannot pin on anyone.
+
+Two limits worth stating plainly. This is a **cold disk / backup** defence only: a live
+host compromise, and the operator, have the key in process memory. And it is not
+retroactive — backups taken before the blind-index migration still hold the plaintext
+columns.
+
+The bedrock is unchanged and is "inability, not good faith": the operator cannot hand over
+message content or sender identities because the server never had them in a readable form.
 
 ### Device thief (offline access to a *client* disk)
 *Can:* read the on-disk vault and try to brute-force it.

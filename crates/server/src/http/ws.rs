@@ -42,8 +42,27 @@ pub(crate) async fn ws_upgrade(
     let Some(client) = client_key(&headers, &state) else {
         return (StatusCode::FORBIDDEN, "no trusted client address").into_response();
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, client))
+    ws.max_message_size(MAX_DELIVERY_FRAME_BYTES)
+        .max_frame_size(MAX_DELIVERY_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, client))
 }
+
+/// Cap on a single frame from a delivery-socket client. Axum/tungstenite default to a
+/// 64 MiB message and a 16 MiB frame, and every relay-side limit is checked only *after*
+/// the whole message has been assembled — so a client could force a 64 MiB allocation
+/// per socket, repeatedly, before anything looked at it (SP-08).
+///
+/// This socket carries exactly two client frames: the `Auth` frame (a hash, a 32-byte
+/// nonce, and a signature — a few hundred bytes) and `Ack` frames (~100 bytes). 8 KiB is
+/// three orders of magnitude of headroom over the protocol's real maximum and still four
+/// orders below the default.
+const MAX_DELIVERY_FRAME_BYTES: usize = 8 * 1024;
+
+/// Cap on a single frame from a call-socket client — the *media* maximum, which is a
+/// different number from the delivery socket's and must be sized separately (SP-08).
+/// `MAX_FRAME_BYTES` is exactly the media-v2 cell size; the slack covers WebSocket
+/// framing only. Setting this below a real cell would truncate video and break calls.
+const MAX_CALL_FRAME_BYTES: usize = crate::call::MAX_FRAME_BYTES + 1024;
 
 /// Upgrade a call-relay socket. Join is by capability token only (the random call id
 /// from the E2E call offer) — deliberately unauthenticated so the relay cannot link a
@@ -58,17 +77,28 @@ pub(crate) async fn call_upgrade(
     if !origin_ok(&headers, &state) {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+    let Some(client) = client_key(&headers, &state) else {
+        return (StatusCode::FORBIDDEN, "no trusted client address").into_response();
+    };
     {
-        let Some(client) = client_key(&headers, &state) else {
-            return (StatusCode::FORBIDDEN, "no trusted client address").into_response();
-        };
         let key = format!("call:{client}");
         let mut inner = state.inner.lock().unwrap();
         if !inner.rate.check(&key, now()) {
             return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
         }
     }
-    ws.on_upgrade(move |socket| crate::call::handle_call_socket(socket, state, call_id))
+    // The join limiter bounds the *rate*, not the *count* — and a paired room lives up
+    // to 6 h, so without a concurrency cap sockets accumulate (SP-08). Claimed here and
+    // released by the RAII slot when the socket ends, same as the delivery path.
+    let Some(slot) = WsSlot::claim(&state, &client, SocketKind::Call) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many call sockets").into_response();
+    };
+    ws.max_message_size(MAX_CALL_FRAME_BYTES)
+        .max_frame_size(MAX_CALL_FRAME_BYTES)
+        .on_upgrade(move |socket| async move {
+            crate::call::handle_call_socket(socket, state, call_id, client).await;
+            drop(slot);
+        })
 }
 
 /// Discovery for the QUIC media path: UDP port + the exact certificate hash to pin.
@@ -92,19 +122,36 @@ pub(crate) async fn quic_info(State(state): State<AppState>) -> Json<serde_json:
 /// fd forever, no authentication needed.
 const WS_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Which per-client socket budget a [`WsSlot`] draws on. Delivery and call sockets are
+/// counted separately — a device in a group call legitimately holds a delivery socket
+/// *and* one call socket per mesh room.
+#[derive(Clone, Copy)]
+pub(crate) enum SocketKind {
+    Delivery,
+    Call,
+}
+
 /// RAII slot in the per-client socket count: dropping it (any exit path, including
 /// panics and the auth-deadline return) releases the slot.
-struct WsSlot {
+pub(crate) struct WsSlot {
     state: AppState,
     client: String,
+    kind: SocketKind,
 }
 
 impl WsSlot {
     /// Claim a slot for `client`, or `None` if it is already at the cap.
-    fn claim(state: &AppState, client: &str) -> Option<Self> {
+    pub(crate) fn claim(state: &AppState, client: &str, kind: SocketKind) -> Option<Self> {
         let mut inner = state.inner.lock().unwrap();
-        let cap = state.config.max_ws_per_client;
-        let n = inner.ws_count.entry(client.to_string()).or_insert(0);
+        let cap = match kind {
+            SocketKind::Delivery => state.config.max_ws_per_client,
+            SocketKind::Call => state.config.max_call_ws_per_client,
+        };
+        let counts = match kind {
+            SocketKind::Delivery => &mut inner.ws_count,
+            SocketKind::Call => &mut inner.call_ws_count,
+        };
+        let n = counts.entry(client.to_string()).or_insert(0);
         if *n >= cap {
             return None;
         }
@@ -112,6 +159,7 @@ impl WsSlot {
         Some(Self {
             state: state.clone(),
             client: client.to_string(),
+            kind,
         })
     }
 }
@@ -119,10 +167,14 @@ impl WsSlot {
 impl Drop for WsSlot {
     fn drop(&mut self) {
         let mut inner = self.state.inner.lock().unwrap();
-        if let Some(n) = inner.ws_count.get_mut(&self.client) {
+        let counts = match self.kind {
+            SocketKind::Delivery => &mut inner.ws_count,
+            SocketKind::Call => &mut inner.call_ws_count,
+        };
+        if let Some(n) = counts.get_mut(&self.client) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                inner.ws_count.remove(&self.client);
+                counts.remove(&self.client);
             }
         }
     }
@@ -131,7 +183,7 @@ impl Drop for WsSlot {
 async fn handle_socket(socket: WebSocket, state: AppState, client: String) {
     // One address must not hoard sockets (each one costs a task + fd). Multiple
     // devices/tabs behind one NAT share the cap, so it is generous, not tight.
-    let Some(_slot) = WsSlot::claim(&state, &client) else {
+    let Some(_slot) = WsSlot::claim(&state, &client, SocketKind::Delivery) else {
         return; // over the cap — drop the socket
     };
     let (mut sink, mut stream) = socket.split();
@@ -233,9 +285,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, client: String) {
                 if let Ok(ClientFrame::Ack { msg_id }) = serde_json::from_str(t.as_str()) {
                     if let Some(hash) = IdentityHash::from_hex(&authed_hash) {
                         let mut inner = state.inner.lock().unwrap();
+                        // Both deletes must hit the SAME row set: the in-memory ack is
+                        // scoped to the authenticated mailbox, so the durable one must be
+                        // too (SP-05). `msg_id` alone is a shared namespace across every
+                        // device and self-sync copy of one logical message.
                         inner.store.ack(&hash, &msg_id);
                         if let Some(db) = &inner.db {
-                            let _ = db.delete_message(&msg_id);
+                            let _ = db.delete_message(hash.as_str(), &msg_id);
                         }
                     }
                 }
@@ -288,11 +344,18 @@ fn authenticate(state: &AppState, frame: &str) -> AuthOutcome {
     let Some(signing_key) = inner.directory.get(&hash).map(|e| e.signing_key.clone()) else {
         return AuthOutcome::Revoked;
     };
-    // The client signs the raw nonce bytes (base64-decoded).
-    let Ok(nonce_bytes) = vodozemac::base64_decode(&nonce) else {
-        return AuthOutcome::Failed;
-    };
-    if auth::verify(&signing_key, &nonce_bytes, &signature) {
+    // SP-01: the client signs a domain-separated, mailbox-bound message — never the raw
+    // nonce. Signing raw relay-chosen bytes with the account identity key was a blind
+    // signing oracle (the relay could serve a KT roster/binding payload as the "nonce"
+    // and harvest a genuine signature over it). Belt to the prefix's braces: refuse any
+    // nonce that does not decode to exactly the 32 bytes `ChallengeStore::issue` mints,
+    // so no longer structure can ride the challenge field even in a future context.
+    match vodozemac::base64_decode(&nonce) {
+        Ok(bytes) if bytes.len() == protocol_types::WS_AUTH_NONCE_LEN => {}
+        _ => return AuthOutcome::Failed,
+    }
+    let message = protocol_types::ws_auth_signing_message(&hash, &nonce);
+    if auth::verify(&signing_key, &message, &signature) {
         AuthOutcome::Ok(hash)
     } else {
         AuthOutcome::Failed

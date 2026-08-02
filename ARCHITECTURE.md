@@ -128,7 +128,9 @@ since clients are Tauri/Rust, `crypto-core` is linked directly — no language b
 
 ### 3.4 Server (Rust / Axum)
 Blind relay. Persists to encrypted SQLite (or in-memory if no `DB_PATH`):
-- Pre-key bundles (public key material), addressed by identity hash.
+- Pre-key bundles (public key material), addressed by identity hash — stored sealed, and
+  indexed by a **keyed blind index** over that hash rather than the hash itself, so a
+  stolen file cannot be linked back to the usernames it is addressed by.
 - Offline queue: opaque envelopes, **AEAD-encrypted at rest under an off-disk key**,
   TTL-bounded, deleted on delivery.
 - The KT log (public entries, plaintext — auditable by design).
@@ -246,7 +248,7 @@ frame can't lock a healthy device out). Calls ring on all devices; first answer 
 | Honest-but-curious server | reads everything it stores | E2EE; server holds only ciphertext + hashes |
 | Malicious server | forges keys, drops/reorders, equivocates | Key Transparency + OOB verification + sealed sender |
 | Network attacker | intercepts/modifies traffic | TLS; ratchet integrity under that; non-replayable signed auth |
-| Server disk / backup theft | reads the relay DB at rest | message blobs AEAD-encrypted under an off-disk key; content was E2E anyway; only recipient hashes + timing remain |
+| Server disk / backup theft | reads the relay DB at rest | everything but the public KT log AEAD-encrypted under an off-disk key; mailbox-hash columns replaced by a keyed blind index, so rows are unattributable; content was E2E anyway. Timing + volume remain, unlinked |
 | Client device thief | offline access to a client's disk | Argon2id vault + secure-element wrap + backup exclusion + auto-lock |
 | Metadata adversary | watches who-talks-to-whom | sealed sender, hash routing, content-free push, length padding, optional Tor routing |
 | Endpoint compromise | reads live secrets | out of scope to *prevent*; PCS bounds the damage window |
@@ -353,11 +355,13 @@ sona/                   # backend workspace (Cargo.toml: members = crates/*, exc
   SOCKS5/Tor routing; GrapheneOS-grade Android hardening (StrongBox, MTE —
   `docs/ANDROID_HARDENING.md`).
 
-Test status: **352 tests green** — 176 backend (`cargo test`), 147 client SDK
-(`cd clients && cargo test`, which spins a real relay up in-process) and 29 in the app
-shell (`cd clients/desktop/src-tauri && cargo test --lib`). Seven more are `#[ignore]`d
+Test status: **544 tests green** — 244 backend (`cargo test`), 210 client SDK
+(`cd clients && cargo test`, which spins a real relay up in-process) and 90 in the app
+shell (`cd clients/desktop/src-tauri && cargo test --lib`). Eleven more are `#[ignore]`d
 because they need hardware that CI does not have: a GPU encoder, a microphone, a screen.
-Clippy clean across both workspaces, fmt-gated CI, plus a no-monolith file-size ratchet.
+Clippy clean across both workspaces, fmt-gated CI, dependency advisories gated on all
+three lockfiles (root, clients, and the detached Tauri shell), plus a no-monolith
+file-size ratchet.
 
 ---
 

@@ -23,13 +23,14 @@ Generate each with `head -c 32 /dev/urandom | base64 | tr -d '='`:
 | Variable | Role | If lost | If leaked |
 |---|---|---|---|
 | `KT_SIGNING_KEY` | signs the Key Transparency log | every client's pinned key breaks — effectively a new server identity | attacker can sign forged tree heads (auditors + client gossip will still catch equivocation, but don't) |
-| `STORAGE_KEY` | encrypts queued message blobs at rest | undelivered queued messages are unreadable and dropped; nothing else | a stolen *database* becomes readable as ciphertext+metadata (content is still E2EE) |
+| `STORAGE_KEY` | encrypts everything the relay stores except the public KT log, **and** keys the blind index over every mailbox-hash column | the database is inert: queued messages, directory records, push subscriptions and call-key bindings are all unreadable and unreachable — the KT log survives, but accounts must re-register | a stolen *database* becomes readable as ciphertext+metadata, and its rows become attributable to usernames again (content is still E2EE) |
 | `RATE_SALT` | pseudonymizes rate-limit bookkeeping | nothing — rotate freely | mild: rate-limit keys become linkable |
 
 **The rule that matters: `STORAGE_KEY` lives OFF the data disk.** The env file / secrets
 manager satisfies this; storing it inside the database volume defeats the design.
-Back up `KT_SIGNING_KEY` offline (printed copy, password manager) — it is the one
-thing you cannot regenerate.
+Back up `KT_SIGNING_KEY` **and `STORAGE_KEY`** offline (printed copy, password manager) —
+neither can be regenerated, and `STORAGE_KEY` is now load-bearing for the whole database,
+not just the message queue.
 
 Optional: `GIPHY_API_KEY` enables GIF search. The relay proxies both the search and
 the GIF bytes (strict host allowlist, size-capped), so client IPs and queries never
@@ -171,6 +172,23 @@ Two honest caveats:
   well with that setup; for roaming phones without a VPN it is impractical — addresses
   change constantly.
 
+## Abuse ceilings (all optional, all defaulted)
+
+Every one of these is a resource an individual could otherwise exhaust for everyone
+else. The defaults are sized well above real use, so you only touch them if you are
+running a bigger relay or a deliberately tiny one.
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `MAX_WS_PER_IP` | 16 | Concurrent delivery sockets per client address. Generous — several devices and tabs share one NAT address — while stopping a socket hoard |
+| `MAX_CALL_WS_PER_IP` | 64 | Concurrent **call** sockets per address, counted separately. A group call is a mesh of 1:1 rooms capped at 8 members, so one device holds up to 7; sharing one budget with delivery would let a group call evict the socket that rings it |
+| `MAX_ROOMS` | 1024 | Global concurrent call rooms |
+| `MAX_ROOMS_PER_IP` | 64 | Rooms one address may have **created**. `MAX_ROOMS` alone was a global counter one actor could exhaust (~2048 paired sockets, ≈35 IP-minutes), refusing every call on the relay for up to six hours. Charged on creation only — joining a room someone else opened is the second leg of a real call and is never refused for a quota the caller doesn't control |
+| `CALL_WAKES_PER_HOUR` | 120 | Ring wakes per recipient mailbox per hour. A ceiling, not a rate: the first offer still rings instantly through Doze, only a sustained flood is capped. Each wake costs the victim a foreground service, a TLS handshake and a mailbox drain — invisible to them except as a flat battery |
+| `CONTROL_WAKES_PER_HOUR` | 900 | Call-control wakes per recipient per hour. Deliberately far looser than the ring ceiling: dropping a ring costs a missed call, but dropping a control can leave a phone ringing with nothing to stop it |
+| `MAX_STORAGE_BYTES` | 10 GiB | Global attachment + sync-blob ceiling. Over it, uploads get `507`; the TTL reaper frees space. Sealed-sender uploads can't be attributed, so there is no per-user reclamation |
+| `BLOB_TTL_DAYS` | 30 | Hard attachment retention. Every upload is stamped `now + this` and deleted on schedule regardless of chat activity — deletion signals are end-to-end encrypted and uploads are sealed-sender, so the relay *cannot* tie a blob to a message. Scheduled deletion is the only one it can honestly perform |
+
 ## Being auditable (do not skip)
 
 Your users' protection against *you* (or whoever coerces you) is the KT log — but only
@@ -201,6 +219,23 @@ Back up continuously (see below) and treat KT-log restore as an incident, not ro
   pairing is exactly what the at-rest encryption exists to prevent.
 * A lost database loses queued (undelivered) messages and the KT log history; message
   history was never on the server to lose.
+* **A lost `STORAGE_KEY` is now equivalent to a lost database** (minus the KT log). It
+  keys the blind index over the mailbox-hash columns as well as the blobs, so a database
+  opened under a different key finds nothing at all.
+
+## Upgrading past the at-rest blind index (one-time)
+
+A relay whose database predates the blind-index schema migrates itself on the next start:
+every mailbox-hash column is rewritten as a keyed index and the directory / call-key rows
+are re-sealed, in one transaction, then the file is `VACUUM`ed so the freed pages stop
+holding the old plaintext. Two operational notes:
+
+* The `VACUUM` needs free disk space roughly equal to the database size, and the boot is
+  slower than usual exactly once. If it fails the relay still starts and logs
+  `[db] blind-index migration committed, but VACUUM failed` — run `VACUUM` by hand, or
+  the old plaintext hash columns stay recoverable from the file's free pages.
+* **Existing backups are not migrated.** They still contain the plaintext columns; rotate
+  them out on your normal schedule if that matters to you.
 
 ## What the logs show
 

@@ -65,10 +65,15 @@ pub(crate) fn notif_for_event(
             .any(|(_, p)| p.identity_key == key && p.muted_until.is_some_and(|t| t > now))
     };
     // The display name for a sender key (nickname > pinned username > claimed username).
+    // A pending-request row is keyed by identity key, so its name comes off the request
+    // via `display_name` — never from the map key (SP-02).
     let name_for = |key: &str, claimed: &str| -> String {
         for (u, p) in history.contacts() {
             if p.identity_key == key {
-                return p.nickname.clone().unwrap_or(u);
+                return p
+                    .nickname
+                    .clone()
+                    .unwrap_or_else(|| History::display_name(&u, &p));
             }
         }
         if claimed.is_empty() {
@@ -200,7 +205,8 @@ pub(crate) fn request_notif_plan(history: &History, convo: &str, level: &str) ->
         .contacts()
         .into_iter()
         .find(|(_, p)| p.identity_key == convo)
-        .map(|(u, _)| u)
+        // Pending rows are keyed by identity key; the claimed name lives on the request.
+        .map(|(k, p)| History::display_name(&k, &p))
         .unwrap_or_else(|| "Someone".to_string());
     let (title, body) = match level {
         "generic" => ("Sona".to_string(), "New message request".to_string()),

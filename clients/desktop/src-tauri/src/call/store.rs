@@ -236,10 +236,21 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
     let tmp = path.with_extension("tmp");
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        // Owner-only, set on the TEMP file (SP-15): the rename carries the temp file's
+        // mode to the destination, so hardening the destination afterwards would be both
+        // the wrong order and a window in which the real file is world-readable.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
+    crate::privfile::harden_existing(&tmp);
     std::fs::rename(&tmp, path)
 }
 

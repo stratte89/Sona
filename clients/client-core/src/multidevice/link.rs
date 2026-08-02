@@ -217,11 +217,13 @@ impl Client {
             .error_for_status()?
             .json()
             .await?;
-        let remaining = status["remaining"].as_u64().unwrap_or(0) as usize;
-        if remaining >= target {
+        // Coarse bucket, not an exact count — see `replenish_own_keys` (SP-10).
+        if status["level"].as_str() == Some("plenty") {
             return Ok(0);
         }
-        let need = target - remaining;
+        // Top up past the relay's watermark, not merely to `target` — a target at or
+        // below the watermark would leave the level "low" and re-upload on every cycle.
+        let need = target.max(status["low_watermark"].as_u64().unwrap_or(0) as usize + 1);
         let keys = account.ratchet().generate_one_time_keys(need);
         let msg = protocol_types::one_time_keys_signing_message(&mailbox, &keys);
         let signature = account.ratchet_ref().sign(&msg);

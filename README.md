@@ -35,7 +35,7 @@ evidence. Its ignorance isn't a policy you have to trust. It's the structure.
 | hand out a fake key | **Key Transparency** — every key lives in a public, append-only, signed Merkle log; forgery is loud and provable |
 | see who's in a group — or that a group exists | groups are pairwise fan-out with admin-**signed** membership epochs, indistinguishable from 1:1 traffic |
 | identify you | anonymous accounts — username + password; no phone number, no email |
-| betray you under subpoena or breach | nothing readable to give: no plaintext, no social graph, no passwords; storage encrypted under an off-disk key |
+| betray you under subpoena or breach | nothing readable to give: no plaintext, no social graph, no passwords. Everything but the public transparency log is encrypted under an off-disk key, and even the mailbox columns are a **keyed blind index** — a stolen database can't be linked back to the usernames it's addressed by |
 | learn your IP, if you choose | built-in SOCKS5 routing through Tor/Orbot |
 
 The honest floor — what a store-and-forward relay irreducibly learns — is stated
@@ -79,11 +79,15 @@ forwarding, voice notes, media galleries, GIFs via a privacy proxy, global searc
 **Calls** — voice, video, and screen share (with system audio) over blind relay rooms
 (WebSocket + QUIC); a Signal-style call screen that collapses into a bubble; hardware
 H.264 encoding where the GPU has it and can prove it works; group calls as a mesh the
-relay can't tell from 1:1 calls.
+relay can't tell from 1:1 calls. A **locked** Android phone still rings, answers and
+declines — through a call-control layer with its own scoped identity, so a device can
+screen a call without ever opening the vault.
 **Multi-device** — Signal-style linking with QR + hardware attestation, KT-published
 device rosters, primary transfer, encrypted history sync.
 **Delivery** — headless engine, native call ring, content-free push (UnifiedPush or
-FCM) that wakes the device without telling Google anything but timing.
+FCM) that wakes the device without telling Google anything but timing; you pick the mode
+per device — live connection, push-only, or connection with push fallback — and the app
+tells you honestly when a mode isn't actually available.
 **Hardening** — StrongBox keystore, ARM MTE, screen-capture blocking, reproducible
 builds, fuzzed parsers, relay access tiers up to a stealth mode that plays dead
 without a token.
@@ -96,9 +100,10 @@ Double Ratchet), [ct-merkle](https://github.com/rozbb/ct-merkle) (RFC 6962, the
 construction behind Certificate Transparency), Argon2id + XChaCha20-Poly1305, Ed25519.
 One Rust crypto core, compiled directly into every client.
 
-**366 tests green** (177 backend + 147 client SDK + 42 app shell), clippy-clean,
-fmt-gated, fuzzed, security-audited with every finding remediated. A further 6 are
-`#[ignore]`d because they need real hardware — a GPU encoder, a microphone, a screen.
+**544 tests green** (244 backend + 210 client SDK + 90 app shell), clippy-clean,
+fmt-gated, fuzzed, security-audited with every finding remediated and a regression test
+holding each one shut. A further 11 are `#[ignore]`d because they need real hardware — a
+GPU encoder, a microphone, a screen.
 
 ## The docs
 

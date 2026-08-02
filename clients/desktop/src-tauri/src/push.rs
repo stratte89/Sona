@@ -739,13 +739,10 @@ pub(crate) async fn notif_action(inner: &Arc<Mutex<Session>>, json: &str) {
             } else {
                 // 1:1: chat key is the peer identity key; the receipt path needs the
                 // username too. An unknown key (contact since deleted) is a no-op.
-                let Some(username) = s
-                    .history
-                    .contacts()
-                    .into_iter()
-                    .find(|(_, p)| p.identity_key == chat)
-                    .map(|(u, _)| u)
-                else {
+                // Accepted contacts only: `username_for_peer` skips pending requests,
+                // whose row is keyed by identity key and whose claimed name is
+                // unverified (SP-02). A stranger gets no read receipt.
+                let Some(username) = s.history.username_for_peer(&chat) else {
                     return;
                 };
                 drop(s);
@@ -774,11 +771,9 @@ pub(crate) async fn notif_action(inner: &Arc<Mutex<Session>>, json: &str) {
                 } else if s.history.group(&chat).is_some() {
                     Some((None, true))
                 } else {
-                    s.history
-                        .contacts()
-                        .into_iter()
-                        .find(|(_, p)| p.identity_key == chat)
-                        .map(|(u, _)| (Some(u), false))
+                    // Accepted contacts only — a notification-reply must not be
+                    // addressed to a pending stranger's claimed name (SP-02).
+                    s.history.username_for_peer(&chat).map(|u| (Some(u), false))
                 }
             };
             let outcome = match target {

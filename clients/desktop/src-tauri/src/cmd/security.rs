@@ -177,7 +177,7 @@ pub async fn set_pin(
     let seal = SealKey::from_bytes(&account.seal_key_bytes()).map_err(|e| e.to_string())?;
     password_opens_vault(&s, &password)?;
     let blob = quick::wrap_seal_key_pin(&seal, &pin, &dk).map_err(|e| e.to_string())?;
-    std::fs::write(s.quick_pin_path(), blob).map_err(|e| e.to_string())?;
+    crate::privfile::write_private(&s.quick_pin_path(), &blob).map_err(|e| e.to_string())?;
     s.prefs.pin_attempts = 0;
     s.save_prefs()
 }
@@ -259,7 +259,7 @@ pub async fn set_auto_unlock(
         let account = s.account.as_ref().ok_or("locked")?;
         let seal = SealKey::from_bytes(&account.seal_key_bytes()).map_err(|e| e.to_string())?;
         let blob = quick::wrap_seal_key_auto(&seal, &dk).map_err(|e| e.to_string())?;
-        std::fs::write(s.quick_auto_path(), blob).map_err(|e| e.to_string())?;
+        crate::privfile::write_private(&s.quick_auto_path(), &blob).map_err(|e| e.to_string())?;
         s.prefs.auto_unlock = true;
     } else {
         let _ = std::fs::remove_file(s.quick_auto_path());
@@ -352,7 +352,7 @@ pub async fn set_bio_unlock(
         (account.seal_key_bytes().to_vec(), s.quick_bio_path())
     };
     let blob = bio::enroll_async(seal_bytes).await?;
-    std::fs::write(&bio_path, blob).map_err(|e| e.to_string())?;
+    crate::privfile::write_private(&bio_path, &blob).map_err(|e| e.to_string())?;
     let mut s = state.inner.lock().await;
     s.prefs.bio_enabled = true;
     s.save_prefs()
@@ -438,7 +438,7 @@ pub async fn change_password(
     let new_blob = account
         .rekey(&new_password, dk.as_ref())
         .map_err(|e| e.to_string())?;
-    std::fs::write(s.vault_path(), new_blob).map_err(|e| e.to_string())?;
+    crate::privfile::write_private(&s.vault_path(), &new_blob).map_err(|e| e.to_string())?;
 
     // Every quick-unlock blob wrapped the OLD seal key — rotate them now.
     let account = s.account.as_ref().ok_or("locked")?;
@@ -447,7 +447,8 @@ pub async fn change_password(
         if let Some(dk) = dk.as_ref() {
             // The ceremony just verified this PIN, so re-wrapping with it is safe.
             let blob = quick::wrap_seal_key_pin(&seal, &pin, dk).map_err(|e| e.to_string())?;
-            std::fs::write(s.quick_pin_path(), blob).map_err(|e| e.to_string())?;
+            crate::privfile::write_private(&s.quick_pin_path(), &blob)
+                .map_err(|e| e.to_string())?;
         } else {
             let _ = std::fs::remove_file(s.quick_pin_path());
         }
@@ -456,7 +457,8 @@ pub async fn change_password(
         match dk.as_ref() {
             Some(dk) => {
                 let blob = quick::wrap_seal_key_auto(&seal, dk).map_err(|e| e.to_string())?;
-                std::fs::write(s.quick_auto_path(), blob).map_err(|e| e.to_string())?;
+                crate::privfile::write_private(&s.quick_auto_path(), &blob)
+                    .map_err(|e| e.to_string())?;
             }
             None => {
                 let _ = std::fs::remove_file(s.quick_auto_path());

@@ -2001,10 +2001,14 @@ impl History {
 
     /// Reverse lookup: the username pinned for a peer identity key, if any. Lets the
     /// client name (and receipt) a conversation it only knows by key.
+    ///
+    /// Pending requests are skipped: their map key is an identity key, and their claimed
+    /// name is unverified attacker-chosen text (SP-02). Callers use this to *address*
+    /// someone — reply, receipt, ring — none of which a stranger should get.
     pub fn username_for_peer(&self, peer: &str) -> Option<String> {
         self.contacts
             .iter()
-            .find(|(_, p)| p.identity_key == peer)
+            .find(|(_, p)| p.identity_key == peer && p.request.is_none())
             .map(|(u, _)| u.clone())
     }
 
@@ -2055,6 +2059,14 @@ impl History {
         if self.contacts.contains_key(username) {
             return;
         }
+        // A pending requester is already on file, keyed by their identity key (SP-02).
+        // Pinning their claimed name here would both duplicate the row and hand them
+        // exactly the name squat that keying requests by key exists to prevent — the
+        // accepted pin it creates would shadow the real owner's first message.
+        // `accept_request` is what moves them into the address book under a name.
+        if self.request_pending_for_key(identity_key) {
+            return;
+        }
         self.contacts.insert(
             username.to_string(),
             ContactPin {
@@ -2088,10 +2100,10 @@ impl History {
                 .contacts
                 .iter()
                 .filter(|(_, p)| p.request.is_some())
-                .map(|(u, _)| u.clone())
+                .map(|(k, _)| k.clone())
                 .collect();
-            for username in pending {
-                self.accept_request(&username);
+            for key in pending {
+                self.accept_request(&key);
             }
         }
     }
@@ -2113,11 +2125,61 @@ impl History {
             .any(|p| p.identity_key == convo && p.request.is_some())
     }
 
-    /// Is this username a pending message request?
-    pub fn is_request_pending(&self, username: &str) -> bool {
+    /// Is this contacts-map key a pending message request? For a pending row the key is
+    /// the requester's identity key (see [`PendingRequest`]), so this is the same thing
+    /// as [`request_pending_for_key`](Self::request_pending_for_key) — kept as a
+    /// separate name because the UI passes back whatever key `pending_requests` gave it.
+    pub fn is_request_pending(&self, key: &str) -> bool {
+        self.contacts.get(key).is_some_and(|p| p.request.is_some())
+    }
+
+    /// Whether `claimed` is a name a stranger is not allowed to introduce themselves
+    /// under: empty, reserved, or already held by an **accepted** contact.
+    ///
+    /// The last clause is deliberately narrow (SP-02). Blocking on *any* pin — which is
+    /// what `contacts.contains_key(claimed)` did — composed with the line that created a
+    /// pending pin under the claimed name into a delivery-denial primitive: a stranger
+    /// sent one message as `from: "alice"`, took the `alice` slot, and the **real**
+    /// Alice's first message was then silently dropped forever with no request row, no
+    /// notification, and no UI trace. Only an accepted contact's pin carries the
+    /// name authority that must not be overwritten.
+    fn claimed_name_unavailable(&self, claimed: &str) -> bool {
+        if claimed.is_empty() || claimed == crate::NOTE_TO_SELF_PEER {
+            return true;
+        }
         self.contacts
-            .get(username)
-            .is_some_and(|p| p.request.is_some())
+            .get(claimed)
+            .is_some_and(|pin| pin.request.is_none())
+    }
+
+    /// Record a stranger's pending-request row, keyed by their identity key.
+    ///
+    /// Keying by key rather than by the claimed name is what makes the name unsquattable
+    /// and lets two strangers legitimately claim the same name — "alice from K1" and
+    /// "alice from K2" are two distinct rows the UI renders per key (SP-02).
+    fn open_request(&mut self, convo: &str, claimed: &str, req: PendingRequest) {
+        self.contacts.insert(
+            convo.to_string(),
+            ContactPin {
+                identity_key: convo.to_string(),
+                request: Some(PendingRequest {
+                    claimed: claimed.to_string(),
+                    ..req
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The name to show for one contacts-map entry. Accepted contacts are keyed by their
+    /// username; a pending row is keyed by an identity key, so its name comes off the
+    /// request. Every display path must go through this — rendering the raw map key
+    /// would put a base64 key where a name belongs.
+    pub fn display_name(key: &str, pin: &ContactPin) -> String {
+        match &pin.request {
+            Some(req) if !req.claimed.is_empty() => req.claimed.clone(),
+            _ => key.to_string(),
+        }
     }
 
     /// Screen one inbound content event (text / attachment / forwarded copy) from the
@@ -2147,22 +2209,18 @@ impl History {
             };
         }
         // Unknown sender. A request must be actionable: with no claimed username — or a
-        // name already pinned to a DIFFERENT key (a spoof `auto_pin_contact` would
+        // name already held by an ACCEPTED contact (a spoof `auto_pin_contact` would
         // refuse too) — withhold entirely; no request row, nothing recorded.
-        if claimed.is_empty() || self.contacts.contains_key(claimed) {
+        if self.claimed_name_unavailable(claimed) {
             return InboundScreen::Dropped;
         }
-        let req = PendingRequest {
-            since: now,
-            last: now,
-            withheld: if allow_text { 0 } else { 1 },
-            ..Default::default()
-        };
-        self.contacts.insert(
-            claimed.to_string(),
-            ContactPin {
-                identity_key: convo.to_string(),
-                request: Some(req),
+        self.open_request(
+            convo,
+            claimed,
+            PendingRequest {
+                since: now,
+                last: now,
+                withheld: if allow_text { 0 } else { 1 },
                 ..Default::default()
             },
         );
@@ -2185,18 +2243,15 @@ impl History {
             }
             return;
         }
-        if claimed.is_empty() || self.contacts.contains_key(claimed) {
+        if self.claimed_name_unavailable(claimed) {
             return;
         }
-        self.contacts.insert(
-            claimed.to_string(),
-            ContactPin {
-                identity_key: convo.to_string(),
-                request: Some(PendingRequest {
-                    since: now,
-                    last: now,
-                    ..Default::default()
-                }),
+        self.open_request(
+            convo,
+            claimed,
+            PendingRequest {
+                since: now,
+                last: now,
                 ..Default::default()
             },
         );
@@ -2221,19 +2276,16 @@ impl History {
                 }
             };
         }
-        if claimed.is_empty() || self.contacts.contains_key(claimed) {
+        if self.claimed_name_unavailable(claimed) {
             return false;
         }
-        self.contacts.insert(
-            claimed.to_string(),
-            ContactPin {
-                identity_key: convo.clone(),
-                request: Some(PendingRequest {
-                    since: now,
-                    last: now,
-                    calls: 1,
-                    ..Default::default()
-                }),
+        self.open_request(
+            &convo,
+            claimed,
+            PendingRequest {
+                since: now,
+                last: now,
+                calls: 1,
                 ..Default::default()
             },
         );
@@ -2279,15 +2331,37 @@ impl History {
     }
 
     /// Accept a pending message request: the contact becomes a normal chat and every
-    /// held group invite replays. Returns `false` for an unknown / non-pending name.
-    pub fn accept_request(&mut self, username: &str) -> bool {
-        let Some(pin) = self.contacts.get_mut(username) else {
+    /// held group invite replays. `key` is the contacts-map key the requests list handed
+    /// out — the requester's identity key, not their claimed name (SP-02).
+    ///
+    /// Returns `false` for an unknown / non-pending key, and for the one case the accept
+    /// cannot be honoured: the claimed name has meanwhile been taken by a *different*
+    /// accepted contact. Re-keying over that pin is exactly the overwrite the anti-spoof
+    /// rule exists to prevent, so the request stays pending instead — the user has to
+    /// rename or remove the other contact first.
+    pub fn accept_request(&mut self, key: &str) -> bool {
+        let Some(pin) = self.contacts.get(key) else {
             return false;
         };
-        let Some(req) = pin.request.take() else {
+        let Some(req) = pin.request.clone() else {
             return false;
         };
+        // The accepted name must be free, or already ours. `claimed` is empty only for
+        // rows migrated from a vault written before this field existed; those keep their
+        // key, which for a migrated row is still the old (name) key.
+        let name = if req.claimed.is_empty() {
+            key.to_string()
+        } else {
+            req.claimed.clone()
+        };
+        if name != key && self.contacts.contains_key(&name) {
+            return false;
+        }
+        // Promote: the row moves from "stranger at key K" to "contact named N".
+        let mut pin = self.contacts.remove(key).expect("key just found");
+        pin.request = None;
         let peer = pin.identity_key.clone();
+        self.contacts.insert(name, pin);
         for inv in req.invites {
             // Validate + adopt the signed epoch (the chain is checked on replay too —
             // accepting a request never bypasses membership authority). A refused epoch never
@@ -2318,22 +2392,27 @@ impl History {
     /// Accept by conversation key — replying from any of our devices is consent (the
     /// self-sync path only knows the peer key). No-op unless actually pending.
     pub fn accept_request_for_key(&mut self, convo: &str) -> bool {
-        let name = self
+        let key = self
             .contacts
             .iter()
             .find(|(_, p)| p.identity_key == convo && p.request.is_some())
-            .map(|(u, _)| u.clone());
-        match name {
-            Some(u) => self.accept_request(&u),
+            .map(|(k, _)| k.clone());
+        match key {
+            Some(k) => self.accept_request(&k),
             None => false,
         }
     }
 
     /// Decline a pending request. `block` keeps the pin (blocked) so this key's future
     /// traffic drops silently; otherwise pin and held conversation vanish entirely
-    /// (they may request again later).
-    pub fn decline_request(&mut self, username: &str, block: bool) -> bool {
-        let Some(pin) = self.contacts.get_mut(username) else {
+    /// (they may request again later). `key` is the contacts-map key from
+    /// [`pending_requests`](Self::pending_requests) — the requester's identity key.
+    ///
+    /// A blocked row deliberately stays keyed by identity key: blocking is a judgement
+    /// about a *key*, not a name, and promoting a declined stranger's claimed name into
+    /// the address book would hand them the squat the accept path refuses them.
+    pub fn decline_request(&mut self, key: &str, block: bool) -> bool {
+        let Some(pin) = self.contacts.get_mut(key) else {
             return false;
         };
         let Some(req) = pin.request.as_ref() else {
@@ -2352,7 +2431,7 @@ impl History {
             pin.request = None;
             pin.blocked = true;
         } else {
-            self.contacts.remove(username);
+            self.contacts.remove(key);
         }
         for gid in dead_invite_groups {
             self.held_group_content.remove(&gid);
@@ -2361,7 +2440,10 @@ impl History {
         true
     }
 
-    /// Every pending request as `(username, pin)`, newest activity first.
+    /// Every pending request as `(map key, pin)`, newest activity first. The key is the
+    /// requester's identity key — pass it back to
+    /// [`accept_request`](Self::accept_request) / [`decline_request`](Self::decline_request).
+    /// For display use [`display_name`](Self::display_name), never the key.
     pub fn pending_requests(&self) -> Vec<(String, ContactPin)> {
         let mut out: Vec<(String, ContactPin)> = self
             .contacts
@@ -2903,7 +2985,13 @@ impl History {
         {
             return None;
         }
+        // A pending row is keyed by identity key, so `contains_key` alone would miss a
+        // name we only know from an open request (SP-02) — check both namespaces.
         let known_account = self.contacts.contains_key(claimed)
+            || self
+                .contacts
+                .values()
+                .any(|p| p.request.as_ref().is_some_and(|r| r.claimed == claimed))
             || self.groups.values().any(|group| {
                 !group.left
                     && group
@@ -2933,9 +3021,51 @@ impl History {
     /// Decrypt history sealed by [`seal`](Self::seal). Returns an empty history if the
     /// blob is absent/corrupt so the UI never breaks (fail-soft on load).
     pub fn open(data_key: &[u8; 32], blob: &[u8]) -> Self {
-        crypto_core::localbox::open(data_key, blob)
+        let mut h: Self = crypto_core::localbox::open(data_key, blob)
             .and_then(|plain| serde_json::from_slice(&plain).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        h.migrate_requests_to_key_addressing();
+        h
+    }
+
+    /// One-time migration for vaults written before SP-02: pending-request rows were
+    /// keyed by the requester's claimed name; they are now keyed by identity key, with
+    /// the name carried on the request itself.
+    ///
+    /// Deliberately in-place and total — the fail-soft [`open`](Self::open) above would
+    /// swallow a fallible migration into an empty history, silently deleting every chat
+    /// on the device. This one cannot fail: it only moves entries between keys of a map
+    /// it already holds, and a row whose claimed name is somehow already taken is left
+    /// exactly where it was rather than dropped.
+    fn migrate_requests_to_key_addressing(&mut self) {
+        let stale: Vec<String> = self
+            .contacts
+            .iter()
+            .filter(|(k, p)| {
+                p.request.as_ref().is_some_and(|r| r.claimed.is_empty())
+                    && **k != p.identity_key
+                    && !p.identity_key.is_empty()
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for name in stale {
+            let Some(mut pin) = self.contacts.remove(&name) else {
+                continue;
+            };
+            if let Some(req) = &mut pin.request {
+                req.claimed = name.clone();
+            }
+            let key = pin.identity_key.clone();
+            // Never clobber an existing row under the target key; put it back instead.
+            match self.contacts.entry(key) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    self.contacts.insert(name, pin);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(pin);
+                }
+            }
+        }
     }
 
     /// Serialize history to plaintext JSON for **cross-device** transfer. Device-local
@@ -4125,20 +4255,36 @@ mod tests {
 
     #[test]
     fn auto_pin_adds_a_new_sender_as_unverified() {
-        let mut h = History::new();
-        h.apply(&InboundEvent::Message {
-            sender_identity_key: "dave-key".into(),
-            sender_username: "dave".into(),
-            msg_id: "m1".into(),
-            body: "first contact".into(),
-            sent_at: 0,
-            reply: None,
-            expire_secs: None,
-            forwarded: false,
-        });
-        // New name: pinned so the chat is visible, but never auto-verified.
-        assert_eq!(h.pinned_contact_key("dave"), Some("dave-key"));
-        assert!(!h.contact_verified("dave"));
+        let dave = |h: &mut History| {
+            h.apply(&InboundEvent::Message {
+                sender_identity_key: "dave-key".into(),
+                sender_username: "dave".into(),
+                msg_id: "m1".into(),
+                body: "first contact".into(),
+                sent_at: 0,
+                reply: None,
+                expire_secs: None,
+                forwarded: false,
+            });
+        };
+        // Open mode: a new name is pinned so the chat is visible, never auto-verified.
+        let mut open = History::new();
+        open.set_request_prefs(false, false);
+        dave(&mut open);
+        assert_eq!(open.pinned_contact_key("dave"), Some("dave-key"));
+        assert!(!open.contact_verified("dave"));
+
+        // With the request gate on (the default), the same sender is a stranger: they
+        // get a pending row keyed by their identity key and NO pin under the name they
+        // claimed (SP-02) — claiming a name must not put anyone in the address book.
+        let mut gated = History::new();
+        dave(&mut gated);
+        assert_eq!(gated.pinned_contact_key("dave"), None);
+        assert!(gated.is_request_pending("dave-key"));
+        // Accepting is what files them under the name.
+        assert!(gated.accept_request("dave-key"));
+        assert_eq!(gated.pinned_contact_key("dave"), Some("dave-key"));
+        assert!(!gated.contact_verified("dave"));
     }
 
     #[test]
@@ -4871,7 +5017,7 @@ mod tests {
         // surfaces it; the withheld counter is what the request-only UI shows instead
         // of a preview.
         assert_eq!(h.messages("strangerkey").len(), 2);
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         assert_eq!(h.request_count(), 1);
         let (_, pin) = h.pending_requests().pop().unwrap();
         assert_eq!(pin.request.as_ref().unwrap().withheld, 2);
@@ -4879,7 +5025,7 @@ mod tests {
         assert!(h.request_needs_notify("strangerkey"));
         assert!(!h.request_needs_notify("strangerkey"));
         // Accepting surfaces the held texts — the chat must not start empty.
-        assert!(h.accept_request("mallory"));
+        assert!(h.accept_request("strangerkey"));
         assert_eq!(
             h.messages("strangerkey")
                 .iter()
@@ -4896,16 +5042,16 @@ mod tests {
             sender_identity_key: "strangerkey".into(),
             sender_username: "mallory".into(),
         });
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         assert!(h.messages("strangerkey").is_empty());
         assert!(h.request_needs_notify("strangerkey"));
         // Knocking an accepted contact is a no-op (no new request row).
-        assert!(h.accept_request("mallory"));
+        assert!(h.accept_request("strangerkey"));
         h.apply(&InboundEvent::Knock {
             sender_identity_key: "strangerkey".into(),
             sender_username: "mallory".into(),
         });
-        assert!(!h.is_request_pending("mallory"));
+        assert!(!h.is_request_pending("strangerkey"));
     }
 
     #[test]
@@ -4915,7 +5061,7 @@ mod tests {
         h.apply(&stranger_msg("m1", "hello there"));
         // The text is held in the (hidden) conversation AND the request is pending.
         assert_eq!(h.messages("strangerkey").len(), 1);
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         assert_eq!(
             h.pending_requests()[0].1.request.as_ref().unwrap().withheld,
             0
@@ -4929,13 +5075,13 @@ mod tests {
         h.pin_contact("mallory", "strangerkey", false);
         h.apply(&stranger_msg("m1", "hi"));
         assert_eq!(h.messages("strangerkey").len(), 1);
-        assert!(!h.is_request_pending("mallory"));
+        assert!(!h.is_request_pending("strangerkey"));
         // Open mode: strangers land directly (today's behavior).
         let mut h2 = History::new();
         h2.set_request_prefs(false, false);
         h2.apply(&stranger_msg("m1", "hi"));
         assert_eq!(h2.messages("strangerkey").len(), 1);
-        assert!(!h2.is_request_pending("mallory"));
+        assert!(!h2.is_request_pending("strangerkey"));
     }
 
     #[test]
@@ -4961,13 +5107,13 @@ mod tests {
             avatar: None,
         });
         assert!(h.group("g9").is_none());
-        assert!(h.accept_request("mallory"));
-        assert!(!h.is_request_pending("mallory"));
+        assert!(h.accept_request("strangerkey"));
+        assert!(!h.is_request_pending("strangerkey"));
         // Replayed on accept: the group exists with the carried timer.
         assert!(h.group("g9").is_some());
         assert_eq!(h.group_timer("g9"), Some(60));
         // Accepting twice is a no-op.
-        assert!(!h.accept_request("mallory"));
+        assert!(!h.accept_request("strangerkey"));
     }
 
     #[test]
@@ -4976,13 +5122,13 @@ mod tests {
         h.set_request_prefs(true, true);
         h.apply(&stranger_msg("m1", "spam"));
         // Plain decline: pin and held conversation vanish; they may ask again.
-        assert!(h.decline_request("mallory", false));
+        assert!(h.decline_request("strangerkey", false));
         assert!(h.messages("strangerkey").is_empty());
         assert_eq!(h.request_count(), 0);
         h.apply(&stranger_msg("m2", "spam again"));
         assert_eq!(h.request_count(), 1);
         // Decline-and-block: the pin stays blocked, so the delivery loop drops them.
-        assert!(h.decline_request("mallory", true));
+        assert!(h.decline_request("strangerkey", true));
         assert!(h.peer_blocked("strangerkey"));
         assert_eq!(h.request_count(), 0);
         assert!(h.messages("strangerkey").is_empty());
@@ -4993,9 +5139,9 @@ mod tests {
         let mut h = History::new();
         h.set_request_prefs(true, true);
         h.apply(&stranger_msg("m1", "waiting"));
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         h.set_request_prefs(false, false);
-        assert!(!h.is_request_pending("mallory"));
+        assert!(!h.is_request_pending("strangerkey"));
         assert_eq!(h.request_count(), 0);
         // The held text is still there, now visible as a normal chat (the accept also
         // drops its system chip).
@@ -5012,7 +5158,7 @@ mod tests {
     fn stranger_calls_never_ring_and_fold_into_the_request() {
         let mut h = History::new();
         assert!(!h.screen_call_offer("strangerkey", "mallory", 100));
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         assert_eq!(h.pending_requests()[0].1.request.as_ref().unwrap().calls, 1);
         // Accepted contact rings; open mode rings.
         let mut h2 = History::new();
@@ -5056,6 +5202,97 @@ mod tests {
         });
         assert!(h.messages("ghostkey").is_empty());
         assert_eq!(h.request_count(), 0);
+    }
+
+    /// SP-02. The anti-spoof rule above and the line that opens a request row composed
+    /// into a delivery-denial primitive: a stranger claimed a name, their *pending* row
+    /// took that name, and the real owner's first message was then dropped silently —
+    /// no request row, no notification, no trace, forever.
+    #[test]
+    fn a_strangers_pending_request_cannot_squat_a_name() {
+        let inbound = |key: &str, name: &str, id: &str| InboundEvent::Message {
+            sender_identity_key: key.into(),
+            sender_username: name.into(),
+            msg_id: id.into(),
+            body: "hi".into(),
+            sent_at: 100,
+            reply: None,
+            expire_secs: None,
+            forwarded: false,
+        };
+        let mut h = History::new();
+        h.set_request_prefs(true, true);
+
+        // Mallory pre-squats the name of someone the victim will later hear from.
+        h.apply(&inbound("mallorykey", "alice", "m1"));
+        assert!(h.is_request_pending("mallorykey"));
+
+        // The REAL alice makes first contact from her own key. She must get through.
+        h.apply(&inbound("alicekey", "alice", "m2"));
+        assert!(
+            h.is_request_pending("alicekey"),
+            "the real owner's first message must not be swallowed by a squatted name"
+        );
+        assert_eq!(h.messages("alicekey").len(), 1);
+        // Both rows coexist, distinguished by key, both showing the claimed name.
+        assert_eq!(h.request_count(), 2);
+        for (key, pin) in h.pending_requests() {
+            assert_eq!(History::display_name(&key, &pin), "alice");
+        }
+
+        // Accepting the real alice files her under the name; the squatter stays a
+        // stranger and cannot then take it.
+        assert!(h.accept_request("alicekey"));
+        assert_eq!(h.pinned_contact_key("alice"), Some("alicekey"));
+        assert!(
+            !h.accept_request("mallorykey"),
+            "the squatter must not be able to overwrite an accepted contact's pin"
+        );
+        assert_eq!(h.pinned_contact_key("alice"), Some("alicekey"));
+    }
+
+    /// SP-02 variant: the reserved note-to-self key is not claimable either.
+    #[test]
+    fn a_stranger_cannot_claim_the_reserved_note_to_self_name() {
+        let mut h = History::new();
+        h.apply(&InboundEvent::Message {
+            sender_identity_key: "evilkey".into(),
+            sender_username: crate::NOTE_TO_SELF_PEER.into(),
+            msg_id: "m1".into(),
+            body: "note to you".into(),
+            sent_at: 100,
+            reply: None,
+            expire_secs: None,
+            forwarded: false,
+        });
+        assert_eq!(h.request_count(), 0);
+        assert!(h.messages("evilkey").is_empty());
+        assert!(h.messages(crate::NOTE_TO_SELF_PEER).is_empty());
+    }
+
+    /// SP-02 migration: a vault written when pending rows were keyed by the claimed name
+    /// must come back keyed by identity key, with the name preserved for display. The
+    /// fail-soft `open` would turn a botched migration into an empty history, so this
+    /// asserts the chats survive it too.
+    #[test]
+    fn legacy_name_keyed_requests_migrate_to_key_addressing() {
+        let mut h = History::new();
+        h.set_request_prefs(true, true);
+        h.apply(&stranger_msg("m1", "hi"));
+        // Rewrite the row the old way: keyed by the claimed name, no `claimed` field.
+        let mut pin = h.contacts.remove("strangerkey").unwrap();
+        pin.request.as_mut().unwrap().claimed = String::new();
+        h.contacts.insert("mallory".into(), pin);
+
+        let key = [4u8; 32];
+        let restored = History::open(&key, &h.seal(&key));
+
+        assert!(restored.is_request_pending("strangerkey"));
+        assert!(!restored.is_request_pending("mallory"));
+        assert_eq!(restored.request_count(), 1);
+        let (k, p) = restored.pending_requests().pop().unwrap();
+        assert_eq!(History::display_name(&k, &p), "mallory");
+        assert_eq!(restored.messages("strangerkey").len(), 1);
     }
 
     #[test]
@@ -5103,7 +5340,7 @@ mod tests {
         )
         .unwrap();
         h.apply(&stranger_msg("m1", "hello"));
-        assert!(h.is_request_pending("mallory"));
+        assert!(h.is_request_pending("strangerkey"));
         // Our own other device replied to them (self-sync copy): request clears.
         h.apply(&InboundEvent::SelfSentText {
             sender_identity_key: "mydevice2".into(),
@@ -5116,7 +5353,7 @@ mod tests {
             expire_secs: None,
             forwarded: false,
         });
-        assert!(!h.is_request_pending("mallory"));
+        assert!(!h.is_request_pending("strangerkey"));
     }
 
     #[test]

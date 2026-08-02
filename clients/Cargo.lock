@@ -1897,6 +1897,8 @@ dependencies = [
  "chacha20poly1305",
  "futures-util",
  "hex",
+ "hkdf",
+ "hmac",
  "kt-log",
  "protocol-types",
  "quinn",

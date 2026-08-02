@@ -164,14 +164,22 @@ async fn one_time_keys_deplete_then_replenish() {
     let mut bob = RatchetEngine::new();
     let bob_hash = register(&state, &mut bob, "bob-acct", 1).await; // just 1 OTK
 
-    let remaining = |body: &[u8]| {
-        serde_json::from_slice::<Value>(body).unwrap()["remaining"]
-            .as_u64()
+    // SP-10: the endpoint publishes a coarse bucket, never an exact count — an exact
+    // count is a first-contact activity oracle, since each new inbound session consumes
+    // exactly one key.
+    let level = |body: &[u8]| {
+        serde_json::from_slice::<Value>(body).unwrap()["level"]
+            .as_str()
             .unwrap()
+            .to_string()
     };
 
     let (_, body) = get(&state, &format!("/v1/keys/count/{bob_hash}")).await;
-    assert_eq!(remaining(&body), 1);
+    assert_eq!(level(&body), "low");
+    assert!(
+        !String::from_utf8_lossy(&body).contains("remaining"),
+        "the exact count must not be published"
+    );
 
     // Consume the only key; the next bundle fetch has none left.
     assert_eq!(
@@ -195,7 +203,7 @@ async fn one_time_keys_deplete_then_replenish() {
     assert_eq!(status, StatusCode::OK);
 
     let (_, body) = get(&state, &format!("/v1/keys/count/{bob_hash}")).await;
-    assert_eq!(remaining(&body), 5);
+    assert_eq!(level(&body), "low");
     // Sessions can be started again.
     assert_eq!(
         get(&state, &format!("/v1/bundle/{bob_hash}")).await.0,
@@ -211,6 +219,135 @@ async fn one_time_keys_deplete_then_replenish() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// SP-10: the count endpoint must never let a third party watch a specific user's
+/// session activity. Each new inbound session consumes exactly one key, so an exact
+/// remaining count was a first-contact feed for anyone who could spell a username.
+#[tokio::test]
+async fn the_otk_count_never_reveals_an_exact_number() {
+    let state = AppState::default();
+    let mut bob = RatchetEngine::new();
+    let bob_hash = register(&state, &mut bob, "bob-acct", 40).await;
+
+    let level = |body: &[u8]| {
+        serde_json::from_slice::<Value>(body).unwrap()["level"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let count = || async {
+        let (_, body) = get(&state, &format!("/v1/keys/count/{bob_hash}")).await;
+        (level(&body), String::from_utf8_lossy(&body).to_string())
+    };
+
+    let (before, raw) = count().await;
+    assert_eq!(before, "plenty");
+    assert!(!raw.contains("40"), "no exact count in the body: {raw}");
+
+    // One new session — the single event this oracle used to report — must not move it.
+    assert_eq!(
+        get(&state, &format!("/v1/bundle/{bob_hash}")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(count().await.0, "plenty", "one session must be invisible");
+
+    // Only crossing the watermark changes the answer at all.
+    for _ in 0..35 {
+        let _ = get(&state, &format!("/v1/bundle/{bob_hash}")).await;
+    }
+    assert_eq!(count().await.0, "low");
+}
+
+/// SP-19: `/v1/onetimekeys` was the only handler in the `core` router with neither a
+/// trusted-client gate nor a rate limit, and it spends a directory lookup plus an
+/// Ed25519 verify over a body up to 64 KiB *while holding the global mutex*. Both checks
+/// now run before the verify, so a flood is rejected cheaply.
+#[tokio::test]
+async fn the_onetimekeys_upload_is_rate_limited_before_the_verify() {
+    let state = AppState::default();
+    let mut bob = RatchetEngine::new();
+    let bob_hash = register(&state, &mut bob, "bob-acct", 1).await;
+
+    // Deliberately unsigned: a rejection here proves the gate ran BEFORE the verify.
+    let body = json!({
+        "identity_hash": bob_hash,
+        "one_time_keys": ["AAAA"],
+        "signature": "not-a-signature",
+    });
+    let mut limited = false;
+    for _ in 0..80 {
+        let (status, _) = post_json(&state, "/v1/onetimekeys", body.clone()).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert!(
+        limited,
+        "an unmetered flood must eventually be rate limited"
+    );
+}
+
+/// SP-19 / SP-04: the KT reads are the enumeration surface for a mailbox hash that is a
+/// reversible SHA-256 of a human-chosen username, and they build Merkle proofs inside
+/// the global mutex. They were completely unmetered.
+#[tokio::test]
+async fn the_kt_read_endpoints_are_metered() {
+    let state = AppState::default();
+    let mut bob = RatchetEngine::new();
+    let bob_hash = register(&state, &mut bob, "bob-acct", 1).await;
+
+    let mut limited = false;
+    for _ in 0..80 {
+        let (status, _) = get(&state, &format!("/v1/kt/proof/{bob_hash}")).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "a wordlist walk must eventually be rate limited");
+    // The budget is far above any real cadence: the auditor and roster refresh poll on
+    // the order of minutes, so a handful of reads on a fresh client is never touched.
+    let fresh = AppState::default();
+    let mut carol = RatchetEngine::new();
+    let carol_hash = register(&fresh, &mut carol, "carol-acct", 1).await;
+    for _ in 0..10 {
+        let (status, _) = get(&fresh, &format!("/v1/kt/proof/{carol_hash}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+/// SP-11: three global ceilings were resources one actor could exhaust for everyone.
+/// The KT log is the worst — unbounded, in-memory, never pruned, and replayed and
+/// re-verified from the DB at every boot, so each accepted leaf is permanent, restart
+/// time grows with the flood, and a memory-limited container eventually OOM-loops. A
+/// per-minute limiter cannot bound something that only ever grows, so appended leaves
+/// now also carry a per-client daily cap.
+#[tokio::test]
+async fn kt_growth_is_bounded_per_client_per_day() {
+    let state = AppState::default();
+    let mut refused = false;
+    for i in 0..80 {
+        let engine = RatchetEngine::new();
+        let (_, entry) = claim_entry(&engine, &format!("kt-flood-{i}"));
+        let (status, _) = post_json(
+            &state,
+            "/v1/register",
+            json!({ "entry": entry, "one_time_keys": [] }),
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::OK, "claim {i} should be accepted");
+    }
+    assert!(
+        refused,
+        "a client must not be able to append unbounded permanent KT leaves"
+    );
 }
 
 #[tokio::test]
@@ -384,7 +521,7 @@ async fn full_end_to_end_offline_then_live_delivery() {
         .as_str()
         .unwrap()
         .to_string();
-    let sig = bob.sign(&vodozemac_b64_decode(&nonce));
+    let sig = bob.sign(&protocol_types::ws_auth_signing_message(&bob_hash, &nonce));
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
         .await
@@ -464,7 +601,7 @@ async fn websocket_rejects_forged_auth() {
         .unwrap()
         .to_string();
     let attacker = RatchetEngine::new();
-    let sig = attacker.sign(&vodozemac_b64_decode(&nonce));
+    let sig = attacker.sign(&protocol_types::ws_auth_signing_message(&bob_hash, &nonce));
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
         .await
@@ -489,7 +626,55 @@ async fn websocket_rejects_forged_auth() {
     );
 }
 
-/// Local helper mirroring vodozemac's base64 decode for the nonce bytes.
-fn vodozemac_b64_decode(s: &str) -> Vec<u8> {
-    vodozemac::base64_decode(s).unwrap()
+/// SP-01 regression. The relay must refuse a signature over the **raw** nonce bytes:
+/// that scheme let a hostile relay serve any other context's signing payload as the
+/// "nonce" and harvest a genuine identity-key signature over it (blind signing oracle).
+/// The signature below is produced by the account's real key over the real nonce — the
+/// only thing wrong with it is that it is not domain-separated.
+#[tokio::test]
+async fn websocket_rejects_a_signature_over_the_raw_nonce() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = AppState::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(server_state).into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let mut bob = RatchetEngine::new();
+    let bob_hash = register(&state, &mut bob, "bob-acct", 1).await;
+
+    let (_, body) = get(&state, &format!("/v1/challenge?hash={bob_hash}")).await;
+    let nonce = serde_json::from_slice::<Value>(&body).unwrap()["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The pre-fix client behaviour: sign the base64-decoded nonce, unstructured.
+    let sig = bob.sign(&vodozemac::base64_decode(&nonce).unwrap());
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
+        .await
+        .unwrap();
+    let frame = json!({"type":"auth","hash":bob_hash,"nonce":nonce,"signature":sig});
+    ws.send(WsMessage::Text(frame.to_string())).await.unwrap();
+
+    let mut authed = false;
+    while let Some(Ok(msg)) = ws.next().await {
+        if let WsMessage::Text(t) = msg {
+            let v: Value = serde_json::from_str(t.as_str()).unwrap();
+            if v["type"] == "ready" || v["type"] == "message" {
+                authed = true;
+            }
+            break;
+        }
+    }
+    assert!(
+        !authed,
+        "a raw-nonce signature must not authenticate — that is the signing oracle"
+    );
 }

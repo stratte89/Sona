@@ -111,9 +111,10 @@ pub async fn configure(
         access_token: access_token.clone(),
     };
     let mut s = state.inner.lock().await;
-    std::fs::write(
-        s.config_path(),
-        serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?,
+    // Owner-only: this carries the relay's shared access token (SP-15).
+    crate::privfile::write_private(
+        &s.config_path(),
+        &serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     s.client = Some(Arc::new(

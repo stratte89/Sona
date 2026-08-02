@@ -15,8 +15,25 @@ use sha2::{Digest, Sha256};
 ///
 /// The server stores and routes on this value alone. It cannot reverse the hash to
 /// recover the identifier, so it never learns *who* a mailbox belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct IdentityHash(String);
+
+/// Deserialize through [`IdentityHash::from_hex`], so the 64-lowercase-hex invariant
+/// holds for values that arrive **off the wire** too (SP-16).
+///
+/// Deriving `Deserialize` on the inner `String` bypassed the constructor entirely:
+/// `POST /v1/messages` takes a `Json<Envelope>` and never re-validated `to`, so an
+/// arbitrary string — a literal username, or multibyte text that then panicked a
+/// diagnostic log slice (SP-17) — became a mailbox key in the store and landed in the
+/// cleartext `messages.target_hash` column. `is_zk_clean` did not catch it: that checks
+/// the separate `raw_identifier` field.
+impl<'de> Deserialize<'de> for IdentityHash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        IdentityHash::from_hex(&s)
+            .ok_or_else(|| serde::de::Error::custom("malformed identity hash"))
+    }
+}
 
 impl IdentityHash {
     /// Derive the routing hash from a raw account identifier (e.g. the account UUID).
@@ -109,6 +126,49 @@ pub fn call_mailbox_hash(username_hash: &str, device_id: &str) -> Option<Identit
     h.update(b"|");
     h.update(device_id.as_bytes());
     Some(IdentityHash(hex::encode(h.finalize())))
+}
+
+/// The exact decoded length of a WebSocket login nonce. The relay issues 32 random
+/// bytes ([`server::auth::ChallengeStore::issue`]); both sides refuse anything else, so
+/// the relay cannot smuggle a longer structure through the challenge field (SP-01).
+pub const WS_AUTH_NONCE_LEN: usize = 32;
+
+/// Canonical bytes signed to authenticate a WebSocket/mailbox session.
+///
+/// **This is the fix for the blind-signing oracle (SP-01).** The relay chooses the
+/// challenge nonce, and the key that signs it is the account's long-term Ed25519
+/// identity key — the same key that signs KT bindings, device rosters, device
+/// proofs-of-possession, group epochs, and every `*_signing_message` below. When the
+/// client signed the *raw* nonce, a hostile relay could serve any other context's
+/// signing payload as the "nonce" and harvest a genuine signature over it, one per
+/// reconnect. Domain-separating the login message makes that impossible: a login
+/// signature can never coincide with any other signing context.
+///
+/// `mailbox_hash` is bound in deliberately — with `prefix || nonce` alone, a signature
+/// harvested from one mailbox would still authenticate a *different* mailbox the relay
+/// controls.
+pub fn ws_auth_signing_message(mailbox_hash: &str, nonce_b64: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"sona-ws-auth-v1|");
+    v.extend_from_slice(mailbox_hash.as_bytes());
+    v.push(b'|');
+    v.extend_from_slice(nonce_b64.as_bytes());
+    v
+}
+
+/// Canonical bytes an account signs to enumerate **its own** Key Transparency leaves.
+///
+/// The enumeration is gated (SP-13) rather than public: "every leaf under this username"
+/// served to anyone would be a fresh activity-enumeration oracle on top of an already
+/// reversible mailbox hash. Domain-separated and bound to a single-use server nonce, so
+/// a request cannot be replayed or moved to another account.
+pub fn kt_leaves_signing_message(identity_hash: &str, nonce_b64: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"sona-kt-leaves-v1|");
+    v.extend_from_slice(identity_hash.as_bytes());
+    v.push(b'|');
+    v.extend_from_slice(nonce_b64.as_bytes());
+    v
 }
 
 /// Canonical bytes a client signs (Ed25519, with its identity signing key) to authorize
@@ -321,6 +381,38 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SP-16: the `from_hex` invariant must hold for values that arrive off the wire,
+    /// not just ones built through the constructor. A derived `Deserialize` on the inner
+    /// String let an arbitrary attacker-chosen string become a mailbox key.
+    #[test]
+    fn identity_hash_deserializes_only_well_formed_hashes() {
+        let good = IdentityHash::from_identifier("bob");
+        let json = serde_json::to_string(&good).unwrap();
+        assert_eq!(serde_json::from_str::<IdentityHash>(&json).unwrap(), good);
+
+        for bad in [
+            "\"bob\"",                      // a literal username
+            "\"\"",                         // empty
+            "\"\u{20ac}\u{20ac}\u{20ac}\"", // multibyte — also the SP-17 log panic
+            "\"zz\"",                       // non-hex
+            "\"AA\"",                       // right alphabet, wrong length
+        ] {
+            assert!(
+                serde_json::from_str::<IdentityHash>(bad).is_err(),
+                "{bad} must not deserialize into an IdentityHash",
+            );
+        }
+        // Uppercase hex of the right length is normalized, not rejected — `from_hex`
+        // lowercases and trims, and a stored hash must round-trip stably.
+        let upper = format!("\"{}\"", "A".repeat(64));
+        assert_eq!(
+            serde_json::from_str::<IdentityHash>(&upper)
+                .unwrap()
+                .as_str(),
+            "a".repeat(64),
+        );
+    }
 
     #[test]
     fn identity_hash_is_deterministic_and_64_hex() {

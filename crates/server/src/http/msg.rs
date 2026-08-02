@@ -79,8 +79,10 @@ pub(crate) fn log_wake(
     let Some(suppressed) = wake_log_slot(t) else {
         return;
     };
-    let hash = recipient.as_str();
-    let short = &hash[..hash.len().min(8)];
+    // Boundary-safe (SP-17): a validated hash is ASCII, but the log line must not be the
+    // thing that decides whether validation happened upstream — a byte slice at index 8
+    // panics on any multibyte input.
+    let short: String = recipient.as_str().chars().take(8).collect();
     if suppressed > 0 {
         println!("[wake] {suppressed} line(s) suppressed by the per-second cap");
     }
@@ -113,19 +115,24 @@ pub(crate) async fn send_message(
             return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
         }
         let to = env.to.clone();
-        match inner.store.enqueue(env.clone(), t) {
-            Ok(true) => {}
+        let evicted = match inner.store.enqueue(env.clone(), t) {
+            Ok(s) if s.stored => s.evicted,
             // Idempotent: the relay already holds this exact message (an at-least-once
             // retry after a lost ACK) or it arrived already-expired. Success, but there
             // is nothing new to persist, deliver live, or wake for — the first arrival
             // did all that. Returning 200 here is what stops the sender showing "Not
             // sent" for a message the recipient already received.
-            Ok(false) => return StatusCode::ACCEPTED.into_response(),
+            Ok(_) => return StatusCode::ACCEPTED.into_response(),
             Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        }
-        // Persist the queued message (envelope encrypted at rest) for offline durability.
+        };
+        // Persist the queued message (envelope encrypted at rest) for offline durability,
+        // and drop anything the mailbox shed to make room for it (SP-03) — otherwise a
+        // restart reloads exactly the backlog the eviction was there to bound.
         if let Some(db) = &inner.db {
             let _ = db.insert_message(&env, env.expires_at);
+            for msg_id in &evicted {
+                let _ = db.delete_message(to.as_str(), msg_id);
+            }
         }
         let live = inner.live.get(to.as_str()).cloned().unwrap_or_default();
         // Each outcome is named rather than collapsed into `Option` (E-10): "nobody is
@@ -172,13 +179,32 @@ pub(crate) async fn send_message(
 /// sibling self-terminals — usually inside the same second, and dropping any of them can
 /// leave a phone ringing. Eight covers that with room to spare and still bounds a sender
 /// that simply keeps posting.
-pub(crate) const CONTROL_WAKE_BURST: u32 = 8;
+pub const CONTROL_WAKE_BURST: u32 = 8;
 
 /// Spend one call-control wake against this recipient's bucket, refilling it first.
 ///
 /// A plain min-interval was the wrong shape: a real call's controls arrive together, and a
 /// second-resolution throttle merges exactly the burst that must not be merged. A bucket
 /// separates the two cases — a call's worth of controls passes at once, a stream does not.
+/// Spend one wake against a rolling one-hour ceiling. `true` = allowed and charged.
+///
+/// This is the per-recipient budget SP-09 needs: `Envelope.wake` is attacker-chosen and
+/// sealed sender means the relay cannot attribute the sender, so the only thing it can
+/// bound is how many high-priority wakes ONE MAILBOX absorbs. A counter rather than a
+/// rate on purpose — the first offer must still ring immediately through Doze, so only
+/// the sustained flood is capped, never the first event.
+fn hourly_ceiling(window: &mut (u64, u32), t: u64, limit: u32) -> bool {
+    const WINDOW: u64 = 3600;
+    if t.saturating_sub(window.0) >= WINDOW {
+        *window = (t, 0);
+    }
+    if window.1 >= limit {
+        return false;
+    }
+    window.1 += 1;
+    true
+}
+
 fn control_budget(sub: &mut PushSub, t: u64, config: &Config) -> bool {
     let interval = config.control_wake_min_secs.max(1);
     let repaid = t.saturating_sub(sub.last_wake_control) / interval;
@@ -211,8 +237,19 @@ pub(crate) fn claim_wake(
     let due = match class {
         WakeClass::None => false,
         WakeClass::Normal => t.saturating_sub(sub.last_wake_normal) >= config.wake_debounce_secs,
-        WakeClass::Call => t.saturating_sub(sub.last_wake_call) >= config.call_wake_min_secs,
-        WakeClass::CallControl => control_budget(sub, t, config),
+        // Both high-priority classes pass their own shape AND the per-recipient hourly
+        // ceiling (SP-09). The min-interval/bucket bounds how *close together* wakes may
+        // be; the ceiling bounds how many there may be at all, which is what a battery
+        // drain is. Order matters: the ceiling is charged only for a wake that would
+        // otherwise be granted, so a debounced burst does not eat the hour's budget.
+        WakeClass::Call => {
+            t.saturating_sub(sub.last_wake_call) >= config.call_wake_min_secs
+                && hourly_ceiling(&mut sub.call_window, t, config.call_wakes_per_hour)
+        }
+        WakeClass::CallControl => {
+            control_budget(sub, t, config)
+                && hourly_ceiling(&mut sub.control_window, t, config.control_wakes_per_hour)
+        }
     };
     if !due {
         return None;
@@ -238,8 +275,10 @@ pub(crate) fn log_wake_outcome(
     let Some(_) = wake_log_slot(now()) else {
         return;
     };
-    let hash = recipient.as_str();
-    let short = &hash[..hash.len().min(8)];
+    // Boundary-safe (SP-17): a validated hash is ASCII, but the log line must not be the
+    // thing that decides whether validation happened upstream — a byte slice at index 8
+    // panics on any multibyte input.
+    let short: String = recipient.as_str().chars().take(8).collect();
     let tag = match outcome {
         crate::push::WakeOutcome::Sent => "sent",
         crate::push::WakeOutcome::DeadToken => "dead-token (push row dropped)",

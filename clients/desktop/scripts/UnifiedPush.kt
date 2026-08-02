@@ -129,10 +129,17 @@ object UnifiedPushMgr {
     try { NotificationBridge.nativeSetUpEndpoint(endpoint) } catch (_: Throwable) {}
   }
 
+  // SP-18: this guard used to fail OPEN on a null token (`token != null && …`), unlike
+  // its two siblings. The receiver must be exported — the distributor is a separate app —
+  // and carries no permission guard, so ANY app on the device could broadcast
+  // UNREGISTERED with no extras, pass the guard, drop the stored endpoint, and unregister
+  // push at the relay. The victim then silently stops receiving message and call wakes
+  // whenever the socket is down. `tokenMatches` is false for null, which is the correct
+  // behaviour here; reuse it so all three paths share one fail-closed rule. A real
+  // distributor always includes the token, so this does not break real unregistration.
   internal fun onGone(ctx: Context, token: String?) {
-    val p = prefs(ctx)
-    if (token != null && token != p.getString("token", null)) return
-    p.edit().remove("endpoint").apply()
+    if (!tokenMatches(ctx, token)) return
+    prefs(ctx).edit().remove("endpoint").apply()
     try { NotificationBridge.nativeSetUpEndpoint("") } catch (_: Throwable) {}
   }
 

@@ -329,6 +329,76 @@ fn verify_signature(signing_key_b64: &str, message: &[u8], signature_b64: &str) 
 
 #[cfg(test)]
 mod tests {
+    /// SP-20 (the half that cannot be a libFuzzer target from `fuzz/`): the JSON parse a
+    /// **locked** device runs on relay-supplied bytes.
+    ///
+    /// `crypto_core::CallKey::open_capsule` — the AEAD/header parser ahead of this — is
+    /// covered by the `call_capsule` fuzz target. What follows the decrypt is
+    /// `serde_json::from_slice::<CallCapsule>` plus `well_formed`, and that lives here in
+    /// `client-core`, which the standalone fuzz package cannot depend on without dragging
+    /// libopus/OpenH264 (cmake + a C toolchain) into the fuzz CI job for one target.
+    /// So the same shape is driven deterministically instead: structured mutations of a
+    /// real capsule, which is where a deserializer actually breaks — not uniform noise,
+    /// which almost never reaches past the first byte.
+    ///
+    /// Invariant: no input panics, and nothing malformed is ever `well_formed`.
+    #[test]
+    fn the_locked_device_capsule_parser_never_panics_on_relay_bytes() {
+        let seed = minted().0.encode();
+
+        // A cheap deterministic PRNG — no dev-dependency, and a failure is reproducible.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..4000 {
+            let mut buf = seed.clone();
+            match next() % 5 {
+                // Flip a byte.
+                0 => {
+                    let i = (next() as usize) % buf.len();
+                    buf[i] ^= (next() % 256) as u8;
+                }
+                // Truncate anywhere, including to nothing.
+                1 => buf.truncate((next() as usize) % (buf.len() + 1)),
+                // Splice in multibyte UTF-8 and structural JSON characters.
+                2 => {
+                    let i = (next() as usize) % (buf.len() + 1);
+                    let junk: &[u8] = match next() % 4 {
+                        0 => "€€€".as_bytes(),
+                        1 => b"\"\"\"",
+                        2 => b"{[,:]}",
+                        _ => &[0xff, 0xfe, 0x00],
+                    };
+                    buf.splice(i..i, junk.iter().copied());
+                }
+                // Repeat a slice — deep nesting / huge fields.
+                3 => {
+                    let chunk: Vec<u8> = buf.iter().take(64).copied().collect();
+                    for _ in 0..(next() % 40) {
+                        buf.extend_from_slice(&chunk);
+                    }
+                }
+                // Raw bytes with no structure at all.
+                _ => buf = (0..(next() % 256)).map(|_| (next() % 256) as u8).collect(),
+            }
+
+            // `decode` is the production entry point: size cap, deserialize, and
+            // `well_formed`. The only requirement is that it returns, either way — a
+            // panic here aborts the locked-device drain.
+            if let Some(c) = CallCapsule::decode(&buf) {
+                // Anything that survived `decode` is well-formed by construction, and
+                // building its signing payload must not panic either.
+                assert!(c.well_formed());
+                let _ = c.signing_payload();
+            }
+        }
+    }
+
     use super::*;
     use crate::callstate::{CALL_RING_TIMEOUT_SECS, CALL_SIGNAL_TTL_SECS};
 

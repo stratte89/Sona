@@ -177,9 +177,15 @@ impl Client {
         ensure_ok(resp).await
     }
 
-    /// Top up our own one-time keys so others can keep starting sessions with us. Queries
-    /// how many remain; if below `target`, generates the difference, signs the upload with
-    /// our identity key, and publishes them. Returns how many were added.
+    /// Top up our own one-time keys so others can keep starting sessions with us. Asks
+    /// the relay whether the stock is `plenty`; if not, generates a fresh batch, signs the
+    /// upload with our identity key, and publishes it. Returns how many keys were
+    /// generated and uploaded (`0` = nothing needed).
+    ///
+    /// The relay answers with a coarse bucket rather than an exact count (SP-10), so this
+    /// uploads a whole batch rather than a computed difference — the relay dedups and
+    /// caps, so overshooting costs only bandwidth, whereas undershooting would starve the
+    /// key stock and push new sessions onto the reusable fallback key.
     ///
     /// Call on login and periodically. NOTE: this advances the ratchet account state, so
     /// the caller should re-seal the vault afterward if any keys were added.
@@ -193,11 +199,19 @@ impl Client {
             .error_for_status()?
             .json()
             .await?;
-        let remaining = status["remaining"].as_u64().unwrap_or(0) as usize;
-        if remaining >= target {
+        // The relay publishes a coarse bucket, never an exact count (SP-10): an exact
+        // count is a first-contact activity oracle for anyone who can spell a username,
+        // because each new inbound session consumes exactly one key. "plenty" is the only
+        // answer that means "do nothing"; otherwise upload a full batch. Over-uploading
+        // is free — the relay dedups and caps at MAX_ONE_TIME_KEYS — and an old relay
+        // that still answers with `remaining` simply reads as "not plenty", so this
+        // fails safe in the top-up direction rather than the starve direction.
+        if status["level"].as_str() == Some("plenty") {
             return Ok(0);
         }
-        let need = target - remaining;
+        // Top up past the relay's watermark, not merely to `target` — a target at or
+        // below the watermark would leave the level "low" and re-upload on every cycle.
+        let need = target.max(status["low_watermark"].as_u64().unwrap_or(0) as usize + 1);
         let keys = account.ratchet().generate_one_time_keys(need);
         let msg = protocol_types::one_time_keys_signing_message(&hash, &keys);
         let signature = account.ratchet_ref().sign(&msg);

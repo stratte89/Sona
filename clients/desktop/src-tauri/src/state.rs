@@ -566,9 +566,11 @@ impl Session {
     }
 
     pub(crate) fn save_prefs(&self) -> Result<(), String> {
-        std::fs::write(
-            self.prefs_path(),
-            serde_json::to_vec_pretty(&self.prefs).map_err(|e| e.to_string())?,
+        // Owner-only: prefs carries `pin_attempts`, and every at-rest file here is
+        // private by default (SP-15).
+        crate::privfile::write_private(
+            &self.prefs_path(),
+            &serde_json::to_vec_pretty(&self.prefs).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())
     }
@@ -597,9 +599,9 @@ impl Session {
             return Ok(());
         };
         let vault = account.reseal().map_err(|e| e.to_string())?;
-        std::fs::write(self.vault_path(), vault).map_err(|e| e.to_string())?;
+        crate::privfile::write_private(&self.vault_path(), &vault).map_err(|e| e.to_string())?;
         let hist = self.history.seal(&account.data_key());
-        std::fs::write(self.history_path(), hist).map_err(|e| e.to_string())?;
+        crate::privfile::write_private(&self.history_path(), &hist).map_err(|e| e.to_string())?;
         // The call-control store rides along whenever it changed, so a tombstone written
         // by the encrypted signalling path survives a restart exactly like one written by
         // a capsule. Through the same helper `save_call_store` uses, so the two cannot drift

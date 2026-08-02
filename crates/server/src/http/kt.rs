@@ -15,7 +15,10 @@ pub(crate) async fn kt_pubkey(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(PubkeyResponse { pubkey })).into_response()
 }
 
-pub(crate) async fn kt_sth(State(state): State<AppState>) -> Response {
+pub(crate) async fn kt_sth(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = metered(&headers, &state, "kt") {
+        return denied;
+    }
     let sth = state.inner.lock().unwrap().kt.sth(now());
     (StatusCode::OK, Json(sth)).into_response()
 }
@@ -32,7 +35,14 @@ struct KtProofResponse {
 /// The latest binding for a username plus a proof it is in the log, and the head to
 /// verify the proof against. The client checks the proof itself — it never trusts that
 /// this entry is genuine just because the server returned it.
-pub(crate) async fn kt_proof(State(state): State<AppState>, Path(hash): Path<String>) -> Response {
+pub(crate) async fn kt_proof(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(denied) = metered(&headers, &state, "kt") {
+        return denied;
+    }
     let inner = state.inner.lock().unwrap();
     let Some(index) = inner.kt.latest_index_for(&hash) else {
         return (StatusCode::NOT_FOUND, "no key transparency entry").into_response();
@@ -70,8 +80,12 @@ struct ConsistencyResponse {
 /// client saw — so the client can confirm no past binding was rewritten.
 pub(crate) async fn kt_consistency(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ConsistencyQuery>,
 ) -> Response {
+    if let Some(denied) = metered(&headers, &state, "kt") {
+        return denied;
+    }
     let inner = state.inner.lock().unwrap();
     let Some(proof) = inner.kt.consistency(q.from) else {
         return (StatusCode::BAD_REQUEST, "from exceeds current size").into_response();
@@ -110,8 +124,12 @@ pub(crate) async fn publish_roster(
     }
 
     let mut inner = state.inner.lock().unwrap();
-    // Roster appends grow the permanent public log — same strict budget as /register.
+    // Roster appends grow the permanent public log — same strict budget as /register,
+    // and the same permanent-growth backstop (SP-11).
     if !inner.auth_rate.check(&format!("roster:{key}"), now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+    if !inner.kt_growth_rate.check(&format!("kt:{key}"), now()) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -251,7 +269,14 @@ struct KtRosterResponse {
 /// verify the proof AND validate the roster against the account's KT-verified binding
 /// (`KtRosterEntry::validate_against`) — never trust the list because the server served
 /// it. 404 = the account has never published a roster (single-device account).
-pub(crate) async fn kt_roster(State(state): State<AppState>, Path(hash): Path<String>) -> Response {
+pub(crate) async fn kt_roster(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(denied) = metered(&headers, &state, "kt") {
+        return denied;
+    }
     let inner = state.inner.lock().unwrap();
     let Some(index) = inner.kt.latest_roster_index_for(&hash) else {
         return (StatusCode::NOT_FOUND, "no device roster").into_response();
@@ -270,4 +295,102 @@ pub(crate) async fn kt_roster(State(state): State<AppState>, Path(hash): Path<St
         }),
     )
         .into_response()
+}
+
+// ─────────────────────── Per-user leaf enumeration (owner-gated) ───────────────────────
+
+#[derive(Deserialize)]
+pub struct KtLeavesRequest {
+    pub hash: String,
+    pub nonce: String,
+    /// Ed25519 over [`protocol_types::kt_leaves_signing_message`].
+    pub signature: String,
+}
+
+/// One leaf under a username, with its proof of inclusion in the current tree.
+#[derive(Serialize)]
+struct KtLeaf {
+    index: u64,
+    /// `"binding"` or `"roster"` — which record kind this leaf is.
+    kind: &'static str,
+    /// The record itself, so the owner can check it against what it actually signed.
+    record: serde_json::Value,
+    /// Base64 RFC 6962 inclusion proof against `sth`.
+    proof_b64: String,
+}
+
+#[derive(Serialize)]
+struct KtLeavesResponse {
+    leaves: Vec<KtLeaf>,
+    sth: SignedTreeHead,
+}
+
+/// **Every** leaf under one username, each with an inclusion proof against the current
+/// head — the primitive SP-13 needs.
+///
+/// `sona-auditor` verifies exactly two things: the STH is signed by the pinned key, and
+/// each growth step carries a valid consistency proof. That catches a *rewritten* log. It
+/// does not catch a log that grows correctly while containing an entry the named account
+/// never authorized, and the account's own `audit_devices` asks the relay for its current
+/// roster — so a two-faced relay can serve the victim the pre-injection epoch and everyone
+/// else the injected one, and every check stays green. `ARCHITECTURE.md` §4 promises "B's
+/// own client will see 'there's a key for B that B never published'"; without leaf
+/// enumeration, nothing could.
+///
+/// **Owner-gated deliberately.** "All leaves for this username", served to anyone, would
+/// be a fresh activity-enumeration oracle stacked on an already-reversible mailbox hash
+/// (SP-04) — who registered, when, how often they rotate, how many devices they have. So
+/// it is challenge-signed by the account's own key, exactly like push register/unregister.
+/// Independent auditors keep the aggregate consistency view they already have.
+///
+/// This is a detection net, not a fix: it exists so an injected-but-validly-signed leaf
+/// becomes *visible* to its victim. Making the injection impossible in the first place is
+/// SP-01, which is closed.
+pub(crate) async fn kt_leaves(
+    State(state): State<AppState>,
+    Json(req): Json<KtLeavesRequest>,
+) -> Response {
+    if IdentityHash::from_hex(&req.hash).is_none() {
+        return (StatusCode::BAD_REQUEST, "malformed hash").into_response();
+    }
+    let msg = protocol_types::kt_leaves_signing_message(&req.hash, &req.nonce);
+    let mut inner = state.inner.lock().unwrap();
+    if let Err(err) = super::push::consume_and_verify(
+        &mut inner,
+        &req.hash,
+        &req.nonce,
+        &msg,
+        &req.signature,
+        now(),
+    ) {
+        return err.into_response();
+    }
+    let sth = inner.kt.sth(now());
+    let mut leaves = Vec::new();
+    for index in inner.kt.all_indices_for(&req.hash) {
+        // Each leaf carries its own proof against the SAME head, so a relay that omits
+        // one cannot also produce a consistent head — the omission is what the owner is
+        // looking for, and hiding it costs the relay a detectable equivocation.
+        let (kind, record, proof) = match inner.kt.record(index) {
+            Some(kt_log::KtRecord::Binding(e)) => (
+                "binding",
+                serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+                inner.kt.inclusion(index).map(|(_, p)| p),
+            ),
+            Some(kt_log::KtRecord::Roster(r)) => (
+                "roster",
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
+                inner.kt.roster_inclusion(index).map(|(_, p)| p),
+            ),
+            None => continue,
+        };
+        let Some(proof) = proof else { continue };
+        leaves.push(KtLeaf {
+            index: index as u64,
+            kind,
+            record,
+            proof_b64: kt_log::inclusion_to_b64(&proof),
+        });
+    }
+    (StatusCode::OK, Json(KtLeavesResponse { leaves, sth })).into_response()
 }
